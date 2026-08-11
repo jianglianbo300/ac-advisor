@@ -1,0 +1,16 @@
+# 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# Hermes 临时文件
+.hermes-tmp.*
+
+# 运行时状态（每次运行自动生成，不入库）
+ac_state.json
+forecast.json
+
+# 环境/凭据
+.env
