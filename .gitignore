@@ -12,5 +12,11 @@ __pycache__/
 ac_state.json
 forecast.json
 
+# 版本备份 *.bak-*
+*.bak-*
+
+# 滤网状态（运行时生成）
+filter_state.json
+
 # 环境/凭据
 .env
