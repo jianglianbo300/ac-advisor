@@ -1,0 +1,15 @@
+# Cline 规则：统一记忆接入
+
+## 🧠 记忆系统：Obsidian 为唯一事实源
+
+本机所有 AI CLI 共同维护一个记忆系统，唯一规范：`D:/Knowledge/_Agent/MEMORY_PROTOCOL.md`
+
+- **跨会话记忆唯一事实源** = `D:/Knowledge/02_Projects/Active/_Agent/`（Journal / Lessons / Profile / Session/state.json）
+- **会话开始**：读 `Session/state.json` → `Lessons.md` 尾部 → `Profile.md`（轻量延迟读取）
+- **会话结束**：追加 `Journal.md`（事实）→ `Lessons.md`（≥1 次复现教训，未验证标 [候选]）→ 根级 `log.md`（带 [new]/[mod]/[fix]/[lesson] 标记）→ `Session/state.json` 原子写（tempfile + os.replace）
+- **纪律**：只追加不覆盖他 agent 内容、带日期头、改完必须验证再记 Journal
+
+## 本项目补充
+
+- 本项目（定频空调省电顾问）状态与历史记录在 `D:/Knowledge/03_Resources/定频空调省电顾问.md` + `D:/Knowledge/log.md`
+- 涉及本项目逻辑修改时，改完必须实跑验证（.venv 下 python）再记 Journal
