@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """调智谱 GLM-5.2 审查空调脚本逻辑"""
-import json, urllib.request
+import json, os, urllib.request
 
-KEY = "64721d72617346ac8ec4870beef6bbd6.kC322yOykimt7l0I"
+
+def _load_env():
+    """读取同目录 .env（git 已忽略），key 不硬编码在代码里"""
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        for line in open(f, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+_load_env()
+KEY = os.environ.get("GLM_API_KEY", "")
 prompt = """审查定频空调省电脚本逻辑，找出漏洞和改进建议：
 
 定频1.5匹(松川KFRd-35GW)装上海闵行，两台(厅+2屋)实际只用一台(女儿屋)+风扇循环。

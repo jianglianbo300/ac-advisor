@@ -13,12 +13,13 @@ G. v4.1: 低温高湿分支（24≤T<26 且湿度>65 → 制冷 23°C 强制除�
 H. v4.2: 分支B(26≤T<28湿度>65) 由「除湿模式」改为「制冷24°C集中一轮」——与降湿优先制冷的结论统一；省电提示按各分支实际设定温度输出；输出注明空调模式为建议值非实测
 I. v4.3: 开窗判断加湿度趋势+时段（晴天清晨露水潮气且湿度趋势明显下降→不劝关窗，提示稍后再开）；除湿占空比模型绑定湿度（湿度越高压缩机越卖力，60%→0.7倍/85%→1.1倍）
 J. v4.4: 电价按时段动态计算——上海一户一表分时电价 峰0.617(6:00-22:00)/谷0.307(22:00-6:00 半价)，cost_est 按当前时段取价，省电提示标注峰电/谷电
+K. v4.5: 审计修复（分支A设定=室内-2防到温空转、删死代码、ac_off_alert落地、last_off_at锚点修复）+ 夜间三方案对比块（睡眠+26/24 与除湿，睡前时段展示）
 """
 import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 
 # 确保能找到 miio（cron 可能用 python3.11，miio 装在 3.12）
 _MIIO_PATHS = [
@@ -199,6 +200,38 @@ def read_indoor(timeout=3.0):
     return None, None
 
 
+NIGHT_HOURS = 6          # 夜间整夜对比时长（小时）
+DAYS_PER_MONTH = 30      # 月差价估算天数
+NIGHT_DUTY_26 = (2 * 0.55 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷26°C：前2h压1°C轻载、后4h维持
+NIGHT_DUTY_24 = (2 * 0.85 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷24°C：前2h硬压3°C、后4h维持
+# 说明：睡眠模式设定每小时+1°C → 后半夜设定>室温压缩机基本停，故不用整夜平均 COOL_DUTY(0.70)
+
+def night_cost_lines(indoor_temp, indoor_hum):
+    """夜间方案对比（睡前 20:00~次日 6:00 谷电窗口展示）。
+    0️⃣ 压一轮即关（用户现行打法，基准参照）vs 1️⃣~3️⃣ 整夜方案。
+    定频耗电 = 输入功率 × 占空比 × 时长；谷电 0.307 元/度。
+    """
+    h = datetime.now().hour
+    if not (h >= 20 or h < 6):
+        return []
+    p = ELECTRIC_VALLEY
+    kb = kwh_est(COOL_BURST_MIN, COOL_DUTY)   # 压一轮 24°C 40~60min（对齐文档实测案例 0.5度≈0.15元）
+    dd = dehumid_duty(indoor_temp if indoor_temp is not None else 26.5, indoor_hum)
+    k26 = kwh_est(NIGHT_HOURS * 60, NIGHT_DUTY_26)
+    k24 = kwh_est(NIGHT_HOURS * 60, NIGHT_DUTY_24)
+    kd = kwh_est(NIGHT_HOURS * 60, dd)
+    lines = [f"🌙 夜间方案对比（谷电 {p:.3f} 元/度）:"]
+    lines.append(f"   0️⃣ 压一轮24°C×40~60min: {kb:.2f}度 ≈ {kb * p:.2f}元 ← 最省（能顶到天亮就收工）")
+    lines.append(f"   1️⃣ 睡眠+制冷26°C整夜:  {k26:.2f}度 ≈ {k26 * p:.2f}元（怕热醒选它，后半夜基本停）")
+    lines.append(f"   2️⃣ 睡眠+制冷24°C整夜:  {k24:.2f}度 ≈ {k24 * p:.2f}元（贵 {(k24 - k26) * p * DAYS_PER_MONTH:.1f}元/月，除湿最快）")
+    lines.append(f"   3️⃣ 除湿模式整夜:        {kd:.2f}度 ≈ {kd * p:.2f}元（慢且最贵；睡眠升降温对除湿无效）")
+    if indoor_hum is not None and indoor_hum > 70:
+        lines.append("   💡 湿度偏高：先压一轮24°C到60%再睡；后半夜闷醒就切睡眠26°C兜底")
+    else:
+        lines.append("   💡 湿度不高：压一轮收工最省；怕热醒就睡眠26°C整夜")
+    return lines
+
+
 def filter_clean_reminder():
     """滤网清洗提醒(v2.5): 脏滤网=风量降=除湿慢=费电, 2018老机更敏感。"""
     try:
@@ -247,6 +280,7 @@ def main():
         src = "室内(净化器)"
     else:
         hum_sig = None  # 室内不可用时，湿度信号为 None——禁掉湿度触发的除湿分支
+    sig_label = "室内" if indoor_ok else "室外体感"
 
     # ── 3. 读取持久化状态 ──
     state = load_state()
@@ -299,10 +333,10 @@ def main():
 
     # 分支 A: 体感高 → 制冷
     if signal >= TEMP_COOLING:
-        reco = max(26, min(28, temp - 7))
+        reco = round(max(26, min(28, signal - 2)))  # 设定比室温低2°C，保证压缩机运转（防到温停机空转）
         burst_set = reco
         decision = f"制冷模式 {reco}°C + 自动风速"
-        reason = f"体感{signal:.1f}°C ≥ {TEMP_COOLING}°C"
+        reason = f"{sig_label}{signal:.1f}°C ≥ {TEMP_COOLING}°C"
         new_mode = "cooling"
 
     # 分支 B0: 低温高湿 → 制冷强制除湿（24≤T<26 且湿度>65；除湿模式此时会到温停机空转）
@@ -338,37 +372,15 @@ def main():
 
     # 分支 C: 不冷不湿 → 风扇
     elif signal >= TEMP_DEHUMID_LOW:
-        # 但如果是除湿模式运行中，且温度还在→检查关条件
-        if state.get("mode") == "dehumid" and hum_sig is not None:
-            if hum_sig < HUM_DEHUMID_OFF or signal < TEMP_ABSOLUTE_FLOOR:
-                # 关除湿的条件：湿度已达标 或 温度已低于绝对下限
-                decision = "风扇/通风（除湿已达标，可关）"
-                reason = f"湿度{hum_sig:.0f}% < {HUM_DEHUMID_OFF}% 或 温度<{TEMP_ABSOLUTE_FLOOR}"
-                new_mode = "fan"
-            else:
-                # 继续除湿
-                over_max = since_on is not None and since_on >= MAX_RUN
-                if over_max:
-                    decision = "建议切换制冷或关（防死锁）"
-                    reason = f"除湿已连续运行≥{MAX_RUN}分钟"
-                    new_mode = "dehumid_alert"
-                else:
-                    decision = "除湿模式（继续）"
-                    reason = "上一轮建议除湿，湿度和温度尚未达标"
-                    new_mode = "dehumid"
-        else:
-            decision = "风扇够用，不用开空调"
-            reason = f"体感{signal:.1f}°C，不算热"
-            new_mode = "fan"
+        # 26≤T<28 且湿度≤65：风扇够用（v4.2 起除湿分支已统一为制冷，mode 不再有 dehumid，旧分支已删）
+        decision = "风扇够用，不用开空调"
+        reason = f"{sig_label}{signal:.1f}°C，不算热"
+        new_mode = "fan"
 
     # 分支 D: 凉快 → 不开，但室内湿度高本身即"闷"，无需室外体感背书
     else:
-        # 室内温度接近舒适区但湿度 >80% → 本身即闷热，建议开一会儿制冷 (温和,非硬除湿)
-        if signal >= 24 and hum_sig is not None and hum_sig > 80:
-            decision = "开一会儿制冷 26°C 兼除湿"
-            reason = f"室内{signal:.1f}°C/湿度{hum_sig:.0f}%偏高(室外体感{feels:.1f}°C)，体感闷"
-            new_mode = "cooling"
-        elif signal < TEMP_ABSOLUTE_FLOOR:
+        # 湿度爆表提醒已改为下方 ac_off_alert 独立处理；此分支只承接"凉快→不开"
+        if signal < TEMP_ABSOLUTE_FLOOR:
             decision = "关掉除湿！已经过冷"
             reason = f"温度{signal:.1f}°C < {TEMP_ABSOLUTE_FLOOR}°C，除湿还在吹会越吹越冷"
             new_mode = "off"
@@ -406,8 +418,20 @@ def main():
             reason += f"；开仅{int(since_on)}分钟，<{MIN_RUN}分钟"
             new_mode = state.get("mode", "unknown")
         else:
-            state["last_off_at"] = now_ts
+            # 只在"从运行态转关闭"时刷新 last_off_at；空调本就关着时不刷（保持"已关 X 分钟"锚点真实）
+            if state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+                state["last_off_at"] = now_ts
             state["mode"] = new_mode
+
+    # ── ac_off_alert（文档 v2.3 声明，本次落地）：空调未建议运行 + 湿度爆表 → 提醒开空调压湿度（每天最多1次防轰炸） ──
+    ac_alert = ""
+    if (new_mode in ("fan", "fan_locked", "off")
+            and hum_sig is not None and hum_sig > 78
+            and signal is not None and signal >= TEMP_ABSOLUTE_FLOOR
+            and state.get("last_alert_day") != datetime.now().strftime("%Y-%m-%d")):
+        state["last_alert_day"] = datetime.now().strftime("%Y-%m-%d")
+        ac_alert = (f"  ⚠️ 湿度{hum_sig:.0f}%偏高：就算不热，也该开空调压一轮湿度"
+                    f"（制冷集中 40~60 分钟，到 60% 关）")
 
     save_state(state)
 
@@ -426,7 +450,7 @@ def main():
         run_info = f"  已关 {int(since_off)} 分钟"
 
     # ── 6. 输出 ──
-    print(f"🏠 上海闵行 · 定频空调省电顾问 v4.4")
+    print(f"🏠 上海闵行 · 定频空调省电顾问 v4.5")
     print(f"📅 {now_str} · {weather_cn(wcode)}")
     print()
     print(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
@@ -450,6 +474,8 @@ def main():
 
     print(f"  💡 {decision}")
     print(f"     ({reason})")
+    if ac_alert:
+        print(ac_alert)
     print(f"  ℹ️ 空调模式为顾问建议值，非遥控器实测（定频空调无智能接口）")
     print()
 
@@ -478,9 +504,11 @@ def main():
     reminder = filter_clean_reminder()
     if reminder:
         print(reminder)
+    for nl in night_cost_lines(indoor_temp, indoor_hum):
+        print(nl)
     print()
     print("─" * 40)
-    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v4.4")
+    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v4.5")
 
 
 if __name__ == "__main__":

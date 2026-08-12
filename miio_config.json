@@ -1,5 +1,0 @@
-{
-  "ip": "192.168.71.120",
-  "token": "f92f4e2d99720f1fc27ac56e1bcd2832",
-  "_comment": "小米空气净化器 4 Lite (zhimi.airp.rma3) · IP 192.168.71.120 · 通过 Xiaomi-cloud-tokens-extractor 扫码登录拉取真实 token。读取失败时 ac_advisor.py 自动回退室外体感，不会卡住。"
-}

@@ -12,11 +12,14 @@ __pycache__/
 ac_state.json
 forecast.json
 
+# 设备凭据（含净化器 IP + token，禁止入库）
+miio_config.json
+
 # 版本备份 *.bak-*
 *.bak-*
 
 # 滤网状态（运行时生成）
 filter_state.json
 
-# 环境/凭据
+# 环境/凭据（API key 统一存 .env，review_*.py 从环境读取）
 .env

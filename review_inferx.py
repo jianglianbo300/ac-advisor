@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """调 InferX (deepseek-v4-flash-0731) 审查空调脚本"""
-import json, urllib.request
+import json, os, urllib.request
 
-KEY = "ix_b0747423cfcc0975741385ba09a1ecc65227859da28c653748b5fa44c71d517d"
+
+def _load_env():
+    """读取同目录 .env（git 已忽略），key 不硬编码在代码里"""
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        for line in open(f, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+_load_env()
+KEY = os.environ.get("INFERX_API_KEY", "")
 prompt = """审查定频空调省电脚本逻辑，找出漏洞和改进建议：
 
 定频1.5匹(松川KFRd-35GW)装上海闵行，两台(厅+2屋)实际只用一台(女儿屋)+风扇循环。

@@ -8,18 +8,33 @@
 """
 import json, os, sys, urllib.request
 
+
+def _load_env():
+    """读取同目录 .env（git 已忽略），key 不硬编码在代码里"""
+    f = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        for line in open(f, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+_load_env()
 BACKENDS = {
     "glm":   dict(url="https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                  key="64721d72617346ac8ec4870beef6bbd6.kC322yOykimt7l0I",
+                  key=os.environ.get("GLM_API_KEY", ""),
                   model="glm-5.2"),
     "terra": dict(url="https://freetokenfaucet.com/v1/chat/completions",
-                  key="tf_8f6bd15fe8564bf28f63fbc0c9cd845f",
+                  key=os.environ.get("TOKENFAUCET_API_KEY", ""),
                   model="gpt-5.6-terra"),
     "tfdeep":dict(url="https://freetokenfaucet.com/v1/chat/completions",
-                  key="tf_8f6bd15fe8564bf28f63fbc0c9cd845f",
+                  key=os.environ.get("TOKENFAUCET_API_KEY", ""),
                   model="deepseek-v4-flash"),
     "ix":    dict(url="https://model.inferx.net/endpoints/v1/chat/completions",
-                  key="ix_b0747423cfcc0975741385ba09a1ecc65227859da28c653748b5fa44c71d517d",
+                  key=os.environ.get("INFERX_API_KEY", ""),
                   model="deepseek-v4-flash"),
     "omni-t":dict(url="http://localhost:20128/v1/chat/completions",
                   key="x", model="aug/gpt5.6-terra"),
@@ -31,6 +46,9 @@ BACKENDS = {
 
 backend = sys.argv[1] if len(sys.argv) > 1 else "glm"
 conf = BACKENDS.get(backend, BACKENDS["glm"])
+if not conf["key"]:
+    print(f"⚠️ {backend} 的 API key 未配置：请检查同目录 .env（应含 GLM_API_KEY / TOKENFAUCET_API_KEY / INFERX_API_KEY）")
+    sys.exit(1)
 
 DIR = os.path.dirname(os.path.realpath(__file__))
 with open(os.path.join(DIR, "ac_advisor.py"), encoding="utf-8") as f:
