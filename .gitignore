@@ -21,5 +21,13 @@ miio_config.json
 # 滤网状态（运行时生成）
 filter_state.json
 
+# 运行时日志
+ac_watch.log
+_winddown_log.txt
+
 # 环境/凭据（API key 统一存 .env，review_*.py 从环境读取）
 .env
+# QR 扫码会话缓存（含 passToken，禁止入库）
+qr_session.json
+qr_login.log
+samples.jsonl

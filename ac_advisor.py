@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-定频空调省电顾问 v4.2 — 上海闵行
+定频空调省电顾问 v8.1 — 上海闵行
 基于 cline(deepseek0731) 审查修正版。
 核心修正:
 A. 状态持久化: 引入 state.json 记录 mode/last_on/last_off，让 MIN_RUN/MIN_OFF/MAX_RUN 真生效
 B. 除湿关标准加温度下限逃生门: 湿度<60 或 温度<24 → 关
 C. 回退路径禁用室外湿度判除湿
 D. 单一决策转移表 + 滞回区间
-E. 除湿下限提到 26°C（对齐"不算热"）+ 湿度阈值 65%
+E. 除湿下限提到 26°C（对齐"不算热"）+ 湿度阈值 70%
 F. 阈值统一头部常量
 G. v4.1: 低温高湿分支（24≤T<26 且湿度>65 → 制冷 23°C 强制除湿一轮）+ 除湿占空比随室温修正（低温到温停机占空比↓）
 H. v4.2: 分支B(26≤T<28湿度>65) 由「除湿模式」改为「制冷24°C集中一轮」——与降湿优先制冷的结论统一；省电提示按各分支实际设定温度输出；输出注明空调模式为建议值非实测
 I. v4.3: 开窗判断加湿度趋势+时段（晴天清晨露水潮气且湿度趋势明显下降→不劝关窗，提示稍后再开）；除湿占空比模型绑定湿度（湿度越高压缩机越卖力，60%→0.7倍/85%→1.1倍）
 J. v4.4: 电价按时段动态计算——上海一户一表分时电价 峰0.617(6:00-22:00)/谷0.307(22:00-6:00 半价)，cost_est 按当前时段取价，省电提示标注峰电/谷电
 K. v4.5: 审计修复（分支A设定=室内-2防到温空转、删死代码、ac_off_alert落地、last_off_at锚点修复）+ 夜间三方案对比块（睡眠+26/24 与除湿，睡前时段展示）
+L. v7.0: 接入空调插座（米家空调伴侣 lumi.acpartner.mcn02）实测功率——kwh_est 优先实测值，回退铭牌 1076W；输出实时功率行
+M. v8.0: 自动控制——决策直接执行到空调插座（红外 set_power/set_mode/set_tar_temp），已处目标状态不重复动作；miio_config.json ac_control=false 可关
+N. v8.1: 审计修复——①ac_apply 三态化(ACTION/NO_ACTION/FAILED)，控制失败不再伪装成"无需动作"；②command→verify→commit：插座实测为权威对账 state（reconcile_state），执行后回读验证再落盘；③记录 manual_off_at/manual_on_at（T1 手动干预锚点预留）；④定频 dry 模式跳过 set_tar_temp；⑤TTS 失败不再静默
 """
 import json
 import os
@@ -33,7 +36,7 @@ for p in _MIIO_PATHS:
 TEMP_COOLING = 28       # 体感≥28 → 制冷
 TEMP_DEHUMID_LOW = 26   # 除湿温度下限（对齐"不算热"）
 TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
-HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值
+HUM_DEHUMID_ON = 70     # 除湿开启湿度阈值(65->70 与 ac_off_alert 趋势触发线对齐, 防 68% 这种不闷也叫开)
 HUM_DEHUMID_OFF = 60    # 除湿关闭湿度阈值（滞回 5%）
 TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限（OR 逃生门，低于此无条件关）
 MIN_RUN = 40            # 开一次至少 40 分钟
@@ -76,8 +79,9 @@ def dehumid_duty(temp, hum=None):
 
 
 def kwh_est(active_min, duty=1.0):
-    """耗电估算(度): 输入功率 × 占空比 × 时长"""
-    return AC_INPUT_W / 1000.0 * duty * (active_min / 60.0)
+    """耗电估算(度): 输入功率 × 占空比 × 时长。有实测功率时用实测，否则回退铭牌。"""
+    p = AC_MEASURED_W or AC_INPUT_W
+    return p / 1000.0 * duty * (active_min / 60.0)
 
 
 def current_price():
@@ -126,7 +130,7 @@ def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return default
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
             return {**default, **json.load(f)}
     except Exception:
         return default
@@ -134,7 +138,7 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     """写入持久化状态"""
-    with open(STATE_FILE, "w") as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -198,6 +202,186 @@ def read_indoor(timeout=3.0):
     except Exception:
         pass
     return None, None
+
+
+AC_MEASURED_W = None     # 空调插座(空调伴侣 mcn02)实测功率，v7.0 引入
+AC_SOCKET = None         # 插座实测开关状态: "on" | "off" | None(未知)
+AC_CTRL = None           # 自动控制句柄，v8.0 引入
+
+
+def ac_control_init():
+    """初始化自动控制句柄。miio_config.json 的 ac_control=false 可关。"""
+    global AC_CTRL
+    AC_CTRL = None
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        ap = cfg.get("ac_partner") or {}
+        if ap.get("ip") and ap.get("token") and cfg.get("ac_control", True):
+            from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
+            AC_CTRL = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
+    except Exception:
+        AC_CTRL = None
+
+
+def ac_apply(new_mode, target_temp=None):
+    """把决策执行到空调插座（红外 set_power/set_mode/set_tar_temp）。
+    返回 {"status": "action"|"no_action"|"failed", "action": str, "reason": str}。
+    status=failed 表示控制失败或无法验证——绝不能当作"无需动作"。"""
+    if new_mode == "dehumid_alert":
+        return {"status": "no_action", "action": "", "reason": "alert_only"}
+    if AC_CTRL is None:
+        return {"status": "failed", "action": "", "reason": "control_unavailable"}
+    try:
+        st = AC_CTRL.status()
+        on = st.is_on
+    except Exception as e:
+        return {"status": "failed", "action": "", "reason": f"status_read_failed: {e}"}
+    act = []
+    if new_mode in ("cooling", "dehumid"):
+        want_mode = "cool" if new_mode == "cooling" else "dry"
+        if not on:
+            try:
+                AC_CTRL.send_command("set_power", ["on"])
+                act.append("开机")
+                on = True
+            except Exception as e:
+                return {"status": "failed", "action": "开机", "reason": f"power_on_failed: {e}"}
+        try:
+            if st.mode is not None and st.mode.value != want_mode:
+                AC_CTRL.send_command("set_mode", [want_mode])
+                act.append(f"模式{want_mode}")
+        except Exception:
+            pass
+        if want_mode == "dry":
+            pass  # 定频 dry 模式温度设定多数无效，跳过（T2）
+        else:
+            try:
+                if target_temp and st.target_temperature != target_temp:
+                    AC_CTRL.send_command("set_tar_temp", [target_temp])
+                    act.append(f"设定{target_temp}°C")
+            except Exception:
+                pass
+    elif new_mode in ("fan", "off"):
+        if on:
+            try:
+                AC_CTRL.send_command("set_power", ["off"])
+                act.append("关机")
+            except Exception as e:
+                return {"status": "failed", "action": "关机", "reason": f"power_off_failed: {e}"}
+    return {"status": "action" if act else "no_action", "action": "，".join(act), "reason": ""}
+
+
+def reconcile_state(state, now_ts):
+    """以插座实测为权威对账持久化状态（P2）。
+    插座可达时真实设备状态优先：state 说运行但插座关 → 记 manual_off_at 并回正；
+    state 说关但插座开 → 记 manual_on_at 并标记运行（模式未知按 cooling 计）。
+    插座不可达（AC_SOCKET=None）时跳过，回退持久化状态。"""
+    if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+        state["manual_off_at"] = now_ts
+        state["mode"] = "off"
+        state["last_off_at"] = now_ts
+        state["run_start"] = None
+    elif AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        state["manual_on_at"] = now_ts
+        state["mode"] = "cooling"
+        state["run_start"] = now_ts
+
+
+def verify_socket():
+    """执行后回读插座真实开关状态（command→verify）。返回 "on"|"off"|None(不可达)。"""
+    if AC_CTRL is None:
+        return None
+    try:
+        s = AC_CTRL.status()
+        return "on" if s.is_on else "off"
+    except Exception:
+        return None
+
+
+def apply_state_from_verify(state, new_mode, real, now_ts):
+    """按插座实测结果更新运行/停止锚点。仅 apply_and_commit 调用。
+    返回 None=状态一致；True=verify 与意图矛盾（调用方标 failed）。"""
+    was_on = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+    if real == "on":
+        if new_mode in ("cooling", "dehumid", "dehumid_alert"):
+            if not was_on:
+                state["run_start"] = now_ts
+                state["last_on_at"] = now_ts
+            state["mode"] = new_mode
+            return None
+        # 想关/风扇但实测在制冷 → 按真实状态修正
+        state["mode"] = "cooling"
+        state.pop("last_off_at", None)
+        return True
+    # real == "off"
+    if new_mode in ("fan", "fan_locked", "off"):
+        if was_on:
+            state["last_off_at"] = now_ts
+        state["mode"] = new_mode
+        state["run_start"] = None
+        return None
+    # 想开制冷/除湿但实测已关 → 按真实状态修正
+    state["mode"] = "off"
+    state["run_start"] = None
+    return True
+
+
+def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
+    """唯一执行接口（P2 状态所有权）：ac_apply → verify → 按真实结果修改 state → commit。
+    advice(cron) 与 ac_watch(v8.2.1) 共用；mode/run_start/last_on_at/last_off_at 仅由此函数写入，
+    调用方禁止预先修改——控制失败时绝不把"意图态"落盘。
+
+    meta(dict, optional): 执行成功时合并到 state 再落盘的额外字段。
+    用于控制方在不破坏 P2 所有权的前提下附加元数据（如 last_dehumid_adjust_at）。
+    控制失败/验证失败时不写入 meta，与"意图态不落盘"原则一致。"""
+    if now_ts is None:
+        now_ts = datetime.now().isoformat(timespec="seconds")
+    ctrl = ac_apply(new_mode, target_temp)
+    if ctrl["status"] == "failed":
+        save_state(state)
+        return ctrl
+    real = verify_socket()
+    if real is None:
+        ctrl = {"status": "failed", "action": ctrl.get("action", ""), "reason": "verify_unreachable"}
+        save_state(state)
+        return ctrl
+    contradict = apply_state_from_verify(state, new_mode, real, now_ts)
+    if contradict:
+        ctrl = {"status": "failed", "action": ctrl.get("action", ""),
+                "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on"}
+    # meta 只在执行成功时合并（控制失败/验证矛盾都不写入，与 P2 一致）
+    if meta and not contradict:
+        for k, v in meta.items():
+            state[k] = v
+    save_state(state)
+    return ctrl
+
+
+def read_ac_power(timeout=4.0):
+    """读取空调插座实测功率(W)与开关状态。
+    返回实测瓦数(开且读得到)，否则 None。全局 AC_SOCKET 记录 on/off/未知。
+    空调插座 = 米家空调伴侣 lumi.acpartner.mcn02 @ 192.168.71.43，走局域网 miio。
+    """
+    global AC_MEASURED_W, AC_SOCKET
+    AC_SOCKET = None
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        ap = cfg.get("ac_partner") or {}
+        if not ap.get("ip") or not ap.get("token"):
+            return None
+        from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
+        d = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
+        st = d.status()
+        AC_SOCKET = "on" if st.is_on else "off"
+        AC_MEASURED_W = None
+        if st.is_on and st.load_power and st.load_power > 0:
+            AC_MEASURED_W = round(st.load_power)
+            return AC_MEASURED_W
+    except Exception:
+        pass
+    return None
 
 
 NIGHT_HOURS = 6          # 夜间整夜对比时长（小时）
@@ -269,6 +453,8 @@ def main():
     # ── 2. 读取室内温湿度 ──
     indoor_temp, indoor_hum = read_indoor()
     indoor_ok = indoor_temp is not None and indoor_hum is not None
+    ac_w = read_ac_power()
+    ac_control_init()
 
     # 主信号：室内优先，室外回退（仅限体感温度，湿度不用室外）
     signal = feels
@@ -285,6 +471,7 @@ def main():
     # ── 3. 读取持久化状态 ──
     state = load_state()
     now_ts = datetime.now().isoformat()
+    reconcile_state(state, now_ts)   # 真实设备状态优先对账（P2），修正手动干预/上次控制失败残留
     since_on = minutes_since(state.get("run_start"))
     since_off = minutes_since(state.get("last_off_at"))
 
@@ -356,11 +543,7 @@ def main():
         running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
         over_max = running and since_on is not None and since_on >= MAX_RUN
         # 除湿也要考虑温度下限逃生门：如果温度已经低于绝对下限，不开除湿
-        if signal < TEMP_ABSOLUTE_FLOOR:
-            decision = "风扇/通风"
-            reason = f"温度{signal:.1f}°C已低于{TEMP_ABSOLUTE_FLOOR}°C，开除湿会过冷"
-            new_mode = "fan"
-        elif over_max:
+        if over_max:
             decision = "建议切换制冷或关（防死锁）"
             reason = f"除湿已连续运行≥{MAX_RUN}分钟"
             new_mode = "dehumid_alert"
@@ -394,7 +577,8 @@ def main():
             reason = f"温度{signal:.1f}°C，凉快；{why}"
             new_mode = "off"
 
-    # ── 5. 应用状态约束（最小运行/停机时间） ──
+    # ── 5. 应用状态约束（最小运行/停机时间）：只调整意图 new_mode 与文案；
+    #    state 字段（mode/run_start/last_on_at/last_off_at）由 apply_and_commit 唯一写入（P2） ──
     if new_mode in ("cooling", "dehumid", "dehumid_alert"):
         # 开：检查关后最小停机时间
         if since_off is not None and since_off < MIN_OFF:
@@ -404,24 +588,12 @@ def main():
             # 如果湿度高但锁定中，给个手动建议
             if hum_sig is not None and hum_sig > 80:
                 decision += "；实在闷就开一会儿制冷26°C，不闷就关"
-        else:
-            # 记录运行开始时间（仅当从"未运行"态进入运行态才重置；
-            # 运行中模式切换如 dehumid→cooling/dehumid_alert 保留 run_start，维持连续运行时长）
-            if state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
-                state["run_start"] = now_ts
-            state["last_on_at"] = now_ts
-            state["mode"] = new_mode
     elif new_mode in ("fan", "fan_locked", "off"):
         # 关：检查最小运行时间
         if since_on is not None and since_on < MIN_RUN:
             decision = "继续开着（开够" + str(MIN_RUN) + "分钟再关，已经" + str(int(since_on)) + "分钟）"
             reason += f"；开仅{int(since_on)}分钟，<{MIN_RUN}分钟"
             new_mode = state.get("mode", "unknown")
-        else:
-            # 只在"从运行态转关闭"时刷新 last_off_at；空调本就关着时不刷（保持"已关 X 分钟"锚点真实）
-            if state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
-                state["last_off_at"] = now_ts
-            state["mode"] = new_mode
 
     # ── ac_off_alert（文档 v2.3 声明，本次落地）：空调未建议运行 + 湿度爆表 → 提醒开空调压湿度（每天最多1次防轰炸） ──
     ac_alert = ""
@@ -433,11 +605,15 @@ def main():
         ac_alert = (f"  ⚠️ 湿度{hum_sig:.0f}%偏高：就算不热，也该开空调压一轮湿度"
                     f"（制冷集中 40~60 分钟，到 60% 关）")
 
-    save_state(state)
+    ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
 
     # 构建运行时间信息（基于更新后的状态重新计算，避免旧 run_start 误导时长）
     run_info = ""
-    if new_mode in ("cooling", "dehumid", "dehumid_alert"):
+    if AC_SOCKET == "on":
+        run_info = "  🔌 空调运行中（插座实测）"
+    elif AC_SOCKET == "off":
+        run_info = "  🔌 空调已关（插座实测）"
+    elif new_mode in ("cooling", "dehumid", "dehumid_alert"):
         run_now = minutes_since(state.get("run_start"))
         if run_now is not None:
             if run_now < 1:
@@ -450,7 +626,7 @@ def main():
         run_info = f"  已关 {int(since_off)} 分钟"
 
     # ── 6. 输出 ──
-    print(f"🏠 上海闵行 · 定频空调省电顾问 v4.5")
+    print(f"🏠 上海闵行 · 定频空调省电顾问 v8.1")
     print(f"📅 {now_str} · {weather_cn(wcode)}")
     print()
     print(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
@@ -461,6 +637,15 @@ def main():
     print(f"  今日最高: {max_t:.1f}°C  降雨: {rain:.0f}%")
     if run_info:
         print(run_info)
+    if ac_w:
+        print(f"  🔌 空调实测功率: {ac_w}W（空调插座实时）")
+    if ctrl["status"] == "action":
+        print(f"  🎛️ 已自动执行: {ctrl['action']}")
+    elif ctrl["status"] == "no_action":
+        if AC_CTRL is not None:
+            print("  🎛️ 已处目标状态，无需动作")
+    else:
+        print(f"  ⚠️ 自动控制失败（{ctrl['reason']}）——建议人工确认空调状态")
     print()
 
     # 雨天/潮湿警示放结论前（防投递链路润色丢失）
@@ -476,6 +661,17 @@ def main():
     print(f"     ({reason})")
     if ac_alert:
         print(ac_alert)
+    # 音箱播报结论（与微信/桌面提醒并行；失败静默）
+    try:
+        _tts_dir = r"D:\Hermes_Data\.hermes\scripts"
+        if _tts_dir not in sys.path:
+            sys.path.insert(0, _tts_dir)
+        from ac_tts import speak
+        speak(decision[:50])
+        if ac_alert:
+            speak(ac_alert, force=True)
+    except Exception as e:
+        print(f"  ⚠️ TTS 播报失败（{e}）——微信/桌面提醒仍正常")
     print(f"  ℹ️ 空调模式为顾问建议值，非遥控器实测（定频空调无智能接口）")
     print()
 
