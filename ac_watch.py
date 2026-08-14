@@ -31,7 +31,8 @@ NIGHT_START_AH = 17.0       # 夜间启动绝对湿度阈值 (g/m3)
 NIGHT_STOP_AH = 14.0        # 夜间停止绝对湿度阈值
 NIGHT_STOP_AH_HYST = 1.0    # 夜间停止迟滞带（降到 14 停，升到 15 才重开）
 NIGHT_STOP_T = 26.0         # 夜间停止温度阈值
-NIGHT_TARGET = 27           # 夜间目标温度
+NIGHT_TARGET = 26           # 夜间目标温度上限（=clamp(室温-2,24,26)，分支 A 夜间对齐）
+NIGHT_MIN_TARGET = 24       # 夜间目标温度下限（防过冷）
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
 NIGHT_EXTEND_RUN = 30       # 超限后单次运行延长(min)
@@ -233,10 +234,12 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if since_off is not None and since_off < A.MIN_OFF:
         return (None, None)
     if is_night:
+        # 分支 A 夜间对齐：目标永远低于室温 2C（保证定频压缩机启动），clamp 24~26
+        night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
         if temp >= NIGHT_START_T:
-            return ("cooling", NIGHT_TARGET)
+            return ("cooling", night_target)
         if ah is not None and ah >= NIGHT_START_AH + NIGHT_STOP_AH_HYST:
-            return ("cooling", NIGHT_TARGET)
+            return ("cooling", night_target)
         return (None, None)
     if temp >= A.TEMP_COOLING:
         return ("cooling", round(max(26, min(28, temp - 2))))
@@ -461,10 +464,10 @@ def _selftest():
 
     # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
-    # 夜间：T>=28 → 启动 27C
-    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None) == ("cooling", 27)
-    # 夜间：AH>=18（17+1 迟滞）→ 启动 27C
-    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None) == ("cooling", 27)
+    # 夜间：T>=28 → 启动 室温-2=27 → clamp 上限 26
+    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None) == ("cooling", 26)
+    # 夜间：AH>=18（17+1 迟滞，室温 26）→ 启动 26-2=24
+    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None) == ("cooling", 24)
     # 夜间：条件不满足 → 不动
     assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None) == (None, None)
     # 夜间运行中：AH<=14 → 关
