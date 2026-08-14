@@ -207,6 +207,17 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None):
     return True
 
 
+def handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target, comp_min, path=None):
+    """apply+verify 通过后按动作类型维护周期记录（main 的唯一入口，纯数据层）。
+    开机 → open_cycle；关机 → close_cycle；其余动作 → 不写。"""
+    if new_mode == "cooling" and mode_before != "cooling":
+        open_cycle(state, now_ts, ah, hum)
+        return True
+    if new_mode == "off" and mode_before in ("cooling", "dehumid", "dehumid_alert"):
+        return close_cycle(state, now_ts, ah, hum, running_target, comp_min, path=path)
+    return False
+
+
 def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
@@ -448,12 +459,8 @@ def main():
     log(f"执行 {new_mode} target={target} → {ctrl['status']} {ctrl.get('action','')} {ctrl.get('reason','')} · {cl} {meta}")
     if ctrl["status"] == "action":
         # ── v8.6 cycle log：只在真实开关动作(apply+verify 通过)时记录，失败路径→action 不成立不写 ──
-        if new_mode == "cooling" and mode_before != "cooling":
-            open_cycle(state, now_ts, ah, rh)
-            A.save_state(state)
-        elif new_mode == "off" and mode_before in ("cooling", "dehumid", "dehumid_alert"):
-            close_cycle(state, now_ts, ah, rh, running_target, comp_min_at_apply)
-            A.save_state(state)
+        handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target, comp_min_at_apply)
+        A.save_state(state)
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
         if not is_night:
             try:
@@ -625,6 +632,22 @@ def _selftest():
     with open(_tmp_cycle, encoding="utf-8") as f:
         assert len(f.read().strip().splitlines()) == 1
     os.remove(_tmp_cycle)
+
+    # ── handle_cycle_after_action（main 动作钩子的接线测试，防参数接错回归） ──
+    _tmp2 = os.path.join(tempfile.mkdtemp(), "cycle_log.jsonl")
+    st_h = {}
+    assert handle_cycle_after_action(st_h, "cooling", "off", "2026-08-15T02:10:00", 18.0, 71, 26, 30.0, path=_tmp2) is True
+    assert st_h.get("cycle_start") is not None, "开机应写 cycle_start 快照"
+    st_h["estimated_kwh"] = 0.15
+    assert handle_cycle_after_action(st_h, "off", "cooling", "2026-08-15T02:40:00", 14.5, 60, 26, 30.0, path=_tmp2) is True
+    with open(_tmp2, encoding="utf-8") as f:
+        lines2 = f.read().strip().splitlines()
+    assert len(lines2) == 1, f"hook_lines={len(lines2)}"
+    r2 = json.loads(lines2[0])
+    assert r2["start_AH"] == 18.0 and r2["end_AH"] == 14.5 and r2["start_RH"] == 71 and r2["end_RH"] == 60
+    # 设定动作（模式不变）→ 不写不记录
+    assert handle_cycle_after_action(st_h, "cooling", "cooling", "2026-08-15T03:00:00", 14.0, 60, 25, 30.0, path=_tmp2) is False
+    os.remove(_tmp2)
 
     total = len(comp_cases) + 11 + 8 + 3
     print(f"selftest OK: {total} decide + 9 apply_and_commit 状态路径")
