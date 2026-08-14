@@ -1,0 +1,41 @@
+{
+  "_comment": "TokenFaucet 免费模型配置",
+  "base_url": "https://freetokenfaucet.com/v1",
+  "anthropic_url": "https://freetokenfaucet.com/anthropic",
+  "api_key_env": "TOKENFAUCET_API_KEY",
+  "free_models": {
+    "gpt-5.6-terra": {
+      "provider": "openai",
+      "note": "免费(1折)，慢 ~50s，适合深度审查"
+    },
+    "mimo-v2.5": {
+      "provider": "openai",
+      "note": "免费，快，日常可用"
+    },
+    "mimo-v2.5-pro": {
+      "provider": "openai",
+      "note": "免费，比v2.5强"
+    },
+    "deepseek-v4-flash": {
+      "provider": "openai",
+      "note": "免费，最快，当前主力"
+    }
+  },
+  "paid_models": {
+    "gpt-5.5": {"note": "1折"},
+    "gpt-5.6-sol": {"note": "1折"},
+    "claude-sonnet-5": {"note": "2.2折"},
+    "claude-opus-4-8": {"note": "2.2折"},
+    "claude-fable-5": {"note": "2.2折"},
+    "deepseek-v4-pro": {"note": "付费"},
+    "glm-5": {"note": "付费"},
+    "glm-5.1": {"note": "付费"},
+    "kimi-k2.5": {"note": "付费"},
+    "kimi-k2.6": {"note": "付费"},
+    "minimax-m2.7": {"note": "付费"},
+    "minimax-m3": {"note": "付费"},
+    "qwen3.6-flash": {"note": "付费"},
+    "qwen3.7-max": {"note": "付费"},
+    "qwen3.7-plus": {"note": "付费"}
+  }
+}
