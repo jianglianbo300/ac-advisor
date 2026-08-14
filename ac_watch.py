@@ -164,6 +164,9 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     不用 since_on（壁钟时间）——定频机到温停压缩机，since_on 包含大量风扇空吹时间。
     失败/低效判断只基于真实除湿工作时间，避免"看起来跑了很久实际没干活"的误判。
     """
+    if running is None:
+        # 传感器不可达：放弃本次决策，不动作
+        return (None, None)
     if running:
         if compressor == "fan_only":
             # ── 假运行（v8.3） ──
@@ -260,7 +263,12 @@ def main():
     state = A.load_state()
     A.reconcile_state(state, now_ts)
 
-    running = socket == "on" or state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+    # socket=None（传感器不可达）时，不信任 state.mode 冒充真实状态
+    # load_power 才是实际执行状态；读不到就进入降级态而非假设运行
+    if socket is None:
+        running = None  # 未知 → decide 返回 None，本次不动作（避免误控）
+    else:
+        running = socket == "on" or state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
     since_on = A.minutes_since(state.get("run_start"))
     since_off = A.minutes_since(state.get("last_off_at"))
 
@@ -288,13 +296,23 @@ def main():
         last_comp_stop = now_ts
     state["compressor_state"] = comp
 
-    # ── 压缩机累计运行时间（单位：分钟） ──
+    # ── 压缩机连续运行时间（基于真实时间差，不是固定 +10/tick）──
     comp_on_min = state.get("compressor_on_min", 0) or 0
     if comp == "compressor":
-        comp_on_min += 10  # 每 tick 约 10 分钟（不是 0.1667！）
+        comp_since = state.get("compressor_on_since")
+        if comp_since:
+            try:
+                elapsed = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(comp_since)).total_seconds() / 60
+                comp_on_min = round(max(0, elapsed), 1)
+            except:
+                comp_on_min += 10
+        else:
+            state["compressor_on_since"] = now_ts
+            comp_on_min = 0
     else:
         comp_on_min = 0
-    state["compressor_on_min"] = round(comp_on_min, 1)
+        state.pop("compressor_on_since", None)
+    state["compressor_on_min"] = comp_on_min
 
     # ── v8.5 kWh 梯形积分 ──
     update_kwh(state, now_ts, load_power)
