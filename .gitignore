@@ -31,3 +31,6 @@ _winddown_log.txt
 qr_session.json
 qr_login.log
 samples.jsonl
+
+# 运行周期数据（v8.6 数据层，每次开关机追加，不入库）
+cycle_log.jsonl

@@ -13,6 +13,7 @@ v8.3 继承：压缩机状态识别（load_power>300W=运行，5-50W=风扇）
 """
 import os
 import sys
+import json
 import math
 from datetime import datetime, timedelta
 
@@ -154,6 +155,46 @@ def update_kwh(state, now_ts, load_power):
     if load_power is not None:
         state["_prev_power"] = load_power
         state["_prev_kwh_ts"] = now_ts
+
+
+def open_cycle(state, now_ts, ah, rh):
+    """开机动作(apply+verify 通过)时记录周期开始快照。纯数据层，不影响决策。"""
+    state["cycle_start"] = {
+        "ts": now_ts,
+        "ah": ah,
+        "rh": rh,
+        "kwh": state.get("estimated_kwh", 0.0) or 0.0,
+    }
+
+
+def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None):
+    """关机动作(apply+verify 通过)时追加一条完整周期记录到 cycle_log.jsonl。
+    无 cycle_start（异常/失败路径）→ 不写假周期。append-only，幂等。"""
+    cs = state.get("cycle_start")
+    if not cs:
+        return False
+    end_kwh = state.get("estimated_kwh", 0.0) or 0.0
+    try:
+        dur_min = round((datetime.fromisoformat(now_ts) - datetime.fromisoformat(cs["ts"])).total_seconds() / 60.0, 1)
+    except Exception:
+        dur_min = None
+    rec = {
+        "start_ts": cs["ts"],
+        "end_ts": now_ts,
+        "start_AH": cs.get("ah"),
+        "end_AH": ah,
+        "start_RH": cs.get("rh"),
+        "end_RH": rh,
+        "target_temp": target_temp,
+        "compressor_runtime_min": round(comp_min, 1) if comp_min is not None else None,
+        "kwh_used": round(max(0.0, end_kwh - cs.get("kwh", 0.0)), 4),
+        "duration_min": dur_min,
+    }
+    path = path or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cycle_log.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    state.pop("cycle_start", None)
+    return True
 
 
 def decide(temp, hum, running, since_on, since_off, is_night,
@@ -389,9 +430,19 @@ def main():
     if new_mode == "cooling" and target is not None and target < current_target:
         extra_meta = {"last_dehumid_adjust_at": now_ts}
 
+    mode_before = state.get("mode")
+    running_target = current_target
+    comp_min_at_apply = state.get("compressor_on_min") or 0
     ctrl = A.apply_and_commit(new_mode, target, state, now_ts, meta=extra_meta)
     log(f"执行 {new_mode} target={target} → {ctrl['status']} {ctrl.get('action','')} {ctrl.get('reason','')} · {cl} {meta}")
     if ctrl["status"] == "action":
+        # ── v8.6 cycle log：只在真实开关动作(apply+verify 通过)时记录，失败路径→action 不成立不写 ──
+        if new_mode == "cooling" and mode_before != "cooling":
+            open_cycle(state, now_ts, ah, rh)
+            A.save_state(state)
+        elif new_mode == "off" and mode_before in ("cooling", "dehumid", "dehumid_alert"):
+            close_cycle(state, now_ts, ah, rh, running_target, comp_min_at_apply)
+            A.save_state(state)
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
         if not is_night:
             try:
@@ -531,6 +582,32 @@ def _selftest():
     st = {"mode": "off", "run_start": None}
     r = A.apply_and_commit("cooling", 24, st, TS)
     assert r["status"] == "failed" and st == {"mode": "off", "run_start": None}
+
+    # ── cycle log（v8.6 数据层） ──
+    import tempfile
+    _tmp_cycle = os.path.join(tempfile.mkdtemp(), "cycle_log.jsonl")
+    st_c = {}
+    # 1) 未开机直接关 → 不写（异常/失败路径不产生假周期）
+    assert close_cycle(st_c, "2026-08-15T02:00:00", 14.0, 60, 25, 20.0, path=_tmp_cycle) is False
+    assert not os.path.exists(_tmp_cycle), "无 cycle_start 不应写文件"
+    # 2) 正常开→关 → 写一条完整周期
+    open_cycle(st_c, "2026-08-15T01:24:24", 18.3, 71)
+    st_c["estimated_kwh"] = 0.0922
+    assert close_cycle(st_c, "2026-08-15T02:00:00", 14.1, 60, 25, 20.5, path=_tmp_cycle) is True
+    with open(_tmp_cycle, encoding="utf-8") as f:
+        lines = f.read().strip().splitlines()
+    assert len(lines) == 1, f"cycles={len(lines)}"
+    r = json.loads(lines[0])
+    assert r["start_AH"] == 18.3 and r["end_AH"] == 14.1
+    assert r["start_RH"] == 71 and r["end_RH"] == 60
+    assert r["target_temp"] == 25 and r["compressor_runtime_min"] == 20.5
+    assert abs(r["duration_min"] - 35.6) < 0.1, f"dur={r['duration_min']}"  # 01:24:24→02:00:00
+    assert abs(r["kwh_used"] - 0.0922) < 1e-4
+    # 3) 重复关（周期已清）→ 不写第二条（幂等）
+    assert close_cycle(st_c, "2026-08-15T02:10:00", 14.0, 59, 25, 20.5, path=_tmp_cycle) is False
+    with open(_tmp_cycle, encoding="utf-8") as f:
+        assert len(f.read().strip().splitlines()) == 1
+    os.remove(_tmp_cycle)
 
     total = len(comp_cases) + 11 + 8 + 3
     print(f"selftest OK: {total} decide + 9 apply_and_commit 状态路径")
