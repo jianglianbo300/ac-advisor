@@ -150,8 +150,9 @@ def update_kwh(state, now_ts, load_power):
         except Exception:
             pass
     state["estimated_kwh"] = round(kwh, 4)
-    state["_prev_power"] = load_power
-    state["_prev_kwh_ts"] = now_ts
+    if load_power is not None:
+        state["_prev_power"] = load_power
+        state["_prev_kwh_ts"] = now_ts
 
 
 def decide(temp, hum, running, since_on, since_off, is_night,
@@ -445,6 +446,18 @@ def _selftest():
     update_kwh(st, "2026-08-14T22:20:00", 25)
     # 梯形: (1100+25)/2 * 10min / 1000 = 0.09375
     assert abs(st["estimated_kwh"] - 0.2771) < 0.01, f"kwh_20min={st['estimated_kwh']}"
+
+    # ── kWh 积分: sensor unknown 不覆盖锚点（v8.6 fix） ──
+    update_kwh(st, "2026-08-14T22:30:00", None)  # unknown: 不积分、锚点保留
+    assert st["_prev_power"] == 25, f"unknown_prev={st['_prev_power']}"
+    assert abs(st["estimated_kwh"] - 0.2771) < 0.01, f"unknown_kwh={st['estimated_kwh']}"
+    update_kwh(st, "2026-08-14T22:40:00", 50)  # 恢复: 用旧锚点(25,22:20)梯形积分空窗
+    # (25+50)/2 * 20min / 1000 = 0.0125 → 0.2771+0.0125=0.2896
+    assert abs(st["estimated_kwh"] - 0.2896) < 0.01, f"recover_kwh={st['estimated_kwh']}"
+    assert st["_prev_power"] == 50  # 恢复后重新建立锚点
+    update_kwh(st, "2026-08-14T22:50:00", 45)
+    # (50+45)/2 * 10min / 1000 = 0.007917 → 0.2896+0.0079=0.2975
+    assert abs(st["estimated_kwh"] - 0.2975) < 0.01, f"after_recover_kwh={st['estimated_kwh']}"
 
     # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
