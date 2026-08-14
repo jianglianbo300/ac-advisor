@@ -288,13 +288,13 @@ def main():
         last_comp_stop = now_ts
     state["compressor_state"] = comp
 
-    # ── v8.5 压缩机累计运行时间 ──
-    comp_on_min = state.get("compressor_on_min", 0)
+    # ── 压缩机累计运行时间（单位：分钟） ──
+    comp_on_min = state.get("compressor_on_min", 0) or 0
     if comp == "compressor":
-        comp_on_min += 0.1667  # 每 tick 约 10min = 0.1667h
+        comp_on_min += 10  # 每 tick 约 10 分钟（不是 0.1667！）
     else:
         comp_on_min = 0
-    state["compressor_on_min"] = round(comp_on_min, 2)
+    state["compressor_on_min"] = round(comp_on_min, 1)
 
     # ── v8.5 kWh 梯形积分 ──
     update_kwh(state, now_ts, load_power)
@@ -353,6 +353,8 @@ def main():
     if new_mode is None:
         log(f"无动作 {cl} {meta} 已开={since_on} 已关={since_off} mode={state.get('mode')}")
         print(f"ac_watch: 无需动作 · {cl} · {meta}")
+        # 无动作时也落盘 kWh 和 RH 历史（P2：这些是 watcher 自管字段，不影响控制状态）
+        A.save_state(state)
         return
 
     if dry:
