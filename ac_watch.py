@@ -156,10 +156,12 @@ def update_kwh(state, now_ts, load_power):
 def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
-           minutes_since_last_adjust=None, ah=None, compressor_on_min=None):
+           minutes_since_last_adjust=None, ah=None, compressor_run_min=None):
     """纯决策函数。返回 (new_mode, target_temp) 或 (None, None)。
 
-    v8.5 夜间模式：is_night 时改用夜间参数，不禁止启动。
+    v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
+    不用 since_on（壁钟时间）——定频机到温停压缩机，since_on 包含大量风扇空吹时间。
+    失败/低效判断只基于真实除湿工作时间，避免"看起来跑了很久实际没干活"的误判。
     """
     if running:
         if compressor == "fan_only":
@@ -183,8 +185,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             return (None, None)
 
         # ── 压缩机运行中 ──
-        # 硬上限
-        if since_on is not None and since_on >= WATCH_MAX_RUN:
+        # 用压缩机实际累计运行时间（不是壁钟时间）
+        comp_min = compressor_run_min if compressor_run_min is not None else since_on
+
+        # 硬上限：压缩机累计运行超时，无论湿度如何都停（保护压缩机）
+        if comp_min is not None and comp_min >= WATCH_MAX_RUN:
             return ("off", None)
 
         # 夜间停止条件
@@ -198,8 +203,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         if hum <= DEHUMID_EXIT_RH:
             return ("off", None)
 
-        # 无效（Tier 4）
-        if (since_on is not None and since_on >= DEHUMID_STALL_MIN
+        # 无效（Tier 4）：压缩机实际跑了 60min 以上 RH 不动 → 停止降温
+        if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN
                 and delta_rh_60min is not None and abs(delta_rh_60min) < DEHUMID_STALL_RH_BAND):
             return (None, None)
 
@@ -211,7 +216,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         if hum > DEHUMID_LOW_EFF_RH and delta_rh_20min is not None and delta_rh_20min > DEHUMID_DELTA_RH_MIN:
             if minutes_since_last_adjust is not None and minutes_since_last_adjust < DEHUMID_ADJUST_COOLDOWN:
                 return (None, None)
-            if since_on is not None and since_on >= DEHUMID_FORCE_MIN and hum > DEHUMID_FORCE_RH:
+            if comp_min is not None and comp_min >= DEHUMID_FORCE_MIN and hum > DEHUMID_FORCE_RH:
                 new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
                 return ("cooling", new_target)
             new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
@@ -331,7 +336,8 @@ def main():
                               delta_rh_20min=delta_rh_20,
                               delta_rh_60min=delta_rh_60,
                               minutes_since_last_adjust=minutes_since_adjust,
-                              ah=ah)
+                              ah=ah,
+                              compressor_run_min=state.get("compressor_on_min"))
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
