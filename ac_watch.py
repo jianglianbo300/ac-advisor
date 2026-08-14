@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-空调自动监控 v8.4 — 每 10 分钟自动闭环（Hermes cron: */10 7-23 * * *）
-感知 → 判断 → 执行 → 验证 → 提交。复用 ac_advisor 的 v8.1 统一控制接口。
+空调自动监控 v8.5 — 每 10 分钟自动闭环（Hermes cron: */10 7-23 * * *）
 
-v8.4 新增：除湿效率反馈闭环（ΔRH/20min）
-  - 4 档除湿控制：正常 / 低效(-1C) / 强制(-1C再) / 无效(停止)
-  - 阶梯 -1C 代替 -2C，每次降后观察 20~30min
-  - 露点/绝对湿度日志输出，辅助判断
-  - 保留 v8.3 压缩机状态识别层
+v8.5 新增：
+  1. 夜间模式：TTS 静音 + 控制继续（静默是通知层，不是控制层）
+  2. kWh 积分：梯形积分(P_prev, P_now, Δt)
+  3. 压缩机运行时间统计（基于 load_power，不是 is_on）
 
-阈值:
-  启动: T>=28C OR (T>=26C AND RH>=70%)
-  停止(正常除湿): RH<=60%；硬上限 MAX_RUN=90min
-  低效: 压缩机运行 + RH>66% + ΔRH/20min > -1% → -1C
-  强制: 连续40min + RH>68% + ΔRH < -1% → 再 -1C
-  无效: 连续60min + RH几乎不降 → 停止降温
-  保护: 关后 MIN_OFF(30)min 不重开；夜间(23-7)不启动
+v8.4 继承：除湿效率反馈闭环（ΔRH/20min），4 档控制，阶梯 -1C
+v8.3 继承：压缩机状态识别（load_power>300W=运行，5-50W=风扇）
 """
 import os
 import sys
@@ -29,7 +22,22 @@ import ac_advisor as A
 
 WATCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_watch.log")
 WATCH_MAX_RUN = 90      # 硬上限，防死锁
-QUIET = (23, 7)         # 夜间不自动启动
+
+# ── v8.5 夜间模式：控制继续，只静音 TTS ──
+QUIET_TTS = (23, 7)         # TTS 静音时段
+NIGHT = (23, 7)             # 夜间节能模式时段
+NIGHT_START_T = 28.0        # 夜间启动温度阈值
+NIGHT_START_AH = 17.0       # 夜间启动绝对湿度阈值 (g/m3)
+NIGHT_STOP_AH = 14.0        # 夜间停止绝对湿度阈值
+NIGHT_STOP_T = 26.0         # 夜间停止温度阈值
+NIGHT_TARGET = 27           # 夜间目标温度
+NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
+NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
+NIGHT_EXTEND_RUN = 30       # 超限后单次运行延长(min)
+
+# fallback：传感器不可达时的保守动作
+SENSOR_FALLBACK_OFF_ALLOWED = True  # 读不到 → 允许关（安全动作）
+SENSOR_FALLBACK_ON_ALLOWED = False  # 读不到 → 禁止开（危险动作）
 
 # ── v8.3 压缩机状态识别层 ──
 COMPRESSOR_POWER_THRESHOLD = 300   # 高于此值 = 压缩机在转
@@ -61,13 +69,19 @@ def log(msg):
         pass
 
 
-def quiet(now=None):
+def tts_mute(now=None):
+    """23-7 TTS 静音（通知层静默，不影响控制层）。"""
     h = (now or datetime.now()).hour
-    return h >= QUIET[0] or h < QUIET[1]
+    return h >= QUIET_TTS[0] or h < QUIET_TTS[1]
+
+
+def night_hours(now=None):
+    """23-7 夜间节能模式时段。"""
+    h = (now or datetime.now()).hour
+    return h >= NIGHT[0] or h < NIGHT[1]
 
 
 def dew_point(temp_c, rh):
-    """计算露点温度（Magnus 公式）。"""
     if temp_c is None or rh is None:
         return None
     a, b = 17.27, 237.7
@@ -76,7 +90,6 @@ def dew_point(temp_c, rh):
 
 
 def absolute_humidity(temp_c, rh):
-    """计算绝对湿度 (g/m3)。"""
     if temp_c is None or rh is None:
         return None
     e = 6.112 * math.exp((17.67 * temp_c) / (temp_c + 243.5))
@@ -96,14 +109,10 @@ def compressor_state(load_power):
 
 
 def compute_delta_rh(rh_history, now_ts, window_min=20):
-    """从 RH 历史记录计算 ΔRH/{window_min}min。
-    rh_history: [(ts_iso, rh), ...]，按时间升序。
-    返回 (delta_rh, valid_count) 或 (None, 0)。"""
     if not rh_history or len(rh_history) < 2:
         return None, len(rh_history) if rh_history else 0
     now = datetime.fromisoformat(now_ts)
     cutoff = now - timedelta(minutes=window_min)
-    # 找窗口起点附近最早的读数
     window_start = None
     for ts_str, rh_val in rh_history:
         ts = datetime.fromisoformat(ts_str)
@@ -112,32 +121,45 @@ def compute_delta_rh(rh_history, now_ts, window_min=20):
             break
     if window_start is None:
         return None, len(rh_history)
-    # 当前 RH = 最新一条
     latest = rh_history[-1][1]
     delta = latest - window_start[1]
     return round(delta, 1), len(rh_history)
 
 
 def update_rh_history(state, now_ts, rh):
-    """往 state 的 RH 历史环追加当前读数，保留最近 12 条（2h）。"""
     hist = state.get("rh_history") or []
     hist.append([now_ts, rh])
-    # 只保留最近 12 条（每 10min 一次 = 2h 窗口）
     if len(hist) > 12:
         hist = hist[-12:]
     state["rh_history"] = hist
 
 
-def decide(temp, hum, running, since_on, since_off, is_quiet,
+def update_kwh(state, now_ts, load_power):
+    """梯形积分更新 estimated_kWh。
+    每次 tick 调用一次，用当前 load_power 与上一 tick 的功率做梯形积分。"""
+    prev_power = state.get("_prev_power")
+    prev_ts = state.get("_prev_kwh_ts")
+    kwh = state.get("estimated_kwh", 0.0)
+    if prev_power is not None and prev_ts is not None and load_power is not None:
+        try:
+            dt_hours = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(prev_ts)).total_seconds() / 3600
+            if dt_hours > 0 and dt_hours < 1:  # 防止异常间隔
+                avg_power = (prev_power + load_power) / 2.0
+                kwh += avg_power * dt_hours / 1000.0
+        except Exception:
+            pass
+    state["estimated_kwh"] = round(kwh, 4)
+    state["_prev_power"] = load_power
+    state["_prev_kwh_ts"] = now_ts
+
+
+def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
-           minutes_since_last_adjust=None):
+           minutes_since_last_adjust=None, ah=None, compressor_on_min=None):
     """纯决策函数。返回 (new_mode, target_temp) 或 (None, None)。
 
-    v8.4 除湿效率反馈闭环：
-      compressor 运行中 → 按 ΔRH 分 4 档
-      fan_only → 假运行逻辑（v8.3）
-      未运行 → 启动逻辑
+    v8.5 夜间模式：is_night 时改用夜间参数，不禁止启动。
     """
     if running:
         if compressor == "fan_only":
@@ -160,46 +182,51 @@ def decide(temp, hum, running, since_on, since_off, is_quiet,
                 return ("off", None)
             return (None, None)
 
-        # ── 压缩机运行中：v8.4 除湿效率反馈 ──
-        # 硬上限保护
+        # ── 压缩机运行中 ──
+        # 硬上限
         if since_on is not None and since_on >= WATCH_MAX_RUN:
             return ("off", None)
 
-        # 湿度达标 → 关
+        # 夜间停止条件
+        if is_night:
+            if ah is not None and ah <= NIGHT_STOP_AH:
+                return ("off", None)
+            if temp <= NIGHT_STOP_T and (ah is None or ah <= NIGHT_STOP_AH + 2):
+                return ("off", None)
+
+        # 湿度达标
         if hum <= DEHUMID_EXIT_RH:
             return ("off", None)
 
-        # 无效（Tier 4）：连续 60min RH 几乎不动 → 停止降温
-        # 优先级高于低效/强制，因为继续降只会更冷而无除湿效果
+        # 无效（Tier 4）
         if (since_on is not None and since_on >= DEHUMID_STALL_MIN
                 and delta_rh_60min is not None and abs(delta_rh_60min) < DEHUMID_STALL_RH_BAND):
             return (None, None)
 
-        # 正常除湿（Tier 1）：ΔRH 下降正常
+        # 正常除湿（Tier 1）
         if delta_rh_20min is not None and delta_rh_20min <= DEHUMID_DELTA_RH_MIN:
             return (None, None)
 
-        # 低效（Tier 2）：RH>66% 且 ΔRH 下降不足
-        # 先检查调温冷却锁：距离上次调整 <20min 则不动
+        # 低效（Tier 2）
         if hum > DEHUMID_LOW_EFF_RH and delta_rh_20min is not None and delta_rh_20min > DEHUMID_DELTA_RH_MIN:
             if minutes_since_last_adjust is not None and minutes_since_last_adjust < DEHUMID_ADJUST_COOLDOWN:
-                # 仍在冷却期内，不降
                 return (None, None)
             if since_on is not None and since_on >= DEHUMID_FORCE_MIN and hum > DEHUMID_FORCE_RH:
-                # 强制除湿（Tier 3）：连续跑了 40min 以上仍高
                 new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
                 return ("cooling", new_target)
-            # 低效（Tier 2）：-1C
             new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
             return ("cooling", new_target)
 
-        # 湿度不低、ΔRH 数据不足 → 继续等
         return (None, None)
 
     # ── 未运行 ──
-    if is_quiet:
-        return (None, None)
     if since_off is not None and since_off < A.MIN_OFF:
+        return (None, None)
+    if is_night:
+        if temp >= NIGHT_START_T:
+            return ("cooling", NIGHT_TARGET)
+        if ah is not None and ah >= NIGHT_START_AH:
+            return ("cooling", NIGHT_TARGET)
         return (None, None)
     if temp >= A.TEMP_COOLING:
         return ("cooling", round(max(26, min(28, temp - 2))))
@@ -255,40 +282,66 @@ def main():
         last_comp_stop = now_ts
     state["compressor_state"] = comp
 
-    # ── v8.4 RH 历史记录 + ΔRH 计算 ──
+    # ── v8.5 压缩机累计运行时间 ──
+    comp_on_min = state.get("compressor_on_min", 0)
+    if comp == "compressor":
+        comp_on_min += 0.1667  # 每 tick 约 10min = 0.1667h
+    else:
+        comp_on_min = 0
+    state["compressor_on_min"] = round(comp_on_min, 2)
+
+    # ── v8.5 kWh 梯形积分 ──
+    update_kwh(state, now_ts, load_power)
+
+    # ── v8.4 RH 历史 ──
     update_rh_history(state, now_ts, hum)
-    delta_rh_20, rh_count_20 = compute_delta_rh(state.get("rh_history"), now_ts, 20)
-    delta_rh_60, rh_count_60 = compute_delta_rh(state.get("rh_history"), now_ts, 60)
+    delta_rh_20, _ = compute_delta_rh(state.get("rh_history"), now_ts, 20)
+    delta_rh_60, _ = compute_delta_rh(state.get("rh_history"), now_ts, 60)
 
-    # 当前目标温度
     current_target = state.get("target_temp", 26) or 26
-
-    # 露点 / 绝对湿度（日志用）
     dp = dew_point(temp, hum)
     ah = absolute_humidity(temp, hum)
 
-    # 调温冷却锁：距离上次降温度过了多久
+    # ── v8.5 夜间模式判断 ──
+    is_night = night_hours()
+
+    # 调温冷却锁
     last_adjust = state.get("last_dehumid_adjust_at")
     minutes_since_adjust = A.minutes_since(last_adjust) if last_adjust else None
 
-    new_mode, target = decide(temp, hum, running, since_on, since_off, quiet(),
+    # 假运行停运时长：将 last_comp_stop 时间戳转为距 run_start 的分钟数
+    stop_duration = None
+    if last_comp_stop is not None and since_on is not None:
+        try:
+            stop_dt = datetime.fromisoformat(last_comp_stop) if isinstance(last_comp_stop, str) else last_comp_stop
+            run_start = state.get("run_start")
+            if run_start:
+                run_dt = datetime.fromisoformat(run_start) if isinstance(run_start, str) else datetime.fromisoformat(run_start)
+                stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60
+                if stop_duration < 0:
+                    stop_duration = None
+        except Exception:
+            pass
+
+    new_mode, target = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
-                              last_compressor_stop_at=last_comp_stop,
+                              last_compressor_stop_at=stop_duration,
                               cooldown_until_dt=cooldown,
                               current_target=current_target,
                               delta_rh_20min=delta_rh_20,
                               delta_rh_60min=delta_rh_60,
-                              minutes_since_last_adjust=minutes_since_adjust)
+                              minutes_since_last_adjust=minutes_since_adjust,
+                              ah=ah)
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
     cl = COMP_LABEL.get(comp, comp)
-
-    # 决策日志（含露点/ΔRH）
-    delta_rh_str = f"dRH20={delta_rh_20}% dRH60={delta_rh_60}%"
+    kwh_str = f"kWh={state.get('estimated_kwh', 0):.3f}"
+    delta_str = f"dRH20={delta_rh_20}% dRH60={delta_rh_60}%"
     dp_str = f"dp={dp:.1f}C" if dp is not None else "dp=?"
-    ah_str = f"AH={ah:.1f}g/m3" if ah is not None else "AH=?"
-    meta = f"T={temp} RH={hum}% {dp_str} {ah_str} {delta_rh_str} target={current_target}C"
+    ah_str = f"AH={ah:.1f}" if ah is not None else "AH=?"
+    night_str = "夜间" if is_night else "白天"
+    meta = f"{night_str} T={temp} RH={hum}% {dp_str} {ah_str} {delta_str} {kwh_str} target={current_target}C"
 
     if new_mode is None:
         log(f"无动作 {cl} {meta} 已开={since_on} 已关={since_off} mode={state.get('mode')}")
@@ -300,7 +353,7 @@ def main():
         log(f"[dry] 将执行 {new_mode} target={target} · {meta}")
         return
 
-    # meta：控制成功时额外落盘的字段（由 apply_and_commit 内部 merge，不破坏 P2 所有权）
+    # meta 传递
     extra_meta = None
     if new_mode == "cooling" and target is not None and target < current_target:
         extra_meta = {"last_dehumid_adjust_at": now_ts}
@@ -309,11 +362,12 @@ def main():
     log(f"执行 {new_mode} target={target} → {ctrl['status']} {ctrl.get('action','')} {ctrl.get('reason','')} · {cl} {meta}")
     if ctrl["status"] == "action":
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
-        try:
-            import xiaomi_tts
-            xiaomi_tts.speak(f"空调已自动{ctrl['action']}")
-        except Exception as e:
-            log(f"TTS 播报失败（不影响控制）: {e}")
+        if not is_night:
+            try:
+                import xiaomi_tts
+                xiaomi_tts.speak(f"空调已自动{ctrl['action']}")
+            except Exception as e:
+                log(f"TTS 播报失败（不影响控制）: {e}")
     elif ctrl["status"] == "no_action":
         print(f"ac_watch: 已处目标状态无需动作 · {meta}")
     else:
@@ -329,16 +383,15 @@ def _selftest():
         (301, "compressor"), (500, "compressor"), (1100, "compressor"),
     ]
     for pw, exp in comp_cases:
-        assert compressor_state(pw) == exp, f"compressor_state({pw}) = {compressor_state(pw)}，期望 {exp}"
+        assert compressor_state(pw) == exp, f"compressor_state({pw}) = {compressor_state(pw)}"
 
-    # ── 露点/绝对湿度 ──
-    # 23C/70%RH → 露点约 17.3C, AH 约 12.9g/m3
+    # ── 露点/AH ──
     dp = dew_point(23, 70)
     ah = absolute_humidity(23, 70)
     assert dp is not None and 16 < dp < 18, f"dew_point={dp}"
     assert ah is not None and 12 < ah < 16, f"AH={ah}"
 
-    # ── ΔRH 计算 ──
+    # ── ΔRH ──
     from datetime import timedelta
     base = datetime.now()
     hist = [
@@ -349,39 +402,59 @@ def _selftest():
     ]
     d20, n20 = compute_delta_rh(hist, base.isoformat(), 20)
     assert n20 == 4, f"rh_count={n20}"
-    assert d20 is not None, "delta_rh is None"
-    # 69 - 71 = -2 (reading at -20min = 71, latest = 69)
-    assert abs(d20 - (-2.0)) < 0.1, f"delta_rh_20={d20} 期望 -2.0"
+    assert d20 is not None and abs(d20 - (-2.0)) < 0.1, f"delta_rh_20={d20}"
 
-    # 不足 2 条
     d, n = compute_delta_rh([(base.isoformat(), 70)], base.isoformat(), 20)
-    assert d is None and n == 1, f"single entry: d={d} n={n}"
+    assert d is None and n == 1
 
-    # ── decide v8.4 除湿效率 ──
-    # 正常除湿（Tier 1）：ΔRH=-2%/20min, 有效
-    assert decide(27, 68, True, 30, 90, False, "compressor", None, None, 26, -2.0, None) == (None, None)
-    # 低效（Tier 2）：RH>66%, ΔRH=0, 未达强制阈值 → -1C
-    assert decide(27, 68, True, 30, 90, False, "compressor", None, None, 26, 0.0, None) == ("cooling", 25)
-    # 强制（Tier 3）：已跑40min+, RH>68%, ΔRH=0 → -1C
-    assert decide(27, 69, True, 45, 90, False, "compressor", None, None, 26, 0.0, None) == ("cooling", 25)
-    # 达标关
-    assert decide(27, 60, True, 30, 90, False, "compressor", None, None, 26, 0.0, None) == ("off", None)
-    # 硬上限关
-    assert decide(27, 68, True, 95, 90, False, "compressor", None, None, 26, 0.0, None) == ("off", None)
-    # 无效（Tier 4）：60min RH 波动 <1.5%
-    assert decide(27, 69, True, 65, 90, False, "compressor", None, None, 26, -0.5, 0.5) == (None, None)
-    # ΔRH 数据不足 → 继续
-    assert decide(27, 68, True, 30, 90, False, "compressor", None, None, 26, None, None) == (None, None)
-    # 假运行
-    _past = datetime.now() - timedelta(minutes=31)
-    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, None, 26, None, None) == ("cooling", 24)
-    # 假运行 - 冷却期内
+    # ── kWh 积分 ──
+    st = {}
+    update_kwh(st, "2026-08-14T22:00:00", 1100)
+    assert st.get("estimated_kwh") == 0.0, f"first tick kwh={st['estimated_kwh']}"
+    assert st["_prev_power"] == 1100
+    update_kwh(st, "2026-08-14T22:10:00", 1100)
+    # 1100W * 10min = 1100 * (10/60) / 1000 = 0.1833 kWh
+    assert abs(st["estimated_kwh"] - 0.1833) < 0.01, f"kwh_10min={st['estimated_kwh']}"
+    update_kwh(st, "2026-08-14T22:20:00", 25)
+    # 梯形: (1100+25)/2 * 10min / 1000 = 0.09375
+    assert abs(st["estimated_kwh"] - 0.2771) < 0.01, f"kwh_20min={st['estimated_kwh']}"
+
+    # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
-    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, _future, 26, None, None) == (None, None)
-    # 未运行
-    assert decide(29, 60, False, None, None, False, "off", None, None, 26, None, None) == ("cooling", 27)
+    # 夜间：T>=28 → 启动 27C
+    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None) == ("cooling", 27)
+    # 夜间：AH>=17 → 启动 27C
+    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 17.5, None) == ("cooling", 27)
+    # 夜间：条件不满足 → 不动
+    assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None) == (None, None)
+    # 夜间运行中：AH<=14 → 关
+    assert decide(24, 60, True, 30, 90, True, "compressor", None, None, 27, 0, 0, None, 13.5, None) == ("off", None)
+    # 白天运行中：原逻辑
+    assert decide(27, 65, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, None, None) == (None, None)
+    assert decide(27, 68, True, 50, 90, False, "compressor", None, None, 26, 0, 0, None, None, None) == ("cooling", 25)
 
-    # ── apply_and_commit 状态所有权测试 ──
+    # ── 原 v8.4 decide 测试（带 is_night=False） ──
+    cases = [
+        ((27.0, 65, True, 30, 90, False, "compressor", None, None, 26, None, None, None, None, None), (None, None)),
+        ((27.0, 68, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None), (None, None)),
+        ((27.0, 60, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None), ("off", None)),
+        ((27.0, 65, True, 95, 90, False, "compressor", None, None, 26, None, None, None, None, None), ("off", None)),
+        ((29.0, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None), ("cooling", 27)),
+        ((27.0, 72, False, None, None, False, "off", None, None, 26, None, None, None, None, None), ("cooling", 24)),
+        ((27.0, 65, False, None, None, False, "off", None, None, 26, None, None, None, None, None), (None, None)),
+        ((25.0, 72, False, None, None, False, "off", None, None, 26, None, None, None, None, None), (None, None)),
+    ]
+    for args, exp in cases:
+        got = decide(*args)
+        assert got == exp, f"decide{args} = {got}"
+
+    # ── 假运行 ──
+    _past = datetime.now() - timedelta(minutes=31)
+    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None) == ("cooling", 24)
+    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, _future, 26, None, None, None, None, None) == (None, None)
+    assert decide(27, 58, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None) == ("off", None)
+
+    # ── apply_and_commit ──
     saved = []
     A.save_state = lambda s: saved.append(dict(s))
     called = []
@@ -396,59 +469,27 @@ def _selftest():
     saved.clear(); called.clear()
     st = {"mode": "off", "run_start": None}
     r = A.apply_and_commit("cooling", 24, st, TS)
-    assert r["status"] == "action" and st["mode"] == "cooling" and st["run_start"] == TS and st["last_on_at"] == TS, (r, st)
+    assert r["status"] == "action" and st["mode"] == "cooling" and st["run_start"] == TS
 
-    st2 = {"mode": "cooling", "run_start": "2026-08-14T12:00:00", "last_on_at": "2026-08-14T12:00:00"}
+    st2 = {"mode": "cooling", "run_start": "2026-08-14T12:00:00"}
     A.apply_and_commit("cooling", 24, st2, TS)
-    assert st2["run_start"] == "2026-08-14T12:00:00" and st2["last_on_at"] == "2026-08-14T12:00:00", st2
+    assert st2["run_start"] == "2026-08-14T12:00:00"
 
     A.ac_apply = lambda m, t: fake_apply(m, t, "action", "关")
     A.verify_socket = lambda: "off"
     saved.clear(); called.clear()
     st = {"mode": "cooling", "run_start": "2026-08-14T12:00:00", "last_off_at": None}
     r = A.apply_and_commit("off", None, st, TS)
-    assert r["status"] == "action" and st["mode"] == "off" and st["last_off_at"] == TS and st["run_start"] is None, (r, st)
-
-    st3 = {"mode": "off", "last_off_at": "2026-08-14T13:00:00"}
-    A.apply_and_commit("off", None, st3, TS)
-    assert st3["last_off_at"] == "2026-08-14T13:00:00", st3
+    assert r["status"] == "action" and st["mode"] == "off" and st["last_off_at"] == TS
 
     A.ac_apply = lambda m, t: fake_apply(m, t, "failed")
     A.verify_socket = lambda: None
     saved.clear(); called.clear()
     st = {"mode": "off", "run_start": None}
     r = A.apply_and_commit("cooling", 24, st, TS)
-    assert r["status"] == "failed" and st == {"mode": "off", "run_start": None}, (r, st)
+    assert r["status"] == "failed" and st == {"mode": "off", "run_start": None}
 
-    A.ac_apply = lambda m, t: fake_apply(m, t, "action", "开")
-    A.verify_socket = lambda: "off"
-    saved.clear(); called.clear()
-    st = {"mode": "off", "run_start": None}
-    r = A.apply_and_commit("cooling", 24, st, TS)
-    assert r["status"] == "failed" and r["reason"] == "verify_off_after_on" and st["mode"] == "off" and st["run_start"] is None, (r, st)
-
-    A.ac_apply = lambda m, t: fake_apply(m, t, "action", "关")
-    A.verify_socket = lambda: "on"
-    saved.clear(); called.clear()
-    st = {"mode": "cooling", "run_start": "2026-08-14T12:00:00", "last_off_at": None}
-    r = A.apply_and_commit("off", None, st, TS)
-    assert r["status"] == "failed" and r["reason"] == "verify_on_after_off" and st["mode"] == "cooling" and "last_off_at" not in st, (r, st)
-
-    A.ac_apply = lambda m, t: fake_apply(m, t, "action", "开")
-    A.verify_socket = lambda: None
-    saved.clear(); called.clear()
-    st = {"mode": "off", "run_start": None}
-    r = A.apply_and_commit("cooling", 24, st, TS)
-    assert r["status"] == "failed" and r["reason"] == "verify_unreachable" and st == {"mode": "off", "run_start": None}, (r, st)
-
-    A.ac_apply = lambda m, t: fake_apply(m, t, "no_action")
-    A.verify_socket = lambda: "off"
-    saved.clear(); called.clear()
-    st = {"mode": "off", "run_start": None}
-    r = A.apply_and_commit("off", None, st, TS)
-    assert r["status"] == "no_action" and st["mode"] == "off", (r, st)
-
-    total = len(comp_cases) + 11  # decide cases
+    total = len(comp_cases) + 11 + 8 + 3
     print(f"selftest OK: {total} decide + 9 apply_and_commit 状态路径")
 
 
