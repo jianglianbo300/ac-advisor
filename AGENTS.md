@@ -184,3 +184,7 @@ cat ~/.hermes/cron/output/fc62a2bfd83d/$(ls -t ~/.hermes/cron/output/fc62a2bfd83
 - **LAN miIO 不能 TTS**：`miIO.speaker_command` 对 l16a 返回 `user ack timeout`（-9999）——Xiaomi Sound 的 TTS 只能走云端 MiNA，局域网只能做设备状态/控制
 - **Chrome CDP cookie 不能直接自动登录**：web 会话的 passToken 调 serviceLogin 仍返回 70016 跳登录页（UA 不匹配 web 签发态）；QR 登录才是干净的静默路径
 - 环境注意：aiohttp `cookie_jar.update_cookies()` 需传 `URL` 对象（非 str），且畸形 cookie 名会抛 `CookieError`——注入前按白名单过滤
+
+### 2026-08-15 cron 全天化（修复凌晨无人巡检）
+- `空调自动监控` job `1d6c5460de5e`：schedule `*/10 7-23 * * *` → `*/10 * * * *`（脚本内夜间模式 NIGHT=(23,7) 本就设计通宵运行，此前被外层 cron 窗口卡死，凌晨 0–7 点零巡检）
+- 事件：23:50 停机 T=23/RH=69 → 01:25 闷到 27°C/71%/AH=18.3 无人开；手动 tick 即自动开机 27°C
