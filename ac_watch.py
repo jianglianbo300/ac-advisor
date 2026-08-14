@@ -157,6 +157,16 @@ def update_kwh(state, now_ts, load_power):
         state["_prev_kwh_ts"] = now_ts
 
 
+def stale_stop_ts(old_ts, run_start_ts):
+    """旧 compressor_stop 时间戳是否早于本次 run_start（跨周期遗留视为无效）。"""
+    if not old_ts:
+        return True
+    try:
+        return bool(run_start_ts) and old_ts < run_start_ts
+    except Exception:
+        return False
+
+
 def open_cycle(state, now_ts, ah, rh):
     """开机动作(apply+verify 通过)时记录周期开始快照。纯数据层，不影响决策。"""
     state["cycle_start"] = {
@@ -336,7 +346,8 @@ def main():
     elif comp == "fan_only" and state_comp_before == "compressor":
         state["last_compressor_stop_at"] = now_ts
         last_comp_stop = now_ts
-    elif comp == "fan_only" and state_comp_before != "compressor" and not state.get("last_compressor_stop_at"):
+    elif comp == "fan_only" and state_comp_before != "compressor" and stale_stop_ts(
+            state.get("last_compressor_stop_at"), state.get("run_start")):
         state["last_compressor_stop_at"] = now_ts
         last_comp_stop = now_ts
     state["compressor_state"] = comp
@@ -582,6 +593,12 @@ def _selftest():
     st = {"mode": "off", "run_start": None}
     r = A.apply_and_commit("cooling", 24, st, TS)
     assert r["status"] == "failed" and st == {"mode": "off", "run_start": None}
+
+    # ── stale_stop_ts（跨周期旧时间戳判定） ──
+    assert stale_stop_ts(None, "2026-08-15T01:24:24") is True
+    assert stale_stop_ts("2026-08-14T23:30:22", "2026-08-15T01:24:24") is True
+    assert stale_stop_ts("2026-08-15T01:30:34", "2026-08-15T01:24:24") is False
+    assert stale_stop_ts("2026-08-15T01:24:24", "2026-08-15T01:24:24") is False
 
     # ── cycle log（v8.6 数据层） ──
     import tempfile
