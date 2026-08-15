@@ -1,0 +1,17 @@
+{
+  "status": "ok",
+  "cycles": 3,
+  "by_temp": {
+    "26": {
+      "cycles": 3,
+      "avg_delta_AH": 4.61,
+      "avg_kwh": 0.967,
+      "avg_eff": 100.973,
+      "avg_comp_min": 17.4,
+      "avg_duration_min": 31.3
+    }
+  },
+  "best_temp": 26,
+  "best_eff": 100.973,
+  "analyzed_at": "2026-08-15T14:00:51"
+}

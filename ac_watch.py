@@ -223,15 +223,16 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None):
-    """纯决策函数。返回 (new_mode, target_temp) 或 (None, None)。
+    """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
     不用 since_on（壁钟时间）——定频机到温停压缩机，since_on 包含大量风扇空吹时间。
     失败/低效判断只基于真实除湿工作时间，避免"看起来跑了很久实际没干活"的误判。
+    v8.7：增加 reason 文本——供 TTS 播报"为什么开关"，让用户听到决策逻辑。
     """
     if running is None:
         # 传感器不可达：放弃本次决策，不动作
-        return (None, None)
+        return (None, None, None)
     if running:
         if compressor == "fan_only":
             # ── 假运行（v8.3） ──
@@ -248,10 +249,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                     and stop_duration >= COMPRESSOR_FALSE_RUN_MIN
                     and not in_cooldown):
                 new_target = max(DEHUMID_MIN_TARGET, current_target - COMPRESSOR_RESTART_DROP)
-                return ("cooling", new_target)
+                return ("cooling", new_target,
+                        f"压缩机只吹风不制冷已{int(stop_duration)}分钟，湿度{hum:.0f}%仍偏高，降2度重启压缩机")
             if hum <= DEHUMID_EXIT_RH:
-                return ("off", None)
-            return (None, None)
+                return ("off", None, f"湿度已降到{hum:.0f}%，压缩机已停，关机省电")
+            return (None, None, None)
 
         # ── 压缩机运行中 ──
         # 用压缩机实际累计运行时间（不是壁钟时间）
@@ -259,61 +261,62 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
         # 硬上限：压缩机累计运行超时，无论湿度如何都停（保护压缩机）
         if comp_min is not None and comp_min >= WATCH_MAX_RUN:
-            return ("off", None)
+            return ("off", None, f"压缩机已连续运行{int(comp_min)}分钟，为保护压缩机强行关机")
 
         # 夜间停止条件
         if is_night:
             if ah is not None and ah <= NIGHT_STOP_AH:
-                return ("off", None)
+                return ("off", None, f"夜间室内湿度已达标（AH={ah:.1f}），关机省电")
             if temp <= NIGHT_STOP_T and (ah is None or ah <= NIGHT_STOP_AH + 2):
-                return ("off", None)
+                return ("off", None, f"夜间室温已降到{temp:.0f}度，关机防过冷省电")
 
         # 过冷保护（v8.6 白天）：温度已低于舒适下限且不闷 → 停，避免吹到 22°C 以下
         if not is_night and temp <= DAY_COOL_STOP_T:
             if ah is not None and ah <= NIGHT_STOP_AH + NIGHT_STOP_AH_HYST:
-                return ("off", None)
+                return ("off", None, f"室温已降到{temp:.0f}度不闷，过冷保护关机")
 
         # 湿度达标
         if hum <= DEHUMID_EXIT_RH:
-            return ("off", None)
+            return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
         # 无效（Tier 4）：压缩机实际跑了 60min 以上 RH 不动 → 立即关掉（不空耗）
         if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN
                 and delta_rh_60min is not None and abs(delta_rh_60min) < DEHUMID_STALL_RH_BAND):
-            return ("off", None)
+            return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度没变化，判定无效空耗关机")
 
         # 正常除湿（Tier 1）
         if delta_rh_20min is not None and delta_rh_20min <= DEHUMID_DELTA_RH_MIN:
-            return (None, None)
+            return (None, None, None)
 
         # 低效（Tier 2）
         if hum > DEHUMID_LOW_EFF_RH and delta_rh_20min is not None and delta_rh_20min > DEHUMID_DELTA_RH_MIN:
             if minutes_since_last_adjust is not None and minutes_since_last_adjust < DEHUMID_ADJUST_COOLDOWN:
-                return (None, None)
+                return (None, None, None)
             if comp_min is not None and comp_min >= DEHUMID_FORCE_MIN and hum > DEHUMID_FORCE_RH:
                 new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
-                return ("cooling", new_target)
+                return ("cooling", new_target, f"除湿太慢湿度{hum:.0f}%还降不下来，再降1度加强除湿")
             new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
-            return ("cooling", new_target)
+            return ("cooling", new_target, f"除湿偏慢，目标温度降1度到{new_target}度")
 
-        return (None, None)
+        return (None, None, None)
 
     # ── 未运行 ──
     if since_off is not None and since_off < A.MIN_OFF:
-        return (None, None)
+        return (None, None, None)
     if is_night:
         # 分支 A 夜间对齐：目标永远低于室温 2C（保证定频压缩机启动），clamp 24~26
         night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
         if temp >= NIGHT_START_T:
-            return ("cooling", night_target)
+            return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
         if ah is not None and ah >= NIGHT_START_AH + NIGHT_STOP_AH_HYST:
-            return ("cooling", night_target)
-        return (None, None)
+            return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
+        return (None, None, None)
     if temp >= A.TEMP_COOLING:
-        return ("cooling", round(max(26, min(28, temp - 2))))
+        t = round(max(26, min(28, temp - 2)))
+        return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度")
     if temp >= A.TEMP_DEHUMID_LOW and hum >= A.HUM_DEHUMID_ON:
-        return ("cooling", 24)
-    return (None, None)
+        return ("cooling", 24, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷24度强力除湿")
+    return (None, None, None)
 
 
 def main():
@@ -420,7 +423,7 @@ def main():
         except Exception:
             pass
 
-    new_mode, target = decide(temp, hum, running, since_on, since_off, is_night,
+    new_mode, target, reason = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
                               last_compressor_stop_at=stop_duration,
                               cooldown_until_dt=cooldown,
@@ -471,7 +474,8 @@ def main():
         if not is_night:
             try:
                 import xiaomi_tts
-                xiaomi_tts.speak(f"空调已自动{ctrl['action']}")
+                tts_msg = f"空调已自动{ctrl['action']}，{reason}。" if reason else f"空调已自动{ctrl['action']}。"
+                xiaomi_tts.speak(tts_msg)
             except Exception as e:
                 log(f"TTS 播报失败（不影响控制）: {e}")
     elif ctrl["status"] == "no_action":
@@ -540,21 +544,21 @@ def _selftest():
     # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
     # 白天过冷保护：T=22 AH=13.5 → 停
-    assert decide(22, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30) == ("off", None)
+    assert decide(22, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30)[:2] == ("off", None)
     # 白天 T=25 AH=13.5（不冷）→ 不停
-    assert decide(25, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30) != ("off", None)
+    assert decide(25, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30)[:2] != ("off", None)
 
     # 夜间：T>=28 → 启动 室温-2=27 → clamp 上限 26
-    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None) == ("cooling", 26)
+    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None)[:2] == ("cooling", 26)
     # 夜间：AH>=18（17+1 迟滞，室温 26）→ 启动 26-2=24
-    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None) == ("cooling", 24)
+    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None)[:2] == ("cooling", 24)
     # 夜间：条件不满足 → 不动
-    assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None) == (None, None)
+    assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None)[:2] == (None, None)
     # 夜间运行中：AH<=14 → 关
-    assert decide(24, 60, True, 30, 90, True, "compressor", None, None, 27, 0, 0, None, 13.5, None) == ("off", None)
+    assert decide(24, 60, True, 30, 90, True, "compressor", None, None, 27, 0, 0, None, 13.5, None)[:2] == ("off", None)
     # 白天运行中：原逻辑
-    assert decide(27, 65, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, None, None) == (None, None)
-    assert decide(27, 68, True, 50, 90, False, "compressor", None, None, 26, 0, 0, None, None, None) == ("cooling", 25)
+    assert decide(27, 65, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, None, None)[:2] == (None, None)
+    assert decide(27, 68, True, 50, 90, False, "compressor", None, None, 26, 0, 0, None, None, None)[:2] == ("cooling", 25)
 
     # ── 原 v8.4 decide 测试（带 is_night=False） ──
     cases = [
@@ -569,13 +573,13 @@ def _selftest():
     ]
     for args, exp in cases:
         got = decide(*args)
-        assert got == exp, f"decide{args} = {got}"
+        assert got[:2] == exp, f"decide{args} = {got}"
 
     # ── 假运行 ──
     _past = datetime.now() - timedelta(minutes=31)
-    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None) == ("cooling", 24)
-    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, _future, 26, None, None, None, None, None) == (None, None)
-    assert decide(27, 58, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None) == ("off", None)
+    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None)[:2] == ("cooling", 24)
+    assert decide(27, 68, True, 20, 90, False, "fan_only", 5, _future, 26, None, None, None, None, None)[:2] == (None, None)
+    assert decide(27, 58, True, 20, 90, False, "fan_only", 5, None, 26, None, None, None, None, None)[:2] == ("off", None)
 
     # ── apply_and_commit ──
     saved = []
