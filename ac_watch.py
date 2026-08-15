@@ -34,6 +34,7 @@ NIGHT_STOP_AH_HYST = 1.0    # 夜间停止迟滞带（降到 14 停，升到 15 
 NIGHT_STOP_T = 26.0         # 夜间停止温度阈值
 NIGHT_TARGET = 26           # 夜间目标温度上限（=clamp(室温-2,24,26)，分支 A 夜间对齐）
 NIGHT_MIN_TARGET = 24       # 夜间目标温度下限（防过冷）
+DAY_COOL_STOP_T = 22       # 白天制冷过冷保护：≤22°C 且 AH≤NIGHT_STOP_AH+2 → 停（防过冷不停）
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
 NIGHT_EXTEND_RUN = 30       # 超限后单次运行延长(min)
@@ -265,6 +266,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             if ah is not None and ah <= NIGHT_STOP_AH:
                 return ("off", None)
             if temp <= NIGHT_STOP_T and (ah is None or ah <= NIGHT_STOP_AH + 2):
+                return ("off", None)
+
+        # 过冷保护（v8.6 白天）：温度已低于舒适下限且不闷 → 停，避免吹到 22°C 以下
+        if not is_night and temp <= DAY_COOL_STOP_T:
+            if ah is not None and ah <= NIGHT_STOP_AH + NIGHT_STOP_AH_HYST:
                 return ("off", None)
 
         # 湿度达标
@@ -533,6 +539,11 @@ def _selftest():
 
     # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
+    # 白天过冷保护：T=22 AH=13.5 → 停
+    assert decide(22, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30) == ("off", None)
+    # 白天 T=25 AH=13.5（不冷）→ 不停
+    assert decide(25, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30) != ("off", None)
+
     # 夜间：T>=28 → 启动 室温-2=27 → clamp 上限 26
     assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None) == ("cooling", 26)
     # 夜间：AH>=18（17+1 迟滞，室温 26）→ 启动 26-2=24
