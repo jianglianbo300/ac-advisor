@@ -100,16 +100,21 @@ def cost_est(kwh):
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "ac_state.json")
 
-# ── 天气 API ──────────────────────────────
+# ── 天气 API（和风天气 CMA 数据源） ────────
 LAT, LON = 31.11, 121.38
-WX_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-    f"?latitude={LAT}&longitude={LON}"
-    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code"
-    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-    "&hourly=relative_humidity_2m,precipitation_probability"
-    "&timezone=Asia%2FShanghai"
-)
+QW_HOST = "kf54e6wb7f.re.qweatherapi.com"
+QW_KEY = "e630a3166d6f4146be43fa822cea63a1"
+
+def _qw_get(endpoint: str) -> dict:
+    """调用和风天气 API v2，自动解 gzip，返回 JSON"""
+    import gzip
+    url = f"https://{QW_HOST}/weather/v1/{endpoint}/{LAT}/{LON}"
+    req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
+    resp = urllib.request.urlopen(req, timeout=15)
+    body = resp.read()
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    return json.loads(body.decode("utf-8"))
 
 # ── 室内传感器（小米空气净化器 4 Lite） ────
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "miio_config.json")
@@ -155,11 +160,60 @@ def minutes_since(ts_str: str | None) -> float | None:
 
 
 def fetch_weather() -> dict:
-    """获取天气数据，带异常处理"""
+    """获取天气数据（和风天气 CMA 数据源），返回 Open-Meteo 兼容格式"""
     try:
-        req = urllib.request.Request(WX_URL, headers={"User-Agent": "ac-advisor/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
+        from datetime import timezone, timedelta, datetime
+        CST = timezone(timedelta(hours=8))
+        cur = _qw_get("current")  # 返回的已是扁平结构，无内层 current key
+        dai = _qw_get("daily")["days"][0]
+        hrs = _qw_get("hourly")["hours"]
+
+        # 和风天气 code → WMO 近似值
+        QW2WMO = {100:0, 101:2, 102:2, 103:3, 104:3,
+                  200:0, 201:0, 202:0, 203:0,
+                  300:0, 301:1, 302:2, 303:95, 304:95,  # 303=雷阵雨
+                  400:0, 401:0, 402:0, 403:0,
+                  500:45, 501:45, 502:45, 503:45, 504:45,
+                  507:45, 508:45, 509:45,
+                  510:51, 511:51, 512:51, 513:51, 514:51,
+                  600:61, 601:61, 602:63, 603:65,
+                  305:61, 306:63, 307:65,  # 305=小雨
+                  610:80, 611:80, 612:80, 613:80,
+                  700:45, 701:45, 702:45, 703:45, 704:45,
+                  800:95, 801:95, 802:95, 803:95, 804:95}
+        wmo = QW2WMO.get(int(cur.get("condition",{}).get("code", 0)), 0)
+
+        # 取白天降雨概率（白天更活跃）
+        day_prec = dai.get("daytime", {}).get("precipitation", {})
+        rain_prob = day_prec.get("probability", 0) if isinstance(day_prec, dict) else 0
+
+        times = []
+        for h in hrs:
+            t_utc = datetime.fromisoformat(h["forecastTime"].replace("Z", "+00:00"))
+            t_local = t_utc.astimezone(CST)
+            times.append(t_local.strftime("%Y-%m-%dT%H:%M"))
+
+        return {
+            "current": {
+                "temperature_2m": cur["temperature"]["value"],
+                "apparent_temperature": cur["feelsLike"]["value"],
+                "relative_humidity_2m": round(cur["humidity"] * 100),
+                "weather_code": wmo,
+            },
+            "daily": {
+                "temperature_2m_max": [dai["temperatureMax"]["value"]],
+                "temperature_2m_min": [dai["temperatureMin"]["value"]],
+                "precipitation_probability_max": [round(rain_prob * 100)],
+            },
+            "hourly": {
+                "time": times,
+                "relative_humidity_2m": [round(h["humidity"] * 100) for h in hrs],
+                "precipitation_probability": [
+                    round(h["precipitation"]["probability"] * 100) if isinstance(h.get("precipitation"), dict) else 0
+                    for h in hrs
+                ],
+            },
+        }
     except Exception as e:
         return {"error": str(e)}
 
