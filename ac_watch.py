@@ -797,6 +797,7 @@ def main():
 
     # ── v8.17 室外免费干燥门控：干爽天让开窗干活，不花电除湿 ──
     # 只拦"从关到开"的启动决策；RH 爬过 70 或天气失效自动放行（fail-open，自限）。
+    mode_before = state.get("mode")
     if new_mode == "cooling" and mode_before not in ("cooling", "dehumid", "dehumid_alert"):
         wx = cached_outdoor(state, now_dt)
         dp_out = dew_point(wx["t"], wx["rh"]) if wx else None
