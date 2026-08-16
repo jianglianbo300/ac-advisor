@@ -141,6 +141,13 @@ VENT_GATE_HOURS = (8, 22) # 夜间关窗睡觉不适用
 VENT_WX_TTL_MIN = 30      # 天气缓存（仅门控触发时才拉，防 2min tick 打爆 API）
 VENT_TTS_COOLDOWN = 30    # TTS 提示最短间隔(min)；门控决策本身不受此限
 
+# ── v8.18 晚间恒温巡航（2026-08-16 实测定档）──
+# 依据：晚间锯齿（0.37kWh/h 实测）与持续26°C（0.32-0.54 估算）电耗打平，但温度 24-27 摆动
+# 体感差（用户两晚间喊热均发生在锯齿波谷）→ 20-23 点切"温度优先巡航"，23 点后交还夜间省电逻辑。
+EVENING = (20, 23)        # 晚间巡航时段
+EVENING_TARGET = 26       # 巡航设定（定频机靠自身温控器占空比调制）
+EVENING_START_T = 26.5    # 温度到线即开巡航（不等湿度线）
+
 # ── v8.4 除湿效率参数 ──
 DEHUMID_EXIT_RH = 55               # 湿度达标退出线（与 HUM_DEHUMID_ON=65 保持 10% 滞回，防频繁启停）
 DEHUMID_LOW_EFF_RH = 66            # 低效检测湿度阈值
@@ -392,7 +399,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, compressor_stop_duration_min=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
-           night_comp_starts=None, fake_run_count=None):
+           night_comp_starts=None, fake_run_count=None, evening=False):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
@@ -454,7 +461,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         comp_min = compressor_run_min if compressor_run_min is not None else since_on
 
         # 硬上限：压缩机累计运行超时，无论湿度如何都停（保护压缩机）
-        if comp_min is not None and comp_min >= WATCH_MAX_RUN:
+        # v8.18：晚间巡航豁免——定频机由自身温控器占空比调制，累计时长≠连续运行
+        if comp_min is not None and comp_min >= WATCH_MAX_RUN and not evening:
             return ("off", None, f"压缩机已连续运行{int(comp_min)}分钟，为保护压缩机强行关机")
 
         # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
@@ -492,7 +500,9 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # AH=真实含水量，达标即收手，室温可停在 25°C 而不是吹到 23°C；
         # 自带 10min 压缩机地板（低于 MIN_RUN：AH 达标≈目标完成，类比安全类早停，
         # 配合 MIN_OFF=30 → 白天最多 ~2 次启动/小时，远低于夜间上限 4 次）。
-        if (not is_night and ah is not None and hum <= DAY_EXIT_RH_MAX
+        # v8.18：晚间巡航时豁免舒适类停止（双轴/RH达标/无效判定）——巡航目标是恒温，
+        # 只保留安全类（过冷逃生门/白天过冷保护/传感器失效），除湿收手逻辑留给日/夜模式
+        if (not is_night and not evening and ah is not None and hum <= DAY_EXIT_RH_MAX
                 and ah <= DAY_STOP_AH
                 and comp_min is not None and comp_min >= DUAL_STOP_MIN_COMP):
             return ("off", None, f"含水量已达标（AH={ah:.1f}，RH={hum:.0f}%），关机防过冷")
@@ -502,7 +512,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             return (None, None, None)
 
         # 湿度达标
-        if hum <= DEHUMID_EXIT_RH:
+        if not evening and hum <= DEHUMID_EXIT_RH:
             return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
         # 虚拟变频（v8.8）：湿度接近达标（≤58）且已跑够 MIN_RUN → 升温降负载缓除
@@ -518,7 +528,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
         # 无效（Tier 4）：压缩机实际跑了 60min 以上 RH 降幅不足 → 立即关掉（不空耗）
         # 方向性判断：湿度上涨=环境在加湿，不该停；只有下降不足才算无效
-        if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN
+        if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN and not evening
                 and delta_rh_60min is not None
                 and delta_rh_60min > -DEHUMID_STALL_RH_BAND):
             return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度降幅不足，判定无效空耗关机")
@@ -563,6 +573,9 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     # 峰电维持原阈值不推迟（保舒适，不牺牲体验）
     if temp >= A.TEMP_DEHUMID_LOW and hum >= (VALLEY_START_RH if A.current_price() < A.ELECTRIC_PEAK else A.HUM_DEHUMID_ON):
         return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度强力除湿")
+    # v8.18 晚间恒温巡航：温度优先（闷热除湿分支在上方先判，RH≥65/62 仍走深除）
+    if evening and temp >= EVENING_START_T:
+        return ("cooling", EVENING_TARGET, f"晚间恒温巡航{EVENING_TARGET}度（温度优先，电耗与锯齿打平）")
     return (None, None, None)
 
 
@@ -742,6 +755,7 @@ def main():
 
     # ── v8.5 夜间模式判断 ──
     is_night = night_hours()
+    evening = EVENING[0] <= now_dt.hour < EVENING[1]
 
     # 调温冷却锁
     last_adjust = state.get("last_dehumid_adjust_at")
@@ -772,7 +786,8 @@ def main():
                               ah=ah,
                               compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0),
                               night_comp_starts=state.get("_night_comp_starts"),
-                              fake_run_count=fake_run_count)
+                              fake_run_count=fake_run_count,
+                              evening=evening)
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
@@ -973,7 +988,14 @@ def _selftest():
     assert _rec["rh_spike"] is True
     os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
 
-    print("ac_watch selftest: ALL PASS (v8.17)")
+    # v8.18 晚间恒温巡航
+    assert decide(26.5, 60, False, None, 90, False, "off", None, None, 26, None, None, None, None, None, evening=True)[:2] == ("cooling", 26)
+    assert decide(26.5, 66, False, None, 90, False, "off", None, None, 26, None, None, None, None, None, evening=True)[:2] == ("cooling", 25)  # 闷热除湿优先
+    assert decide(25, 61, True, 12, 90, False, "compressor", None, None, 26, -2.0, None, None, 14.0, 10, evening=True)[:2] == (None, None)  # 巡航不吃双轴停止
+    assert decide(26, 54, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, 12.0, 50, evening=True)[:2] == (None, None)  # 巡航不吃RH达标停止
+    assert decide(23.5, 70, True, 50, 90, False, "compressor", None, None, 26, 0, 0, None, 15.0, 50, evening=True)[0] == "off"  # 安全逃生门保留
+
+    print("ac_watch selftest: ALL PASS (v8.18)")
 
 
 if __name__ == "__main__":
