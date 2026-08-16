@@ -36,8 +36,8 @@ for p in _MIIO_PATHS:
 TEMP_COOLING = 28       # 体感≥28 → 制冷
 TEMP_DEHUMID_LOW = 26   # 除湿温度下限（对齐"不算热"）
 TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
-HUM_DEHUMID_ON = 70     # 除湿开启湿度阈值(65->70 与 ac_off_alert 趋势触发线对齐, 防 68% 这种不闷也叫开)
-HUM_DEHUMID_OFF = 60    # 除湿关闭湿度阈值（滞回 5%）
+HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值（68% 就闷了，65% 更合理）
+HUM_DEHUMID_OFF = 55    # 除湿关闭湿度阈值（滞回 10%，防频繁启停）
 TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限（OR 逃生门，低于此无条件关）
 MIN_RUN = 40            # 开一次至少 40 分钟
 MIN_OFF = 30            # 关后至少 30 分钟再开
@@ -142,9 +142,11 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    """写入持久化状态"""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    """写入持久化状态（原子写：临时文件 → rename）"""
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 def minutes_since(ts_str: str | None) -> float | None:
@@ -316,6 +318,9 @@ def ac_apply(new_mode, target_temp=None):
                     act.append(f"设定{target_temp}°C")
             except Exception:
                 pass
+    elif new_mode == "fan_locked":
+        # 想开但关后 <MIN_OFF 锁定 → 保持现状不动作（关着保持关；手动开着的绝不碰，用户意图优先）
+        pass
     elif new_mode in ("fan", "off"):
         if on:
             try:
@@ -330,16 +335,40 @@ def reconcile_state(state, now_ts):
     """以插座实测为权威对账持久化状态（P2）。
     插座可达时真实设备状态优先：state 说运行但插座关 → 记 manual_off_at 并回正；
     state 说关但插座开 → 记 manual_on_at 并标记运行（模式未知按 cooling 计）。
-    插座不可达（AC_SOCKET=None）时跳过，回退持久化状态。"""
+    插座不可达（AC_SOCKET=None）时跳过，回退持久化状态。
+
+    系统自己关的（_system_off_at 标记）不视为手动干预，
+    避免 ac_watch 的 decide() 被 reconcile_state 篡改 state 后无法正确执行过冷保护等关机逻辑。"""
     if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
-        state["manual_off_at"] = now_ts
+        # 排除系统自己关的 → 不设 manual_off_at，只回正
+        sys_off = state.get("_system_off_at")
+        is_system_off = False
+        if sys_off:
+            try:
+                sys_off_dt = datetime.fromisoformat(sys_off) if isinstance(sys_off, str) else sys_off
+                now_dt = datetime.fromisoformat(now_ts) if isinstance(now_ts, str) else now_ts
+                if (now_dt - sys_off_dt).total_seconds() < 180:
+                    is_system_off = True
+            except Exception:
+                pass
+        if not is_system_off:
+            state["manual_off_at"] = now_ts
         state["mode"] = "off"
         state["last_off_at"] = now_ts
         state["run_start"] = None
-    elif AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        # 清理 _system_off_at（已消费或过期，不再需要）
+        state.pop("_system_off_at", None)
+        return  # 处理后立即返回，不走下面
+
+    # 清理过期 _system_off_at（非 off 状态时已无用，不影响 elif 连接）
+    if state.get("_system_off_at"):
+        state.pop("_system_off_at", None)
+    if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
         state["manual_on_at"] = now_ts
         state["mode"] = "cooling"
         state["run_start"] = now_ts
+        state["_fake_run_count"] = 0
+        _learn_from_manual(state, now_ts)  # 用户习惯学习
 
 
 def verify_socket():
@@ -372,6 +401,7 @@ def apply_state_from_verify(state, new_mode, real, now_ts):
     if new_mode in ("fan", "fan_locked", "off"):
         if was_on:
             state["last_off_at"] = now_ts
+            state["_system_off_at"] = now_ts
         state["mode"] = new_mode
         state["run_start"] = None
         return None
@@ -408,6 +438,9 @@ def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
     if meta and not contradict:
         for k, v in meta.items():
             state[k] = v
+    # 持久化 target_temp（执行成功时写入，off 模式不覆盖）
+    if not contradict and target_temp is not None:
+        state["target_temp"] = target_temp
     save_state(state)
     return ctrl
 
@@ -443,6 +476,47 @@ DAYS_PER_MONTH = 30      # 月差价估算天数
 NIGHT_DUTY_26 = (2 * 0.55 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷26°C：前2h压1°C轻载、后4h维持
 NIGHT_DUTY_24 = (2 * 0.85 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷24°C：前2h硬压3°C、后4h维持
 # 说明：睡眠模式设定每小时+1°C → 后半夜设定>室温压缩机基本停，故不用整夜平均 COOL_DUTY(0.70)
+
+def _learn_from_manual(state, now_ts):
+    """用户习惯学习：记录手动干预，学 3 次以上自动调整阈值。
+    存储在 ac_state.json 的 user_pref 字段中。"""
+    try:
+        # 读取当前室内条件（从 rh_history 获取最近一条）
+        rh_hist = state.get("rh_history", [])
+        if not rh_hist:
+            return
+        last_rh = rh_hist[-1][1] if rh_hist else None
+        if last_rh is None:
+            return
+
+        # 初始化 user_pref
+        pref = state.get("user_pref", {})
+        manual_log = pref.get("manual_on_log", [])
+
+        # 记录本次手动干预
+        manual_log.append({
+            "ts": now_ts,
+            "rh": last_rh,
+            "mode": state.get("mode"),
+        })
+
+        # 只保留最近 20 条
+        if len(manual_log) > 20:
+            manual_log = manual_log[-20:]
+
+        pref["manual_on_log"] = manual_log
+
+        # 分析：如果 3+ 次手动开在 RH 60-65 之间，降低阈值
+        low_rh_manual = [m for m in manual_log if 60 <= m.get("rh", 0) < 65]
+        if len(low_rh_manual) >= 3:
+            pref["hum_threshold"] = 60  # 学到用户偏好更低湿度
+        else:
+            pref.pop("hum_threshold", None)  # 恢复默认 65
+
+        state["user_pref"] = pref
+    except Exception:
+        pass  # 学习失败不影响主逻辑
+
 
 def night_cost_lines(indoor_temp, indoor_hum):
     """夜间方案对比（睡前 20:00~次日 6:00 谷电窗口展示）。
@@ -525,7 +599,23 @@ def main():
     # ── 3. 读取持久化状态 ──
     state = load_state()
     now_ts = datetime.now().isoformat()
+    now_dt = datetime.now()
     reconcile_state(state, now_ts)   # 真实设备状态优先对账（P2），修正手动干预/上次控制失败残留
+    # 手动关锚点检查（对齐 ac_watch）：手动关后 2h 内不自动启动，12h TTL 过期后恢复
+    _manual_anchor = False
+    _manual_anchor_mins = None
+    manual_off = state.get("manual_off_at")
+    if manual_off and state.get("mode") in (None, "off"):
+        try:
+            off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
+            mins = (now_dt - off_dt).total_seconds() / 60
+            if 0 <= mins < 120:
+                _manual_anchor = True
+                _manual_anchor_mins = int(mins)
+            if mins >= 720:
+                state.pop("manual_off_at", None)
+        except Exception:
+            pass
     since_on = minutes_since(state.get("run_start"))
     since_off = minutes_since(state.get("last_off_at"))
 
@@ -651,13 +741,36 @@ def main():
 
     # ── ac_off_alert（文档 v2.3 声明，本次落地）：空调未建议运行 + 湿度爆表 → 提醒开空调压湿度（每天最多1次防轰炸） ──
     ac_alert = ""
+    # 读取独立告警状态文件，避免与 ac_watch 并发写 ac_state.json 冲突
+    _alert_state = {}
+    _alert_file = os.path.join(SCRIPT_DIR, "ac_alert_state.json")
+    try:
+        if os.path.exists(_alert_file):
+            with open(_alert_file, "r", encoding="utf-8") as f:
+                _alert_state = json.load(f)
+    except Exception:
+        pass
+    _today = datetime.now().strftime("%Y-%m-%d")
     if (new_mode in ("fan", "fan_locked", "off")
             and hum_sig is not None and hum_sig > 78
             and signal is not None and signal >= TEMP_ABSOLUTE_FLOOR
-            and state.get("last_alert_day") != datetime.now().strftime("%Y-%m-%d")):
-        state["last_alert_day"] = datetime.now().strftime("%Y-%m-%d")
+            and _alert_state.get("last_alert_day") != _today):
+        _alert_state["last_alert_day"] = _today
+        _alert_state["updated_at"] = datetime.now().isoformat()
+        try:
+            with open(_alert_file, "w", encoding="utf-8") as f:
+                json.dump(_alert_state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
         ac_alert = (f"  ⚠️ 湿度{hum_sig:.0f}%偏高：就算不热，也该开空调压一轮湿度"
                     f"（制冷集中 40~60 分钟，到 60% 关）")
+
+    # 手动关锚点覆盖决策（2h 内不自动启动）
+    if _manual_anchor and new_mode in ("cooling", "dehumid", "dehumid_alert"):
+        new_mode = "off"
+        decision = "保持现状（手动关后" + str(_manual_anchor_mins) + "分钟内不自动启动）"
+        reason = "manual_off_anchor"
+        burst_set = None
 
     ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
 
@@ -717,7 +830,8 @@ def main():
         print(ac_alert)
     # 音箱播报结论（与微信/桌面提醒并行；失败静默）
     try:
-        _tts_dir = r"D:\Hermes_Data\.hermes\scripts"
+        # TTS 脚本路径：优先 Hermes 默认 scripts 目录，fallback 旧路径
+        _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
         if _tts_dir not in sys.path:
             sys.path.insert(0, _tts_dir)
         from ac_tts import speak
