@@ -134,6 +134,13 @@ COMPRESSOR_RESTART_DROP = 2        # 假运行时降 2C 重启压缩机
 # 修法：只在相邻有效采样间隔 ≤10min（5 个 tick 容忍度）内积分，跨 gap 只重置锚点不外推。
 KWH_MAX_GAP_MIN = 10
 
+# ── v8.17 室外免费干燥门控（联动决策模型 2b 露点差判据）──
+VENT_GATE_DP_DIFF = 1.5   # 室外露点 ≤ 室内-1.5°C = 🟢 开窗可顺带除湿（省空调电）
+VENT_GATE_MAX_RH = 69     # RH≥70（紧急闷）自动放行，门控自限
+VENT_GATE_HOURS = (8, 22) # 夜间关窗睡觉不适用
+VENT_WX_TTL_MIN = 30      # 天气缓存（仅门控触发时才拉，防 2min tick 打爆 API）
+VENT_TTS_COOLDOWN = 30    # TTS 提示最短间隔(min)；门控决策本身不受此限
+
 # ── v8.4 除湿效率参数 ──
 DEHUMID_EXIT_RH = 55               # 湿度达标退出线（与 HUM_DEHUMID_ON=65 保持 10% 滞回，防频繁启停）
 DEHUMID_LOW_EFF_RH = 66            # 低效检测湿度阈值
@@ -236,6 +243,58 @@ def update_rh_history(state, now_ts, rh):
     state["rh_history"] = hist
 
 
+def update_temp_history(state, now_ts, temp):
+    """v8.17：室温轨迹（与 rh_history 同构），给回弹/自然降温学习铺数据。"""
+    if temp is None:
+        return
+    hist = state.get("temp_history") or []
+    hist.append([now_ts, temp])
+    if len(hist) > 12:
+        hist = hist[-12:]
+    state["temp_history"] = hist
+
+
+def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
+    """v8.17 纯决策：室外免费干燥是否拦下本次开机。
+    判据（00_联动决策模型 2b 🟢 区 + 换气闸门）：白天 + 非紧急(RH<70) + 室温≥24 +
+    无雨(<45%) + 室外露点比室内低 ≥1.5°C。任何输入 None → False（fail-open）。"""
+    if not (VENT_GATE_HOURS[0] <= hour < VENT_GATE_HOURS[1]):
+        return False
+    if hum is None or temp is None or hum >= VENT_GATE_MAX_RH or temp < A.TEMP_ABSOLUTE_FLOOR:
+        return False
+    if rain is not None and rain >= 45:
+        return False
+    if dp_out is None or dp_in is None:
+        return False
+    return dp_out <= dp_in - VENT_GATE_DP_DIFF
+
+
+def cached_outdoor(state, now_dt):
+    """门控专用天气缓存（30min TTL，存标量不存全量防状态膨胀）。
+    返回 {"t":..,"rh":..,"rain":..} 或 None；获取失败 None（fail-open）。"""
+    c = state.get("_vent_wx_cache")
+    if c:
+        try:
+            if (now_dt - datetime.fromisoformat(c["ts"])).total_seconds() < VENT_WX_TTL_MIN * 60:
+                return c["wx"]
+        except Exception:
+            pass
+    try:
+        w = A.fetch_weather()
+        if not w or w.get("error") or "current" not in w:
+            return None
+        t_out = w["current"].get("temperature_2m")
+        rh_out = w["current"].get("relative_humidity_2m")
+        rain = (w.get("daily", {}).get("precipitation_probability_max") or [None])[0]
+        if t_out is None or rh_out is None:
+            return None
+        wx = {"t": t_out, "rh": rh_out, "rain": rain}
+        state["_vent_wx_cache"] = {"ts": now_dt.isoformat(timespec="seconds"), "wx": wx}
+        return wx
+    except Exception:
+        return None
+
+
 def update_kwh(state, now_ts, load_power):
     """梯形积分更新 estimated_kWh。
     每次 tick 调用一次，用当前 load_power 与上一 tick 的功率做梯形积分。
@@ -289,6 +348,14 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
         dur_min = round((datetime.fromisoformat(now_ts) - datetime.fromisoformat(cs["ts"])).total_seconds() / 60.0, 1)
     except Exception:
         dur_min = None
+    # v8.17 周期污染标记：6min 窗口内 RH 逆势跳升 ≥3pp（开门/晾衣/烧水类事件，
+    # COP 寻优时应剔除该周期——LongCat 待办#5 的数据基础）
+    spike = False
+    hist = state.get("rh_history") or []
+    for i in range(2, len(hist)):
+        if hist[i][1] - hist[i - 2][1] >= 3:
+            spike = True
+            break
     rec = {
         "start_ts": cs["ts"],
         "end_ts": now_ts,
@@ -301,6 +368,7 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
         "kwh_used": round(max(0.0, end_kwh - cs.get("kwh", 0.0)), 4),
         "duration_min": dur_min,
         "abort_reason": abort_reason,
+        "rh_spike": spike,
     }
     path = path or os.path.join(os.path.dirname(os.path.realpath(__file__)), "cycle_log.jsonl")
     with open(path, "a", encoding="utf-8") as f:
@@ -664,6 +732,7 @@ def main():
 
     # ── v8.4 RH 历史 ──
     update_rh_history(state, now_ts, hum)
+    update_temp_history(state, now_ts, temp)
     delta_rh_20, _ = compute_delta_rh(state.get("rh_history"), now_ts, 20)
     delta_rh_60, _ = compute_delta_rh(state.get("rh_history"), now_ts, 60)
 
@@ -725,6 +794,33 @@ def main():
         print(f"ac_watch [dry]: 将执行 {new_mode} target={target} · {meta}")
         log(f"[dry] 将执行 {new_mode} target={target} · {meta}")
         return
+
+    # ── v8.17 室外免费干燥门控：干爽天让开窗干活，不花电除湿 ──
+    # 只拦"从关到开"的启动决策；RH 爬过 70 或天气失效自动放行（fail-open，自限）。
+    if new_mode == "cooling" and mode_before not in ("cooling", "dehumid", "dehumid_alert"):
+        wx = cached_outdoor(state, now_dt)
+        dp_out = dew_point(wx["t"], wx["rh"]) if wx else None
+        if vent_gate_decision(now_dt.hour, hum, temp, wx and wx.get("rain"), dp_out, dp):
+            log(f"vent_gate 拦截开机（室外干爽可免费除湿）· {meta}")
+            state["_vent_skip_at"] = now_ts
+            A.save_state(state)
+            last_tts = state.get("_vent_tts_at")
+            tts_ok = last_tts is None
+            if not tts_ok:
+                try:
+                    tts_ok = (now_dt - datetime.fromisoformat(last_tts)).total_seconds() >= VENT_TTS_COOLDOWN * 60
+                except Exception:
+                    tts_ok = True
+            if tts_ok and not is_night:
+                state["_vent_tts_at"] = now_ts
+                A.save_state(state)
+                try:
+                    import xiaomi_tts
+                    xiaomi_tts.speak("室外空气干爽，开窗通风就能除湿，空调先不开，省电。")
+                except Exception:
+                    pass
+            print("ac_watch: 室外干爽，建议开窗免费除湿，本次不开机")
+            return
 
     # meta 传递
     extra_meta = None
@@ -858,7 +954,25 @@ def _selftest():
     # ⑤ 夜间不吃白天双轴规则（夜间有自己的 AH 线 14.0 与 20min 地板）
     assert decide(25, 61, True, 30, 90, True, "compressor", None, None, 25, 0, 0, None, 14.2, 25)[:2] == (None, None)
 
-    print("ac_watch selftest: ALL PASS (v8.16)")
+    # v8.17 门控纯决策 + 周期污染标记
+    assert vent_gate_decision(15, 66, 26, 10, 15.0, 19.0) is True    # 🟢 干爽白天 → 拦
+    assert vent_gate_decision(15, 66, 26, 10, 18.5, 19.0) is False   # 露点差不足 → 放行
+    assert vent_gate_decision(15, 71, 26, 10, 15.0, 19.0) is False   # 紧急(RH≥70) → 放行
+    assert vent_gate_decision(23, 66, 26, 10, 15.0, 19.0) is False   # 夜间 → 放行
+    assert vent_gate_decision(15, 66, 26, 60, 15.0, 19.0) is False   # 有雨 → 放行
+    assert vent_gate_decision(15, 66, 26, 10, None, 19.0) is False   # 数据缺失 fail-open
+    st_spike = {"estimated_kwh": 1.0, "cycle_start": {"ts": "2026-08-16T10:00:00", "ah": 16.0, "rh": 70, "kwh": 0.5},
+                "rh_history": [["2026-08-16T10:00:00", 70], ["2026-08-16T10:02:00", 70],
+                                ["2026-08-16T10:04:00", 74], ["2026-08-16T10:06:00", 74]]}
+    assert close_cycle(st_spike, "2026-08-16T10:06:00", 14.0, 74, 25, 6.0,
+                       path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
+    import json as _json
+    _rec = _json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"),
+                            encoding="utf-8").read().splitlines()[-1])
+    assert _rec["rh_spike"] is True
+    os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
+
+    print("ac_watch selftest: ALL PASS (v8.17)")
 
 
 if __name__ == "__main__":
