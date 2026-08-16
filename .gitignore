@@ -34,3 +34,6 @@ samples.jsonl
 
 # 运行周期数据（v8.6 数据层，每次开关机追加，不入库）
 cycle_log.jsonl
+
+# 效率分析报告（02:00 cron 每日生成，不入库）
+ac_efficiency_report.json
