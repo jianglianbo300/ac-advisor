@@ -1,0 +1,23 @@
+## 问题清单
+
+🔴必须修 | `decide`: 假运行分支 (L102-L120) | **假运行检测存在 56~61% RH 盲区**。当 `hum` 在 56~61 之间时，既不满足 `> 66`（降2度重启），也不满足 `<= 55`（关机），也不满足 `>= 62`（降回24度重启）。如果此时 `current_target` 已经是 24（即 `A.TEMP_ABSOLUTE_FLOOR + 1`），或者处于冷却期，函数直接返回 `(None, None, None)`。导致空调在压缩机已停的情况下持续吹风（假运行），既不重启压缩机也不关机，浪费电能且可能导致湿度缓慢反弹。 | 在假运行分支末尾增加兜底：如果 `hum` 在 56~61 之间且不满足重启条件，应考虑直接关机（因为湿度已接近达标，压缩机停了说明室温也降下来了），或者强制降回 24°C 重启（打破冷却期限制）。
+
+🔴必须修 | `decide`: 未运行夜间启动分支 (L155-L162) | **夜间启动目标温度 clamp 导致定频机压缩机不转**。`night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))`。当 `temp` 较低（如 24°C）但 `ah` 很高（>=18）时，`night_target` 会被 clamp 到 24°C。此时室温 24°C 设定 24°C，定频机压缩机绝对不会启动，空调只会吹风，瞬间陷入假运行死循环。 | 夜间启动条件应增加 `temp >= NIGHT_MIN_TARGET + 1`（即 25°C）的守卫。如果 `temp < 25`，即使湿度高也不应启动制冷（因为可能无法启动压缩机或导致过冷）。或者当 `temp < 26` 时，强制设定 `night_target = temp - 2`（但不低于绝对下限），确保压缩机有温差能启动。
+
+🟡建议修 | `main`: `fake_run_count` 更新逻辑 (L289-L294) | **正常到温停机被误计为假运行**。只要压缩机从运行变成停止（`comp == "fan_only" and state_comp_before == "compressor"`），`fake_run_count` 就加1。但压缩机停止可能是因为达到了目标温度（正常停机），而不是假运行。如果空调频繁正常启停（如除湿达标停机后湿度反弹又启动），可能误触达 `FAKE_RUN_MAX_CYCLES` 导致误告警关机。 | 只有在 `running` 为 True 且 `hum > DEHUMID_EXIT_RH`（即湿度未达标但压缩机停了）时，才增加 `fake_run_count`。或者在 `decide` 判定为正常关机（如湿度达标、过冷保护）时，清零 `fake_run_count`。
+
+🟡建议修 | `decide`: 虚拟变频升温缓除 (L138-L145) | **升温目标可能导致压缩机停机并卡入假运行盲区**。`new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)`。如果 `current_target` 是 25，升到 26。定频机设定 26 度，如果室温也降到 25 度左右，压缩机会停机，变成假运行。如果此时湿度恰好落在 56~61 区间，会触发问题1的盲区，导致空调一直吹风不动作。 | 虚拟变频升温时，应确保目标温度不超过室温，否则压缩机停机。可改为 `new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1, temp - 1)`，确保始终有温差驱动压缩机。但这可能改变“缓除”的初衷，需权衡。
+
+🔵可选 | `decide`: 白天过冷保护与逃生门顺序 (L124-L131) | **逻辑冗余/潜在死代码**。白天过冷保护 `if not is_night and temp <= DAY_COOL_STOP_T:` (22°C) 在前，逃生门 `if temp < A.TEMP_ABSOLUTE_FLOOR:` (假设24°C) 在后。如果 `A.TEMP_ABSOLUTE_FLOOR` 是 24，那么 `temp <= 22` 时，如果 `ah > 15`（不满足过冷保护关机），会继续走到逃生门并关机。这意味着白天过冷保护的 `ah > 15` 分支永远会被逃生门覆盖，是死代码。 | 明确 `A.TEMP_ABSOLUTE_FLOOR` 的值。如果是 24，则白天过冷保护的 `ah` 判断无意义，应移除或调整顺序。如果是 22，则需修正注释“防过冷不停”与实际行为（允许过冷继续除湿）的矛盾。
+
+🔵可选 | `decide`: `comp_min is not None` 判断 (L107, L116, L128 等) | **死代码**。`main` 传入的 `compressor_run_min` 永远是数字（`cycle_comp_total + compressor_on_min`），不会是 None。所以 `comp_min is not None` 永远为 True。 | 移除 `comp_min is not None` 的冗余判断，或者保留以增强函数的独立可测性，但需在文档中注明。
+
+🔵可选 | `decide`: `running is None` 分支 (L88) | **不可达分支**。在当前 `main` 调用方式下，`running` 永远是 `True` 或 `False`，因为 `main` 在传感器不可达时已提前 return，不会调用 `decide`。 | 明确 `decide` 的契约：是否允许 `running=None`。如果允许，`main` 需要修改；如果不允许，移除此分支。
+
+## 最重要 3 条
+1. **假运行检测盲区 (56~61% RH)**：压缩机停机后，如果湿度在这个区间且目标温度已是下限，空调会无意义地持续吹风，既不重启也不关机，严重浪费电能。
+2. **夜间启动目标温度 clamp 坑**：室温较低时启动制冷，目标温度被 clamp 到与室温相同，定频机压缩机不转，直接陷入假运行死循环。
+3. **`fake_run_count` 误增**：正常到温停机也被计入假运行次数，频繁正常启停会误触告警关机。
+
+## 一句话结论
+状态机在假运行处理和定频机温差驱动上存在致命盲区，会导致无效空耗和压缩机拒动死循环，需优先修复 RH 56~61% 的假运行兜底和夜间启动的温差守卫。

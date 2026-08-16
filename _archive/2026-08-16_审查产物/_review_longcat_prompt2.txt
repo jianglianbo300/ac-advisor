@@ -1,0 +1,134 @@
+你是定频空调控制专家。下面是 2 分钟闭环的 decide() 函数中「运行中」部分（含假运行检测、夜间停止、过冷保护、虚拟变频、Tier1-4 分级）。
+
+定频机物理特性：压缩机只有开/停，设定温度=室温时压缩机会停转而只吹风（风扇继续转）；这是"假运行"。
+
+请只找**真实事故级漏洞**：会导致 ①压缩机频繁启停损坏 ②吹风空耗电 ③湿度反弹死循环 ④夜间误开机/误停机 的场景。给：级别(🔴/🟡) | 位置 | 问题 | 一句话修复。最多 5 条，要具体到代码行，不要泛泛而谈。
+
+```python
+    if running:
+        if compressor == "fan_only":
+            # ── 假运行（v8.3） ──
+            stop_duration = None
+            if compressor_stop_duration_min is not None and since_on is not None:
+                stop_duration = compressor_stop_duration_min
+                if stop_duration < 0:
+                    stop_duration = None
+            in_cooldown = False
+            if cooldown_until_dt is not None:
+                in_cooldown = datetime.now() < cooldown_until_dt
+
+            # v8.10 假运行计数器：连续 FAKE_RUN_MAX_CYCLES 次后停机告警
+            if fake_run_count is not None and fake_run_count >= FAKE_RUN_MAX_CYCLES:
+                return ("off", None,
+                        f"假运行已连续{int(fake_run_count)}次，空调可能硬件故障，停止自动重试")
+
+            if (hum > DEHUMID_LOW_EFF_RH
+                    and stop_duration is not None
+                    and stop_duration >= COMPRESSOR_FALSE_RUN_MIN
+                    and not in_cooldown):
+                new_target = max(DEHUMID_MIN_TARGET, current_target - COMPRESSOR_RESTART_DROP)
+                return ("cooling", new_target,
+                        f"压缩机只吹风不制冷已{int(stop_duration)}分钟，湿度{hum:.0f}%仍偏高，降2度重启压缩机")
+            if hum <= DEHUMID_EXIT_RH:
+                return ("off", None, f"湿度已降到{hum:.0f}%，压缩机已停，关机省电")
+            # v8.9 降温补偿（Laguna 交叉审查）：虚拟变频升温后湿度回升 → 降回重启
+            # 填补 58%~66% 之间的"无人区"（假运行检测只覆盖 >66%）
+            if (hum >= VIRTUAL_INV_RECOVER_RH
+                    and current_target > A.TEMP_ABSOLUTE_FLOOR + 1
+                    and not in_cooldown):
+                return ("cooling", 24,
+                        f"升温缓除后湿度回升到{hum:.0f}%，降回24度继续除湿")
+            # v8.13 假运行盲区兜底（glm-5.2 交叉审查）：压缩机停 + 湿度 56~66%
+            # 既不满足重启(>66)也不满足达标(<=55)也不满足降回24(>=62 且 target>25) →
+            # 之前一直返回 None 让风扇空吹。压缩机已停=室温已降、湿度接近目标，吹风纯浪费；
+            # 加 stop_duration>=10min 守卫，避免到温停机短暂停顿(<10min)被误关。
+            # 关机后 MIN_OFF 天然兜底防短循环。
+            if (hum <= DEHUMID_LOW_EFF_RH
+                    and stop_duration is not None
+                    and stop_duration >= COMPRESSOR_FALSE_RUN_MIN):
+                return ("off", None,
+                        f"压缩机已停、湿度{hum:.0f}%接近目标，不再吹风空耗，关机省电")
+            return (None, None, None)
+
+        # ── 压缩机运行中 ──
+        # 用压缩机实际累计运行时间（不是壁钟时间）
+        comp_min = compressor_run_min if compressor_run_min is not None else since_on
+
+        # 硬上限：压缩机累计运行超时，无论湿度如何都停（保护压缩机）
+        if comp_min is not None and comp_min >= WATCH_MAX_RUN:
+            return ("off", None, f"压缩机已连续运行{int(comp_min)}分钟，为保护压缩机强行关机")
+
+        # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
+        # 安全类关机（硬上限/过冷/夜间）在前置处理，不受此守卫影响
+
+        # 夜间停止条件（v8.11 修复：从 T≤26 改为湿度达标优先，避免60%就停）
+        # 注意：安全类关机（过冷/AH达标）先于守卫，防止低温不停机
+        if is_night:
+            if ah is not None and ah <= NIGHT_STOP_AH:
+                return ("off", None, f"夜间室内湿度已达标（AH={ah:.1f}），关机省电")
+            # v8.11: 夜间停止不再以 T≤26°C 为条件（太激进，导致 60%RH 就停），改为湿度驱动
+            # 只有湿度真正降到 55% 以下才停，或者温度降到 24°C 逃生门
+            if hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= NIGHT_MIN_COMP_ON:
+                return ("off", None, f"夜间湿度已降到{hum:.0f}%，压缩机工作完成关机")
+            if temp <= A.TEMP_ABSOLUTE_FLOOR:
+                return ("off", None, f"夜间室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门关机")
+            # 舒适类守卫：跑不够 20 分钟不停，启动次数超限不新开
+            if comp_min is not None and comp_min < NIGHT_MIN_COMP_ON:
+                return (None, None, None)
+            if night_comp_starts and len(night_comp_starts) >= NIGHT_MAX_STARTS_PER_H:
+                return (None, None, None)
+
+        # 过冷保护（v8.6 白天）：温度已低于舒适下限且不闷 → 停，避免吹到 22°C 以下
+        if not is_night and temp <= DAY_COOL_STOP_T:
+            if ah is not None and ah <= DAY_COOL_STOP_AH:
+                return ("off", None, f"室温已降到{temp:.0f}度不闷，过冷保护关机")
+
+        # 温度绝对下限逃生门（SKILL.md：湿度<60 或 温度<24°C 无条件关，防除湿越吹越冷）
+        # 先于 MIN_RUN 守卫：安全类关机不等最短运行时间（补白天过冷 AH>15 的空区）
+        if temp < A.TEMP_ABSOLUTE_FLOOR:
+            return ("off", None, f"室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门无条件关机")
+
+        # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
+        if comp_min is not None and comp_min < A.MIN_RUN:
+            return (None, None, None)
+
+        # 湿度达标
+        if hum <= DEHUMID_EXIT_RH:
+            return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
+
+        # 虚拟变频（v8.8）：湿度接近达标（≤58）且已跑够 MIN_RUN → 升温降负载缓除
+        # 定频机满功率狂除容易过冷，升温 1°C 让压缩机慢除，曲线平滑、防过冷
+        if (hum <= VIRTUAL_INV_APPROACH_RH
+                and comp_min is not None and comp_min >= A.MIN_RUN
+                and current_target is not None and current_target < VIRTUAL_INV_MAX_TARGET
+                and minutes_since_last_adjust is not None
+                and minutes_since_last_adjust >= DEHUMID_ADJUST_COOLDOWN):
+            new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)
+            return ("cooling", new_target,
+                    f"湿度近达标（{hum:.0f}%），目标升1度到{new_target}度缓除防过冷")
+
+        # 无效（Tier 4）：压缩机实际跑了 60min 以上 RH 降幅不足 → 立即关掉（不空耗）
+        # 方向性判断：湿度上涨=环境在加湿，不该停；只有下降不足才算无效
+        if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN
+                and delta_rh_60min is not None
+                and delta_rh_60min > -DEHUMID_STALL_RH_BAND):
+            return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度降幅不足，判定无效空耗关机")
+
+        # 正常除湿（Tier 1）
+        if delta_rh_20min is not None and delta_rh_20min <= DEHUMID_DELTA_RH_MIN:
+            return (None, None, None)
+
+        # 低效（Tier 2）
+        if hum > DEHUMID_LOW_EFF_RH and delta_rh_20min is not None and delta_rh_20min > DEHUMID_DELTA_RH_MIN:
+            if minutes_since_last_adjust is not None and minutes_since_last_adjust < DEHUMID_ADJUST_COOLDOWN:
+                return (None, None, None)
+            if comp_min is not None and comp_min >= DEHUMID_FORCE_MIN and hum > DEHUMID_FORCE_RH:
+                new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
+                return ("cooling", new_target, f"除湿太慢湿度{hum:.0f}%还降不下来，再降1度加强除湿")
+            new_target = max(DEHUMID_MIN_TARGET, current_target - DEHUMID_STEP_C)
+            return ("cooling", new_target, f"除湿偏慢，目标温度降1度到{new_target}度")
+
+        return (None, None, None)
+
+
+```

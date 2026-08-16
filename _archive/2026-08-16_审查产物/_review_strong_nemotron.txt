@@ -1,0 +1,218 @@
+The user wants a deep review of the `decide()` function for a fixed-frequency AC control loop. I need to analyze the code for logic bugs, physical characteristic pitfalls, data/timing issues, energy/comfort improvements, and testability. The output must follow a strict format.
+
+Let me first understand the code structure and the `decide` function logic thoroughly.
+
+**Constants:**
+- `COMPRESSOR_POWER_THRESHOLD = 300`
+- `FAN_ONLY_POWER_MAX = 50`
+- `COMPRESSOR_FALSE_RUN_MIN = 10`
+- `COMPRESSOR_RESTART_COOLDOWN = 30`
+- `COMPRESSOR_RESTART_DROP = 2`
+- `DEHUMID_EXIT_RH = 55`
+- `DEHUMID_LOW_EFF_RH = 66`
+- `DEHUMID_DELTA_RH_MIN = -1.0`
+- `DEHUMID_ADJUST_COOLDOWN = 20`
+- `DEHUMID_FORCE_MIN = 40`
+- `DEHUMID_FORCE_RH = 68`
+- `DEHUMID_STALL_MIN = 60`
+- `DEHUMID_STALL_RH_BAND = 1.5`
+- `DEHUMID_STEP_C = 1`
+- `DEHUMID_MIN_TARGET = 16`
+- `DEHUMID_START_TARGET = 25` (changed from 24 in v8.12)
+- `VIRTUAL_INV_APPROACH_RH = 58`
+- `VIRTUAL_INV_MAX_TARGET = 26`
+- `VIRTUAL_INV_RECOVER_RH = 62`
+- `WATCH_MAX_RUN = 90`
+- `NIGHT_MIN_COMP_ON = 20`
+- `NIGHT_MAX_STARTS_PER_H = 4`
+- `DAY_COOL_STOP_T = 22`
+- `DAY_COOL_STOP_AH = 15.0`
+- `NIGHT_STOP_AH = 14.0`
+- `NIGHT_START_AH = 17.0`
+- `NIGHT_START_AH_HYST = 1.0`
+- `NIGHT_TARGET = 26`
+- `NIGHT_MIN_TARGET = 24`
+- `A.TEMP_ABSOLUTE_FLOOR` (likely 24 based on context)
+- `A.MIN_RUN` (likely 10 or 20)
+- `A.MIN_OFF` (likely 3 or 5)
+- `A.TEMP_COOLING` (likely 28)
+- `A.HUM_DEHUMID_ON` (likely 65)
+- `A.TEMP_DEHUMID_LOW` (likely 26)
+
+**Function `decide` signature:**
+```python
+def decide(temp, hum, running, since_on, since_off, is_night,
+           compressor=None, compressor_stop_duration_min=None, cooldown_until_dt=None,
+           current_target=26, delta_rh_20min=None, delta_rh_60min=None,
+           minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
+           night_comp_starts=None, fake_run_count=None):
+```
+
+**Logic Flow:**
+
+1.  **Sensor Failure Guard**: `if running is None: return (None, None, None)`
+2.  **Running Branch (`if running:`)**
+    *   **Compressor Stopped (Fan Only) Sub-branch**: `if compressor == "fan_only":`
+        *   Fake run counter check (v8.10): `fake_run_count >= FAKE_RUN_MAX_CYCLES (3)` -> OFF.
+        *   High RH + Long Stop + Not in Cooldown -> Lower target by 2C (restart compressor).
+        *   RH <= DEHUMID_EXIT_RH (55) -> OFF.
+        *   Virtual Inverter Recovery: RH >= VIRTUAL_INV_RECOVER_RH (62) + target > floor + not cooldown -> Set target 24.
+        *   Return None.
+    *   **Compressor Running Sub-branch** (implicit `else`):
+        *   `comp_min` calculation (uses `compressor_run_min` passed in, fallback `since_on`).
+        *   **Hard Limit**: `comp_min >= WATCH_MAX_RUN (90)` -> OFF.
+        *   **Night Stop Conditions** (`if is_night:`):
+            *   AH <= NIGHT_STOP_AH (14) -> OFF.
+            *   RH <= DEHUMID_EXIT_RH (55) AND comp_min >= NIGHT_MIN_COMP_ON (20) -> OFF.
+            *   Temp <= ABSOLUTE_FLOOR (24) -> OFF.
+            *   **Comfort Guards (Return None)**:
+                *   comp_min < NIGHT_MIN_COMP_ON (20) -> None.
+                *   night_comp_starts >= NIGHT_MAX_STARTS_PER_H (4) -> None.
+        *   **Day Overcool Protection** (`if not is_night and temp <= DAY_COOL_STOP_T (22):`):
+            *   AH <= DAY_COOL_STOP_AH (15) -> OFF.
+        *   **Absolute Floor Escape Hatch** (Safety): `temp < A.TEMP_ABSOLUTE_FLOOR` -> OFF. (Note: This is *after* Night/Day specific stops but *before* MIN_RUN guard).
+        *   **Min Run Guard**: `comp_min < A.MIN_RUN` -> None.
+        *   **RH Target Met**: `hum <= DEHUMID_EXIT_RH (55)` -> OFF.
+        *   **Virtual Inverter (Approach)**: `hum <= VIRTUAL_INV_APPROACH_RH (58)` + comp_min >= MIN_RUN + current_target < 26 + cooldown passed -> Increase target by 1C.
+        *   **Stall/Invalid (Tier 4)**: `comp_min >= DEHUMID_STALL_MIN (60)` + `delta_rh_60min > -1.5` (i.e., drop < 1.5%) -> OFF.
+        *   **Normal Dehumid (Tier 1)**: `delta_rh_20min <= -1.0` -> None (continue).
+        *   **Low Efficiency (Tier 2)**: `hum > 66` AND `delta_rh_20min > -1.0` (rising or dropping too slow):
+            *   Cooldown check.
+            *   Force condition: comp_min >= 40 AND hum > 68 -> Drop 1C.
+            *   Else -> Drop 1C.
+        *   Return None.
+3.  **Not Running Branch (`else:`)**
+    *   Min Off Guard: `since_off < A.MIN_OFF` -> None.
+    *   **Night Start Logic** (`if is_night:`):
+        *   Calc `night_target = clamp(temp-2, 24, 26)`.
+        *   Temp >= 28 -> ON cooling night_target.
+        *   AH >= 18 (17+1) -> ON cooling night_target.
+        *   None.
+    *   **Day Start Logic**:
+        *   Temp >= TEMP_COOLING (28):
+            *   Hum >= HUM_DEHUMID_ON (65) -> ON cooling DEHUMID_START_TARGET (25).
+            *   Else -> ON cooling clamp(temp-2, 26, 28).
+        *   Temp >= TEMP_DEHUMID_LOW (26) AND Hum >= 65 -> ON cooling 25.
+        *   None.
+
+Now, I need to find **real vulnerabilities/improvements** based on the 5 angles.
+
+### 1. Logic Vulnerabilities (Boundary, Undefined, Unreachable, Guard Order)
+
+*   **Guard Order: Absolute Floor vs Min Run**.
+    *   Code: Absolute Floor check (`temp < A.TEMP_ABSOLUTE_FLOOR`) is **BEFORE** `comp_min < A.MIN_RUN` guard.
+    *   Comment says: "先于 MIN_RUN 守卫：安全类关机不等最短运行时间".
+    *   **Issue**: This is correct for safety. However, `A.TEMP_ABSOLUTE_FLOOR` is likely 24. `NIGHT_MIN_TARGET` is 24. If target is 24, AC *will* hit 24C eventually. This triggers escape hatch. This is intended behavior ("防除湿越吹越冷").
+    *   **Potential Bug**: `DEHUMID_MIN_TARGET = 16`. The logic *can* request target 16C (Tier 2 force drop). But `A.TEMP_ABSOLUTE_FLOOR` (24) escape hatch triggers at 24C room temp. If room temp drops to 24C, it stops. It will never reach 16C target. So `DEHUMID_MIN_TARGET=16` is effectively dead code/unreachable target for the *room temp*. The compressor might run long enough to hit 24C room temp, then stop. The target 16C is just a "run forever" signal to the AC unit, but the escape hatch kills it at 24C room temp. This is a **logic inconsistency**: The code thinks it can drive to 16C, but the escape hatch prevents it. The `DEHUMID_MIN_TARGET` should probably be `A.TEMP_ABSOLUTE_FLOOR` (24) or the escape hatch logic needs to account for "intentional deep dehumid". But the spec says "防过冷", so 24C floor is hard.
+    *   **Verdict**: `DEHUMID_MIN_TARGET = 16` is misleading/unreachable for room temp. The compressor *might* run if the AC unit allows target 16C, but the control loop kills it at 24C room temp.
+
+*   **Guard Order: Night Stop - RH vs Temp**.
+    *   Code:
+        1. `ah <= NIGHT_STOP_AH` -> OFF
+        2. `hum <= DEHUMID_EXIT_RH (55) AND comp_min >= 20` -> OFF
+        3. `temp <= ABSOLUTE_FLOOR` -> OFF
+        4. `comp_min < 20` -> None (Block stop)
+        5. `starts >= 4` -> None (Block stop)
+    *   **Issue**: Condition 4 (`comp_min < 20`) blocks *all* stops including Condition 1 (AH stop) and Condition 3 (Escape hatch) if placed *after* them? No, Condition 4 is *after* 1, 2, 3. So Safety stops (1, 3) execute even if `comp_min < 20`. Condition 2 (RH stop) requires `comp_min >= 20`.
+    *   **Wait**: Condition 1 (AH stop) has **NO** `comp_min` check. It stops immediately if AH <= 14. This might cause short cycling if AH sensor noise dips below 14 briefly.
+    *   **Issue**: `NIGHT_STOP_AH = 14.0`. `NIGHT_START_AH = 17.0`. Hysteresis = 3.0 (Start at 18, Stop at 14). That's huge hysteresis. But AH changes slowly. Okay.
+    *   **Critical Bug**: `night_comp_starts` logic. `night_comp_starts` is a list of timestamps. `len(night_comp_starts) >= 4` blocks *stops* (returns None). **This prevents the AC from turning OFF if it has started 4 times in the last hour.**
+    *   **Quote**: `if night_comp_starts and len(night_comp_starts) >= NIGHT_MAX_STARTS_PER_H: return (None, None, None)`
+    *   **Context**: This is inside `if is_night:` block, *after* stop conditions.
+    *   **Meaning**: "If we have started 4 times recently, do not stop (return None -> keep running)". This is **anti-short-cycling** logic but implemented as "prevent stop". It forces the compressor to run *longer* to avoid the 5th start? Or prevents stopping so it doesn't need to start again?
+    *   **Problem**: If the AC is running, and we hit this guard, we return `None` (keep running). But the *start* count increments on *start* (in `main`). If we are running, the start already happened. This guard prevents *stopping* to avoid a future start? That logic is inverted. Usually, you limit *starts* by preventing *starts* (in the OFF branch). Preventing *stops* keeps the compressor running indefinitely (until other stop conditions like 90min hard limit or RH 55%). This defeats the purpose of "max starts per hour" (which protects compressor from frequent on/off). Keeping it ON protects it from cycling, but wastes energy if RH is met.
+    *   **Actually**: If RH is met (55%), Condition 2 triggers OFF *before* this guard. So this guard only triggers if RH > 55% but we want to stop for other reasons (Temp? No temp stop in night except escape hatch. AH? Condition 1 handles AH). So this guard basically says: "If we cycled 4 times, stay ON forever until RH 55% or 90min limit". This might be intentional "give up cycling, just run continuous". But it's a **logic smell**.
+
+*   **Unreachable Branch: `DEHUMID_START_TARGET = 25` vs `VIRTUAL_INV_MAX_TARGET = 26`**.
+    *   Day start: High Temp + High Hum -> Target 25.
+    *   Virtual Inverter: Approaches RH 58 -> Raises target up to 26.
+    *   Recovery: RH >= 62 -> Drops target to 24.
+    *   Tier 2 Low Eff: Drops target by 1C repeatedly down to 16.
+    *   **Conflict**: If we start at 25 (Day High Hum), Virtual Inverter raises to 26. Recovery drops to 24. Tier 2 drops further.
+    *   **Night Start**: Target `clamp(temp-2, 24, 26)`.
+    *   **Issue**: `DEHUMID_START_TARGET` (25) is hardcoded in Day start branch. `VIRTUAL_INV_MAX_TARGET` is 26. The "Virtual Inverter" logic checks `current_target < VIRTUAL_INV_MAX_TARGET`. If we start at 25, it raises to 26. Okay.
+    *   **But**: `DEHUMID_MIN_TARGET = 16`. Tier 2 drops target. `max(DEHUMID_MIN_TARGET, current_target - 1)`. It will go 25->24->23...->16.
+    *   **Escape Hatch**: `temp < A.TEMP_ABSOLUTE_FLOOR (24)` -> OFF.
+    *   **Result**: Target goes 25, 24, 23... Room temp follows. At Room Temp 24, Escape Hatch triggers OFF. Target never reaches 16. **`DEHUMID_MIN_TARGET=16` is dead code.**
+
+*   **Variable `compressor_run_min` Calculation in `main`**:
+    *   `compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0)`
+    *   `cycle_comp_total` accumulates *previous* compressor-on segments within the *current AC ON cycle*.
+    *   `compressor_on_min` is current segment duration.
+    *   **Bug**: `cycle_comp_total` is reset to 0 **only** when `new_mode == "off"` in `handle_cycle_after_action` (or explicit reset).
+    *   **Scenario**: AC turns ON -> Comp runs 30min -> Comp stops (fan) -> Comp runs 20min. `cycle_comp_total` = 30. `compressor_on_min` = 20. Total = 50.
+    *   **Stall Check**: `comp_min >= 60` (DEHUMID_STALL_MIN). Uses this sum. Correct.
+    *   **Hard Limit**: `comp_min >= 90` (WATCH_MAX_RUN). Uses this sum. Correct.
+    *   **Night Min Run**: `comp_min >= NIGHT_MIN_COMP_ON (20)`. Uses this sum. **BUG**: Night min run should probably be *continuous* run time (current segment) or total? If compressor cycles (stops/starts) due to thermostat, `cycle_comp_total` accumulates. If it cycles 3 times x 10min = 30min. `comp_min` = 30. Night stop condition `hum <= 55 and comp_min >= 20` triggers. This seems okay (total work done).
+    *   **But**: `fake_run_count` logic. `fake_run_count` increments on transition `compressor -> fan_only`.
+    *   **Fake Run Restart**: `stop_duration >= 10` -> Drop target 2C.
+    *   **Cooldown**: `COMPRESSOR_RESTART_COOLDOWN = 30 min`. Set on *compressor start*.
+    *   **Conflict**: Fake run restart checks `not in_cooldown`. Cooldown is 30min after *compressor start*. If compressor runs 5min, stops (fake run). `stop_duration` grows. After 10min stop (total 15min since start), `stop_duration >= 10`. Cooldown active (15 < 30). **Fake run restart BLOCKED by cooldown.**
+    *   **Result**: Compressor stops (fake run). Fan blows for 30min (cooldown) before we try restart. During this 30min, RH rises. **This defeats the purpose of "Fake Run Detection" (quick restart).** The cooldown is for *intentional* target changes (Tier 2/Virtual Inv) to let temp stabilize. Fake run is a *fault* condition needing immediate action.
+    *   **Verdict**: **Major Logic Bug**. Cooldown blocks Fake Run Recovery.
+
+*   **`delta_rh_20min` / `delta_rh_60min` Calculation**:
+    *   `compute_delta_rh` uses `rh_history` list of `(ts, rh)`.
+    *   `main` calls `update_rh_history(state, now_ts, hum)`.
+    *   **Sensor Noise**: RH sensors (cheap ones) have +/- 3-5% noise. `DEHUMID_DELTA_RH_MIN = -1.0`. `DEHUMID_STALL_RH_BAND = 1.5`.
+    *   **Issue**: 2-min tick. 20min window = 10 samples. 60min = 30 samples. Linear regression (implied by `compute_delta_rh` name, need to check implementation but not provided, assume slope).
+    *   **Noise Impact**: If noise is 3%, 20min slope detection of -1% is **buried in noise**. `delta_rh_20min <= -1.0` (Tier 1 Success) vs `> -1.0` (Tier 2 Low Eff). The threshold is too tight for noisy sensors.
+    *   **Stall Check**: 60min window, band 1.5%. Noise 3% -> Band violated constantly -> Never triggers Stall (good) OR triggers Stall randomly (bad). Actually `delta_rh_60min > -1.5` means "drop less than 1.5%". If noise is high, slope might be positive or near zero -> `> -1.5` true -> **False Positive Stall Stop**.
+    *   **Verdict**: Thresholds too sensitive for typical cheap RH sensors. Need filtering or wider bands.
+
+*   **`AH` Calculation & Usage**:
+    *   `ah = absolute_humidity(temp, hum)`.
+    *   Night Stop: `ah <= 14`. Night Start: `ah >= 18`.
+    *   Day Overcool Stop: `temp <= 22 AND ah <= 15`.
+    *   **Issue**: `absolute_humidity` depends on Temp. If Temp drops, AH drops even if moisture mass constant.
+    *   Night Stop AH=14. Start AH=18. Hysteresis 4 g/m3.
+    *   Day Stop AH=15. Temp <=22.
+    *   **Consistency**: Night Stop AH (14) < Day Stop AH (15). Night is stricter? Okay.
+    *   **Sensor Drift**: Temp sensor drift affects AH calc significantly.
+
+*   **`minutes_since_last_adjust` Cooldown**:
+    *   Used in Virtual Inverter (Approach) and Tier 2 (Low Eff).
+    *   `DEHUMID_ADJUST_COOLDOWN = 20 min`.
+    *   Set in `main` when `new_mode == "cooling" and target < current_target`: `extra_meta = {"last_dehumid_adjust_at": now_ts}`.
+    *   **Missing**: Virtual Inverter *raises* target (`target > current_target`). Does it set `last_dehumid_adjust_at`?
+    *   Code: `if new_mode == "cooling" and target is not None and target < current_target: extra_meta = ...`
+    *   **Bug**: Virtual Inverter **raises** target (e.g., 24->25). This does **NOT** update `last_dehumid_adjust_at`.
+    *   **Consequence**: Tier 2 Low Eff check runs immediately after Virtual Inverter raise (if RH conditions met), because cooldown not set. It might drop target back down (25->24) fighting Virtual Inverter.
+    *   **Verdict**: **Logic Bug**. Cooldown only set on *lowering* target. Raising target (Virtual Inv) should also set cooldown to prevent oscillation.
+
+*   **`fake_run_count` Persistence**:
+    *   `state["_fake_run_count"]` incremented in `main` on `compressor -> fan_only` transition.
+    *   Reset to 0 on `compressor` start (in `main`).
+    *   **Issue**: `decide` reads `fake_run_count` from state. If `decide` returns OFF due to `fake_run_count >= 3`, `main` executes OFF. State saved.
+    *   Next tick: `running` becomes False. `decide` enters OFF branch.
+    *   **But**: `_fake_run_count` remains 3 in state (not cleared on OFF).
+    *   Next ON cycle (user manual or auto): `fake_run_count` is still 3. `decide` running branch -> `fan_only` check -> `fake_run_count >= 3` -> OFF immediately.
+    *   **Result**: **Permanent Lockout** after 3 fake runs until manual state clear. `handle_cycle_after_action` on OFF *should* clear it? Code: `state["cycle_comp_total"] = 0; state["compressor_on_min"] = 0; state.pop("compressor_on_since", None)`. **Does NOT clear `_fake_run_count`**.
+    *   **Verdict**: **Critical Bug**. Fake run counter persists across OFF cycles, causing permanent auto-disable.
+
+*   **`compressor_stop_duration_min` Calculation in `main`**:
+    *   `stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60`
+    *   `since_on` = minutes since `run_start` (AC ON wall clock).
+    *   `stop_dt` = `last_compressor_stop_at`.
+    *   `run_dt` = `run_start`.
+    *   `stop_duration` = (Time since AC ON) - (Time of stop since AC ON) = Time since stop. Correct.
+    *   **Edge**: `since_on` might be None? Checked `if last_comp_stop is not None and since_on is not None`.
+    *   **Issue**: `since_on` comes from `A.minutes_since(state.get("run_start"))`. If `run_start` missing, `since_on` None. Guard handles.
+
+*   **Night Target Calculation**: `night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))`.
+    *   `NIGHT_MIN_TARGET=24`, `NIGHT_TARGET=26`.
+    *   If `temp=25`, `temp-2=23`. `round(23)=23`. `min(26, 23)=23`. `max(24, 23)=24`. Target 24.
+    *   If `temp=26`, `temp-2=24`. Target 24.
+    *   If `temp=28`, `temp-2=26`. Target 26.
+    *   **Fixed Freq Physics**: Target **MUST** be < Room Temp for compressor to start.
+    *   If `temp=25`, Target=24. Delta=1C. Compressor starts. Cools to 24. Stops. Temp rises. Cycle.
+    *   If `temp=24.5`, Target=24. Delta=0.5C. Might not start or short cycle.
+    *   **Guard**: `NIGHT_MIN_TARGET=24`. `A.TEMP_ABSOLUTE_FLOOR=24`.
+    *   If Room Temp = 24.5. Target = 24. Compressor runs -> Room Temp -> 24.0. **Escape Hatch Triggers (Temp < 24? No, <=? Code: `temp < A.TEMP_ABSOLUTE_FLOOR` -> `temp < 24`).**
+    *   If Temp hits 23.9 -> OFF.
+    *   **Oscillation**: Temp 24.5 -> Target 24 -> Cool to 23.9 -> OFF -> Temp rises to 24.5 -> ON. **Short Cycle**.
+    *   **Fix**: `NIGHT_MIN_TARGET` should be > `A.TEMP_ABSOLUTE_FLOOR` (e.g., 25) OR Escape Hatch should be lower (e.g., 23). But Spec says "防过冷" at 24.
+    *   **Conflict**: Night logic wants Target = RoomTemp - 2. If RoomTemp ~26, Target 24. Escape at 24. **Zero margin**.
+
+*   **`DEHUMID_START_TARGET = 25` (v8.12) vs `VIRTUAL_INV_RECOVER_RH = 62` -> Target 24**.
+    *   Start

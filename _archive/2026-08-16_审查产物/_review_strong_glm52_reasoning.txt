@@ -1,0 +1,208 @@
+用户希望我作为资深家电自动化/嵌入式状态机审查专家，深度审查一段定频空调2分钟自动控制闭环的纯决策函数。
+需要从5个角度找真实漏洞/改进点：逻辑漏洞、定频机物理特性坑、数据/时序问题、节能/舒适改进、可测性。
+输出格式有严格要求。
+
+先仔细阅读代码，特别是 `decide` 函数和 `main` 函数中的相关逻辑。
+
+### 1. 逻辑漏洞
+- `decide` 函数中，`running is None` 时返回 `(None, None, None)`。但在 `main` 中，如果 `socket is None`，`running` 会根据 `state.get("mode")` 判断，如果 `state.get("mode")` 也不在指定列表中，`running` 会是 `False`，而不是 `None`。只有当 `temp is None or hum is None` 时，`main` 会提前 return，不会调用 `decide`。所以 `running is None` 的分支在当前 `main` 调用下可能永远走不到。
+- `decide` 函数中，假运行检测：
+  ```python
+  if (hum > DEHUMID_LOW_EFF_RH
+          and stop_duration is not None
+          and stop_duration >= COMPRESSOR_FALSE_RUN_MIN
+          and not in_cooldown):
+  ```
+  如果 `hum <= DEHUMID_LOW_EFF_RH` (即 <= 66)，且 `hum > DEHUMID_EXIT_RH` (即 > 55)，会走到 `if hum <= DEHUMID_EXIT_RH:` 返回 off，否则走到 `if (hum >= VIRTUAL_INV_RECOVER_RH ...)`。`VIRTUAL_INV_RECOVER_RH` 是 62。如果 `hum` 在 56~61 之间，且 `current_target <= A.TEMP_ABSOLUTE_FLOOR + 1`，或者 `in_cooldown` 为 True，则返回 `(None, None, None)`。这里逻辑似乎没问题，但如果 `hum` 在 56~61 之间，假运行状态下，既不重启压缩机，也不关机，也不降回24度（因为没到62），就一直空转吹风？这是一个漏洞！假运行时如果湿度在 56~61 之间，且目标温度已经是24（或者处于冷却期），空调会一直假运行（只吹风），湿度可能因为不制冷而反弹，但代码不会采取任何动作。
+- `decide` 函数中，`comp_min` 的计算：
+  ```python
+  comp_min = compressor_run_min if compressor_run_min is not None else since_on
+  ```
+  如果 `compressor_run_min` 为 0（刚启动），`comp_min` 会是 0。这没问题。但如果 `compressor_run_min` 传入的是 `cycle_comp_total + compressor_on_min`，如果两者都是 0，`comp_min` 是 0。如果 `compressor_run_min` 传入的是 None，则用 `since_on`。在 `main` 中，`compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0)`，所以它永远不为 None，总是 >= 0。那么 `comp_min is not None` 永远为 True。
+- `decide` 函数中，夜间停止条件：
+  ```python
+  if hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= NIGHT_MIN_COMP_ON:
+      return ("off", None, f"夜间湿度已降到{hum:.0f}%，压缩机工作完成关机")
+  ```
+  如果 `hum <= 55` 但 `comp_min < 20`，会继续往下走到 `if temp <= A.TEMP_ABSOLUTE_FLOOR:`，如果温度没到下限，走到 `if comp_min is not None and comp_min < NIGHT_MIN_COMP_ON: return (None, None, None)`。这意味着夜间湿度已经达标（<=55），但压缩机运行不足20分钟，会继续运行直到20分钟。这符合“最短运行时间保护”的意图，但夜间湿度已经很低了，继续运行可能导致过冷。不过有 `temp <= A.TEMP_ABSOLUTE_FLOOR` 的逃生门兜底。
+- `decide` 函数中，未运行状态下的夜间启动：
+  ```python
+  night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
+  if temp >= NIGHT_START_T:
+      return ("cooling", night_target, ...)
+  if ah is not None and ah >= NIGHT_START_AH + NIGHT_START_AH_HYST:
+      return ("cooling", night_target, ...)
+  ```
+  `NIGHT_TARGET` 是 26，`NIGHT_MIN_TARGET` 是 24。如果 `temp` 是 27，`round(27-2)=25`，`night_target` 是 25。如果 `temp` 是 28，`night_target` 是 26。如果 `temp` 是 25，`night_target` 是 24。这看起来合理。但如果 `temp` 是 24，`round(24-2)=22`，`max(24, min(26, 22))` = 24。如果 `temp` 是 23，`night_target` 也是 24。此时如果 `ah >= 18`，会启动制冷24度。但室温才23度，设定24度，定频机压缩机根本不会启动！这是一个典型的定频机物理特性坑。
+
+### 2. 定频机物理特性坑
+- 如上所述，夜间启动时，如果 `temp < 26`，`night_target` 会被 clamp 到 24。如果 `temp` 是 25，设定 24，压缩机可能会启动（温差1度，有些定频机可能启动，有些可能不启动，取决于回差）。如果 `temp` 是 24，设定 24，压缩机绝对不会启动，空调只会吹风，变成假运行。
+- 假运行检测中，如果 `hum` 在 56~61 之间，且 `current_target` 已经是 24（`A.TEMP_ABSOLUTE_FLOOR + 1` 可能是 25，如果 `A.TEMP_ABSOLUTE_FLOOR` 是 24），那么 `current_target > A.TEMP_ABSOLUTE_FLOOR + 1` 为 False，不会降回24度。此时空调假运行，湿度可能反弹，但没有动作。
+- 虚拟变频升温缓除：`new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)`。如果 `current_target` 是 25，升到 26。定频机设定26度，如果室温也降到25度左右，压缩机可能会停，变成假运行。这正好和假运行检测衔接，但如果假运行检测没覆盖到（比如湿度在56~61），就会卡死。
+
+### 3. 数据/时序问题
+- `delta_rh_20min` 和 `delta_rh_60min` 的计算依赖于 `rh_history`。如果传感器抖动厉害，2分钟的 tick 可能导致 `delta_rh` 抖动。代码中没有对 `delta_rh` 做平滑处理。
+- `stop_duration` 的计算在 `main` 中：
+  ```python
+  stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60
+  ```
+  这个逻辑有点绕。`since_on` 是从 `run_start` 到现在的时间。`stop_dt - run_dt` 是从 `run_start` 到 `last_comp_stop` 的时间。两者相减，正好是 `last_comp_stop` 到现在的时间，即压缩机停止的时长。这个计算是正确的，但如果 `last_comp_stop` 在 `run_start` 之前（异常情况），`stop_duration` 会大于 `since_on`，虽然代码里有 `if stop_duration < 0: stop_duration = None`，但没有处理 `stop_duration > since_on` 的情况。不过影响不大。
+- `comp_on_min` 的计算在 `main` 中：
+  ```python
+  if comp == "compressor":
+      comp_since = state.get("compressor_on_since")
+      if comp_since:
+          elapsed = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(comp_since)).total_seconds() / 60
+          comp_on_min = round(max(0, elapsed), 1)
+      else:
+          state["compressor_on_since"] = now_ts
+          comp_on_min = 0
+  ```
+  这里 `comp_on_min` 是当前连续运行时间。`cycle_comp_total` 是之前累计的。传给 `decide` 的是 `cycle_comp_total + comp_on_min`。但在 `main` 中，如果 `comp == "fan_only"`，会把 `prev_comp_on_min` 加到 `cycle_comp_total`，然后 `comp_on_min = 0`。传给 `decide` 的是 `cycle_comp_total + 0`。这看起来是对的。但如果在一个 tick 内，压缩机从运行变成停止，`comp_on_min` 被清零，`cycle_comp_total` 增加了。但如果在同一个 tick 内，压缩机又启动了（不太可能，因为 tick 是2分钟），可能会有问题。不过2分钟内启停不太可能。
+- `fake_run_count` 的增加逻辑：
+  ```python
+  elif comp == "fan_only" and state_comp_before == "compressor":
+      state["last_compressor_stop_at"] = now_ts
+      last_comp_stop = now_ts
+      fake_run_count += 1
+      state["_fake_run_count"] = fake_run_count
+  ```
+  这里只要压缩机从运行变成停止，`fake_run_count` 就加1。但压缩机停止可能是因为达到了目标温度（正常停机），而不是假运行。这会导致 `fake_run_count` 误增。正常除湿达标停机也会增加 `fake_run_count`，然后在下次启动时清零。但如果频繁正常启停，可能会误触达 `FAKE_RUN_MAX_CYCLES` 导致告警关机。
+
+### 4. 节能/舒适改进
+- 假运行时，如果湿度在 56~61 之间，且目标温度已经是24，应该考虑直接关机，而不是继续吹风。因为此时压缩机已经停了，湿度可能会反弹，但反弹到62才会降回24度重启。在56~61之间吹风纯属浪费电，且可能导致用户不适。
+- 夜间启动时，如果 `temp < 26`，不应该启动制冷，因为设定24度可能不会启动压缩机，或者即使启动了也会很快停机。应该只在高湿（AH很高）且温度不是太低（比如 >= 25）时才启动。
+
+### 5. 可测性
+- `running is None` 的分支在 `main` 的当前调用方式下永远走不到，因为 `main` 在 `temp is None or hum is None` 时已经 return 了，不会调用 `decide`。而 `running` 的计算只会产生 `True` 或 `False`。
+- `decide` 函数中，`if comp_min is not None` 这个判断永远为 True，因为 `compressor_run_min` 传入的总是数字。所以 `comp_min is not None` 是死代码。
+
+### 具体问题整理
+
+1. 🔴必须修 | `decide`: 假运行分支中，当 `hum` 在 56~61 之间，且 `current_target <= A.TEMP_ABSOLUTE_FLOOR + 1` 或 `in_cooldown` 时，函数返回 `(None, None, None)`，导致空调在压缩机已停的情况下持续吹风（假运行），既不重启压缩机也不关机，浪费电能且可能导致湿度反弹。
+   修复建议：在假运行分支中，如果 `hum <= VIRTUAL_INV_RECOVER_RH` 且不满足重启条件，应考虑直接关机或进入虚拟变频模式，而不是无动作。
+
+2. 🔴必须修 | `decide`: 未运行夜间启动分支中，`night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))`。当 `temp` 较低（如24°C）但 `ah` 很高时，`night_target` 会被 clamp 到 24°C。此时室温24°C设定24°C，定频机压缩机不会启动，导致空调只吹风不制冷，陷入假运行死循环。
+   修复建议：夜间启动条件应增加 `temp >= NIGHT_MIN_TARGET + 1`（即25°C）的守卫，或者当 `temp < 26` 时，强制设定 `night_target = temp - 2`（但不低于绝对下限），确保压缩机有温差能启动。如果 `temp` 太低（如 < 25），即使湿度高也不应启动制冷，可考虑其他除湿方式或直接不动作。
+
+3. 🟡建议修 | `main`: `fake_run_count` 的增加逻辑 `elif comp == "fan_only" and state_comp_before == "compressor":` 会将所有压缩机停止（包括正常到温停机）都计入假运行计数。如果空调频繁正常启停，可能误触达 `FAKE_RUN_MAX_CYCLES` 导致误告警关机。
+   修复建议：只有在 `running` 为 True 且 `hum > DEHUMID_EXIT_RH`（即湿度未达标但压缩机停了）时，才增加 `fake_run_count`。正常到温停机不应增加计数。
+
+4. 🔵可选 | `decide`: `comp_min is not None` 的判断是死代码，因为 `main` 传入的 `compressor_run_min` 永远是数字（`cycle_comp_total + compressor_on_min`），不会是 None。
+   修复建议：移除 `comp_min is not None` 的冗余判断，或者保留以增强函数的独立可测性，但需在文档中注明。
+
+5. 🔴必须修 | `decide`: `running is None` 的分支在当前 `main` 调用下永远不可达，因为 `main` 在传感器不可达时已提前 return。如果未来 `main` 修改为允许传感器不可达时调用 `decide`，此分支会生效，但目前是死代码。
+   修复建议：明确 `decide` 的契约：是否允许 `running=None`。如果允许，`main` 需要修改；如果不允许，移除此分支。
+
+6. 🟡建议修 | `decide`: 虚拟变频升温缓除时，`new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)`。如果 `current_target` 是 25，升到 26。定频机设定26度，如果室温也降到25度左右，压缩机可能会停，变成假运行。虽然假运行检测会处理，但如果假运行检测没覆盖到（如问题1），会卡死。
+   修复建议：虚拟变频升温时，应确保目标温度不超过室温，否则压缩机停机。可以改为 `new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1, temp - 1)`，确保始终有温差。
+
+7. 🟡建议修 | `decide`: 夜间停止条件中，如果 `hum <= DEHUMID_EXIT_RH` 但 `comp_min < NIGHT_MIN_COMP_ON`，会继续运行直到20分钟。但夜间湿度已经很低（<=55），继续运行可能导致过冷。
+   修复建议：夜间如果湿度达标（<=55），即使运行时间不足20分钟，也应考虑停止，或者至少降低目标温度的优先级，依赖温度逃生门兜底。但考虑到防短循环，可以保留，但需注意过冷风险。
+
+8. 🔵可选 | `main`: `stop_duration` 的计算 `stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60` 逻辑虽然正确，但可读性差。
+   修复建议：直接计算 `stop_duration = A.minutes_since(last_comp_stop)`，更清晰且不易出错。
+
+9. 🟡建议修 | `decide`: 低效检测中，`if hum > DEHUMID_LOW_EFF_RH and delta_rh_20min is not None and delta_rh_20min > DEHUMID_DELTA_RH_MIN:`。如果 `delta_rh_20min` 为 None（如刚启动，历史数据不足），会跳过低效检测，直接返回 `(None, None, None)`。这在冷启动时是合理的，但如果传感器抖动导致 `delta_rh` 频繁为 None，可能错过低效检测。
+   修复建议：如果 `delta_rh_20min` 为 None，可以基于 `hum` 和 `comp_min` 做保守判断，或者记录日志告警。
+
+10. 🔴必须修 | `decide`: 白天过冷保护 `if not is_night and temp <= DAY_COOL_STOP_T:` 中，`DAY_COOL_STOP_T` 是 22。但逃生门 `if temp < A.TEMP_ABSOLUTE_FLOOR:` 在后面。如果 `A.TEMP_ABSOLUTE_FLOOR` 是 24，那么 `temp <= 22` 时会先走白天过冷保护，如果 `ah > 15`，不会关机，然后走到 `if temp < 24:` 会关机。逻辑上没冲突，但顺序上过冷保护在逃生门之前，如果过冷保护条件不满足（ah>15），逃生门会兜底。但如果 `A.TEMP_ABSOLUTE_FLOOR` 是 22，那么逃生门永远不会触发，因为白天过冷保护已经拦截了 `temp <= 22`。需要确认 `A.TEMP_ABSOLUTE_FLOOR` 的值。
+    （注：代码中提到 `temp < A.TEMP_ABSOLUTE_FLOOR` 是逃生门，且注释说“防除湿越吹越冷”，通常绝对下限是24。如果 `A.TEMP_ABSOLUTE_FLOOR` 是24，那么 `temp <= 22` 时，先走白天过冷保护，如果 `ah > 15`，不关机，然后走到 `if temp < 24:` 关机。这没问题。但如果 `A.TEMP_ABSOLUTE_FLOOR` 是22，则逃生门永远走不到。假设 `A.TEMP_ABSOLUTE_FLOOR` 是24，则没问题。但代码中 `DAY_COOL_STOP_T = 22`，而 `A.TEMP_ABSOLUTE_FLOOR` 可能是24，这意味着白天在22~24之间，如果 `ah > 15`，空调会继续运行直到 `temp < 24` 才关机。这看起来有点矛盾：22度已经很低了，为什么还要等到24度以下？哦，`temp <= 22` 已经满足 `temp < 24`，所以会先走白天过冷保护，如果 `ah > 15`，不关机，然后走到 `if temp < 24:` 关机。所以最终还是会关机。但逻辑有点绕。）
+
+重新审视问题1：
+假运行分支：
+```python
+if (hum > DEHUMID_LOW_EFF_RH # > 66
+        and stop_duration is not None
+        and stop_duration >= COMPRESSOR_FALSE_RUN_MIN # >= 10
+        and not in_cooldown):
+    # 降2度重启
+if hum <= DEHUMID_EXIT_RH: # <= 55
+    # 关机
+if (hum >= VIRTUAL_INV_RECOVER_RH # >= 62
+        and current_target > A.TEMP_ABSOLUTE_FLOOR + 1
+        and not in_cooldown):
+    # 降回24度重启
+return (None, None, None)
+```
+如果 `hum` 在 56~61 之间：
+- 不满足 `> 66`
+- 不满足 `<= 55`
+- 不满足 `>= 62`
+所以直接返回 `(None, None, None)`。
+此时压缩机已停（假运行），空调只吹风。湿度可能会慢慢反弹。如果反弹到 62，且 `current_target > 25` 且不在冷却期，会降回24度重启。但如果 `current_target` 已经是 24（即 `A.TEMP_ABSOLUTE_FLOOR`），则 `current_target > 25` 为 False，不会重启。那么空调会一直吹风，直到湿度反弹到 66 以上，才会降2度（到22度）重启。但这中间有很长一段时间的无效吹风。这是一个真实的漏洞。
+
+重新审视问题2：
+夜间启动：
+```python
+night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
+if temp >= NIGHT_START_T: # >= 28
+    return ("cooling", night_target, ...)
+if ah is not None and ah >= NIGHT_START_AH + NIGHT_START_AH_HYST: # >= 18
+    return ("cooling", night_target, ...)
+```
+如果 `temp` 是 25，`night_target` = max(24, min(26, 23)) = 24。
+此时室温25，设定24，温差1度。有些定频机可能启动，有些可能不启动。
+如果 `temp` 是 24，`night_target` = 24。室温24，设定24，压缩机绝对不会启动。
+如果此时 `ah >= 18`，会启动制冷24度，但压缩机不转，只吹风，陷入假运行。
+这是一个定频机的经典坑。
+
+重新审视问题3：
+`fake_run_count` 误增：
+```python
+elif comp == "fan_only" and state_comp_before == "compressor":
+    state["last_compressor_stop_at"] = now_ts
+    last_comp_stop = now_ts
+    fake_run_count += 1
+    state["_fake_run_count"] = fake_run_count
+```
+这里只要压缩机停了就加1。但如果是正常到温停机（比如湿度达标了，或者温度达标了），也会加1。然后在 `decide` 中，如果湿度达标，会返回 `off`，`main` 会执行关机。关机时 `fake_run_count` 不会被清零（只有启动时才清零）。下次启动时清零。这看起来没问题。
+但如果空调频繁正常启停（比如除湿达标停机，然后湿度反弹又启动），每次停机都会加1。如果在一个小时内启停3次，就会触发假运行告警关机。这显然是误判。
+修复建议：只有在 `running` 为 True 且 `hum > DEHUMID_EXIT_RH`（即湿度未达标但压缩机停了）时，才增加 `fake_run_count`。或者，在 `decide` 判定为正常关机时，清零 `fake_run_count`。
+
+重新审视问题6：
+虚拟变频升温：
+```python
+if (hum <= VIRTUAL_INV_APPROACH_RH # <= 58
+        and comp_min is not None and comp_min >= A.MIN_RUN
+        and current_target is not None and current_target < VIRTUAL_INV_MAX_TARGET # < 26
+        and minutes_since_last_adjust is not None
+        and minutes_since_last_adjust >= DEHUMID_ADJUST_COOLDOWN):
+    new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)
+    return ("cooling", new_target, ...)
+```
+如果 `current_target` 是 25，升到 26。此时如果室温也降到了 25 左右，设定26度，压缩机可能会停。这正好和假运行检测衔接。但如果假运行检测没覆盖到（如问题1，湿度在56~61），就会卡死。
+修复建议：虚拟变频升温时，应确保目标温度不超过室温，否则压缩机停机。可以改为 `new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1, temp - 1)`，确保始终有温差。但这可能违背“升温缓除”的初衷（升温到接近室温让压缩机慢除）。定频机没有“慢除”，只有开停。升温到接近室温只会让压缩机停机。所以虚拟变频在定频机上的本质就是让压缩机停机，靠风扇吹蒸发器上的残余冷量？或者让压缩机间歇启停？如果是后者，那升温到26度，室温25度，压缩机停，然后室温回升，压缩机又启，这确实能实现“虚拟变频”的效果。但这依赖于空调自身的温控逻辑。如果空调温控回差很大，可能不会频繁启停。所以这个问题可能不是漏洞，而是特性。但如果卡在假运行检测的盲区，就是漏洞。
+
+重新审视问题8：
+`stop_duration` 的计算：
+```python
+stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60
+```
+这个计算确实绕。`since_on` 是 `now - run_start`。`stop_dt - run_dt` 是 `last_comp_stop - run_start`。两者相减是 `now - last_comp_stop`，即压缩机停止时长。这是正确的，但直接用 `A.minutes_since(last_comp_stop)` 更简单。不过 `A.minutes_since` 可能返回 None，而这里的逻辑需要处理 None。所以原写法可能是有意为之。但可读性确实差。
+
+重新审视问题10：
+白天过冷保护：
+```python
+if not is_night and temp <= DAY_COOL_STOP_T: # <= 22
+    if ah is not None and ah <= DAY_COOL_STOP_AH: # <= 15
+        return ("off", None, ...)
+```
+如果 `temp <= 22` 但 `ah > 15`，不关机。然后走到：
+```python
+if temp < A.TEMP_ABSOLUTE_FLOOR: # 假设是 24
+    return ("off", None, ...)
+```
+因为 `temp <= 22` 肯定 `< 24`，所以会关机。这意味着白天过冷保护的 `ah > 15` 分支永远会被逃生门覆盖。那白天过冷保护的 `ah` 判断有什么意义？
+如果 `A.TEMP_ABSOLUTE_FLOOR` 是 22，那么 `temp <= 22` 时，如果 `ah > 15`，不关机，然后走到 `if temp < 22:` 不满足，不关机。继续往下走。这意味着白天22度以下，如果湿度高，空调会继续运行。这可能是有意的：如果湿度很高，即使冷也要继续除湿。但注释说“防过冷不停”，这与行为矛盾。
+需要确认 `A.TEMP_ABSOLUTE_FLOOR` 的值。通常绝对下限是24。如果是24，则如上所述，`ah > 15` 的分支会被逃生门覆盖，是死代码。如果是22，则行为符合“湿度高继续除湿”，但与注释“防过冷不停”矛盾（因为此时是允许过冷继续除湿）。
+这是一个逻辑混乱点。
+
+### 最终筛选最重要的问题
+1. 假运行检测盲区（56~61% RH 之间无动作）
+2. 夜间启动目标温度 clamp 导致压缩机不转
+3. `fake_run_count` 误增导致正常启停被误判为假运行
+4. 白天过冷保护与逃生门的逻辑冲突/死代码
+
+### 格式化输出
+按照要求的格式输出。

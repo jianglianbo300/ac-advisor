@@ -1,0 +1,2 @@
+🔴、位置：`if comp_min is not None and comp_min >= 90:`
+问题：变量未定义。函数签名是

@@ -1,0 +1,1026 @@
+﻿python : [HermesPatch] Session shared:dm patch applied.
+所在位置 行:1 字符: 129
++ ... ew($false); python "D:\work\ac-advisor\review_longcat.py" 2>&1 | Out- ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([HermesPatch] S... patch applied.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[HermesPatch] Intent routing patch applied.
+[HermesPatch] _run_agent interceptor patch applied.
+
+============================================================
+📄 审查: 顾问/控制模块 (ac_advisor.py)
+============================================================
+🔍 longcat(meituan/longcat-2.0:free) 审查中，prompt≈31KB ...
+=== LONGCAIT ANSWER (reasoning) ===
+用户要求我对这套空调自动控制系统的源码进行全面审查。我需要通读源码后逐条输出审查结果。
+
+让我先仔细阅读源码，理解架构和逻辑。
+
+系统背景：
+- 上海闵行 70 平
+- 松川 KFRd-35GW 定频 1.5 匹空调
+- 米家空调伴侣 lumi.acpartner.mcn02 红外控制+功率感知
+- 小米空气净化器 4 Lite 读室内温湿度
+- Hermes cron 每 2 分钟跑一次 ac_watch.py 自动闭环
+- 状态持久化到 ac_state.json
+
+架构分层：
+- ac_watch.py = 控制层（但用户只给了 ac_advisor.py 的代码）
+- ac_advisor.py = 模块
+
+等等，用户只给了 ac_advisor.py 的代码，没有给 ac_watch.py。但系统背景提到 ac_watch.py 是控制层。用户说"对这套空调自动控制系统中给出的源码做全面审查"，但只给了 ac_advisor.py。
+
+让我重新看用户的输入。用户说"### 顾问/控制模块（ac_advisor.py，39222 字节）"然后给了代码。所以用户只给了 ac_advisor.py 的代码。
+
+但系统背景提到 ac_watch.py 是控制层，ac_advisor.py 是模块。用户说"通读源码后逐条输出"，但只给了一个文件。
+
+我需要基于给定的 ac_advisor.py 代码进行审查。用户可能期望我审查这个文件，同时注意到 ac_watch.py 没有被提供。
+
+让我仔细阅读 ac_advisor.py 的代码。
+
+代码结构：
+1. 导入和路径设置
+2. 阈值常量定义
+3. 辅助函数（dehumid_duty, kwh_est, cost_est, current_price）
+4. 持久化状态（load_state, save_state, minutes_since）
+5. 天气 API（fetch_weather）
+6. 室内传感器（read_indoor）
+7. 空调控制（ac_control_init, ac_apply, reconcile_state, verify_socket, apply_state_from_verify, apply_and_commit, read_ac_power）
+8. 夜间成本对比（night_cost_lines）
+9. 滤网提醒（filter_clean_reminder）
+10. main() 函数
+
+让我逐段审查。
+
+**1. 导入和路径设置**
+```python
+_MIIO_PATHS = [
+    "C:/Users/Administrator/AppData/Local/Programs/Python/Python312/Lib/site-packages",
+]
+for p in _MIIO_PATHS:
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
+```
+- 硬编码 Windows 路径，可移植性差
+- 但这是 cron 环境的特殊处理，可能可以接受
+
+**2. 阈值常量**
+```python
+TEMP_COOLING = 28       # 体感≥28 → 制冷
+TEMP_DEHUMID_LOW = 26   # 除湿温度下限
+TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
+HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值
+HUM_DEHUMID_OFF = 55    # 除湿关闭湿度阈值
+TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限
+MIN_RUN = 40            # 开一次至少 40 分钟
+MIN_OFF = 30            # 关后至少 30 分钟再开
+MAX_RUN = 180           # 连续运行超 180 分钟建议切换/关
+```
+- 常量定义清晰，有注释
+- 但 HUM_DEHUMID_OFF=55 在代码中似乎没有直接使用？让我检查一下...
+- 在决策逻辑中，我看到 HUM_DEHUMID_OFF 没有在 main() 的决策分支中使用。决策分支用的是 HUM_DEHUMID_ON=65 作为触发条件，但关闭条件似乎没有明确使用 HUM_DEHUMID_OFF。
+- 等等，在 main() 中，分支 B 的湿度条件是 hum_sig > HUM_DEHUMID_ON (65)，但关闭条件在哪里？
+- 在分支 C 和 D 中，没有检查湿度是否降到 HUM_DEHUMID_OFF 以下。
+- 实际上，这个逻辑是"顾问模式"，它建议开一轮（40-60分钟），然后由用户或自动系统决定是否关。但在自动闭环中，应该有湿度降到某个阈值以下就关的逻辑。
+- 让我再仔细看...在 main() 中，分支 B 说"湿度降到60%即关"，但代码中并没有检查湿度是否降到60%以下。这只是文案。
+- 在自动闭环 ac_watch.py 中应该有这个逻辑，但这里没给代码。
+- 但在 ac_advisor.py 的 main() 中，如果湿度已经低于 65，就不会进入分支 B，而是进入分支 C 或 D。所以 HUM_DEHUMID_OFF=55 似乎没有被使用。
+- 等等，让我再仔细看决策逻辑...
+
+决策逻辑：
+- 分支 A: signal >= 28 → 制冷
+- 分支 B0: 24 <= signal < 26 且 hum_sig > 65 → 制冷23°C强制除湿
+- 分支 B: 26 <= signal < 28 且 hum_sig > 65 → 制冷24°C集中除湿
+- 分支 C: signal >= 26 → 风扇（隐含 hum_sig <= 65）
+- 分支 D: signal < 26 → 不开
+
+所以如果湿度在 55-65 之间，且温度在 26-28 之间，会进入分支 C（风扇）。如果湿度 > 65，进入分支 B。
+但 HUM_DEHUMID_OFF=55 没有被使用。如果湿度从 70 降到 58，仍然 > 55，但 < 65，会进入分支 C。这看起来是合理的，因为 58% 不算高。
+但如果湿度从 70 降到 50，也进入分支 C。所以 HUM_DEHUMID_OFF 确实没有被使用。
+
+**3. dehumid_duty 函数**
+```python
+def dehumid_duty(temp, hum=None):
+    if temp is None:
+        base = DEHUMID_DUTY
+    elif temp >= 26:
+        base = DEHUMID_DUTY
+    elif temp <= TEMP_ABSOLUTE_FLOOR:
+        base = 0.25
+    else:
+        base = 0.25 + (DEHUMID_DUTY - 0.25) * (temp - TEMP_ABSOLUTE_FLOOR) / (26 - TEMP_ABSOLUTE_FLOOR)
+    if hum is not None:
+        if hum >= 85:
+            factor = 1.10
+        elif hum <= 60:
+            factor = 0.70
+        else:
+            factor = 0.70 + 0.40 * (hum - 60) / 25.0
+        base *= factor
+    return base
+```
+- 逻辑清晰，有文档字符串
+- 温度插值计算正确
+- 湿度修正因子计算正确
+
+**4. kwh_est 函数**
+```python
+def kwh_est(active_min, duty=1.0):
+    p = AC_MEASURED_W or AC_INPUT_W
+    return p / 1000.0 * duty * (active_min / 60.0)
+```
+- 使用全局变量 AC_MEASURED_W，这是合理的
+- 但如果 AC_MEASURED_W 为 0 呢？`AC_MEASURED_W or AC_INPUT_W` 会在 AC_MEASURED_W=0 时使用 AC_INPUT_W，这是正确的
+
+**5. current_price 和 cost_est**
+```python
+def current_price():
+    h = datetime.now().hour
+    return ELECTRIC_VALLEY if h >= 22 or h < 6 else ELECTRIC_PEAK
+
+def cost_est(kwh):
+    return kwh * current_price()
+```
+- 逻辑正确
+
+**6. 持久化状态**
+```python
+def load_state() -> dict:
+    default = {"mode": None, "last_on_at": None, "last_off_at": None, "run_start": None}
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
+            return {**default, **json.load(f)}
+    except Exception:
+        return default
+```
+- 使用 utf-8-sig 编码，可以处理 BOM
+- 异常处理合理
+
+```python
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+```
+- 没有异常处理！如果写入失败（磁盘满、权限问题），会抛出异常
+- 这是一个问题
+
+```python
+def minutes_since(ts_str: str | None) -> float | None:
+    if not ts_str:
+        return None
+    try:
+        then = datetime.fromisoformat(ts_str)
+        now = datetime.now(tz=then.tzinfo if then.tzinfo else None)
+        return (now - then).total_seconds() / 60.0
+    except Exception:
+        return None
+```
+- 时区处理：如果 ts_str 有时区信息，now 也使用相同的时区；如果 ts_str 没有时区，now 也没有时区
+- 但 datetime.now(tz=None) 返回本地时间，而 datetime.fromisoformat 解析无时区的字符串也返回 naive datetime
+- 如果 state 文件中的时间戳是 naive（无时区），而系统时区发生变化，可能会有问题
+- 但在这个场景中，时间戳都是本地时间，应该没问题
+
+**7. fetch_weather**
+```python
+def _qw_get(endpoint: str) -> dict:
+    import gzip
+    url = f"https://{QW_HOST}/weather/v1/{endpoint}/{LAT}/{LON}"
+    req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
+    resp = urllib.request.urlopen(req, timeout=15)
+    body = resp.read()
+    if body[:2] == b"\x1f\x8b":
+        body = gzip.decompress(body)
+    return json.loads(body.decode("utf-8"))
+```
+- 硬编码 API Key 在源码中！这是一个安全隐患
+- 但这是本地运行的脚本，风险可能可控
+- 使用 "Accept-Encoding": "identity" 禁用压缩，但又检查 gzip 头，有点矛盾
+- 如果服务器忽略 Accept-Encoding 头并返回 gzip，代码能处理
+
+```python
+def fetch_weather() -> dict:
+    try:
+        from datetime import timezone, timedelta, datetime
+        CST = timezone(timedelta(hours=8))
+        cur = _qw_get("current")
+        dai = _qw_get("daily")["days"][0]
+        hrs = _qw_get("hourly")["hours"]
+        # ...
+    except Exception as e:
+        return {"error": str(e)}
+```
+- 异常处理过于宽泛，捕获所有异常
+- 但返回错误字典，调用方检查 "error" key，这是合理的
+- QW2WMO 映射表看起来是合理的
+
+**8. read_indoor**
+```python
+def read_indoor(timeout=3.0):
+    if not os.path.exists(CONFIG_FILE):
+        return None, None
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except Exception:
+        return None, None
+
+    ip = cfg.get("ip")
+    token = cfg.get("token")
+    if not ip or not token:
+        return None, None
+
+    try:
+        from miio import Device
+        d = Device(ip, token, timeout=timeout)
+        r = d.send("get_properties", [
+            {"siid": 3, "piid": 7},
+            {"siid": 3, "piid": 1},
+        ])
+        if isinstance(r, list) and len(r) >= 2:
+            temp = r[0].get("value") if isinstance(r[0], dict) else None
+            hum = r[1].get("value") if isinstance(r[1], dict) else None
+            if temp is not None and hum is not None:
+                return round(temp, 1), round(hum, 0)
+        r2 = d.send("get_prop", ["temp_dec", "humidity"])
+        if isinstance(r2, list) and len(r2) >= 2:
+            return round(r2[0] / 10, 1), round(r2[1], 0)
+    except Exception:
+        pass
+    return None, None
+```
+- 异常处理合理
+- 备用方案（raw send）是好的
+- 但 timeout 参数在 Device 构造函数中可能不生效，取决于 miio 版本
+
+**9. ac_control_init**
+```python
+def ac_control_init():
+    global AC_CTRL
+    AC_CTRL = None
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        ap = cfg.get("ac_partner") or {}
+        if ap.get("ip") and ap.get("token") and cfg.get("ac_control", True):
+            from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
+            AC_CTRL = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
+    except Exception:
+        AC_CTRL = None
+```
+- 异常处理合理
+- 但每次调用都重新读取配置文件，可能影响性能
+- 在 main() 中调用了一次，应该没问题
+
+**10. ac_apply**
+```python
+def ac_apply(new_mode, target_temp=None):
+    if new_mode == "dehumid_alert":
+        return {"status": "no_action", "action": "", "reason": "alert_only"}
+    if AC_CTRL is None:
+        return {"status": "failed", "action": "", "reason": "control_unavailable"}
+    try:
+        st = AC_CTRL.status()
+        on = st.is_on
+    except Exception as e:
+        return {"status": "failed", "action": "", "reason": f"status_read_failed: {e}"}
+    act = []
+    if new_mode in ("cooling", "dehumid"):
+        want_mode = "cool" if new_mode == "cooling" else "dry"
+        if not on:
+            try:
+                AC_CTRL.send_command("set_power", ["on"])
+                act.append("开机")
+                on = True
+            except Exception as e:
+                return {"status": "failed", "action": "开机", "reason": f"power_on_failed: {e}"}
+        try:
+            if st.mode is not None and st.mode.value != want_mode:
+                AC_CTRL.send_command("set_mode", [want_mode])
+                act.append(f"模式{want_mode}")
+        except Exception:
+            pass
+        if want_mode == "dry":
+            pass
+        else:
+            try:
+                if target_temp and st.target_temperature != target_temp:
+                    AC_CTRL.send_command("set_tar_temp", [target_temp])
+                    act.append(f"设定{target_temp}°C")
+            except Exception:
+                pass
+    elif new_mode in ("fan", "off"):
+        if on:
+            try:
+                AC_CTRL.send_command("set_power", ["off"])
+                act.append("关机")
+            except Exception as e:
+                return {"status": "failed", "action": "关机", "reason": f"power_off_failed: {e}"}
+    return {"status": "action" if act else "no_action", "action": "，".join(act), "reason": ""}
+```
+- 问题：如果 new_mode 不在 ("cooling", "dehumid", "fan", "off", "dehumid_alert") 中，函数会返回 {"status": "no_action", ...}，这可能不是期望的行为
+- 但 main() 中 new_mode 的取值范围是 ("cooling", "dehumid", "fan", "fan_locked", "off", "dehumid_alert")
+- "fan_locked" 不在处理范围内！如果 new_mode="fan_locked"，会走到最后的 return，act=[]，返回 no_action
+- 但 fan_locked 应该和 fan/off 一样处理（关空调），这是一个 bug！
+- 等等，让我再看一下 main() 中的逻辑...
+- 在 main() 中，new_mode 被赋值为 "fan_locked" 后，会传给 apply_and_commit
+- apply_and_commit 调用 ac_apply
+- ac_apply 中 "fan_locked" 不在任何分支中，会返回 no_action
+- 这意味着空调不会被关闭！这是一个严重问题！
+
+让我再仔细看 main() 中的逻辑：
+```python
+if new_mode in ("cooling", "dehumid", "dehumid_alert"):
+    if since_off is not None and since_off < MIN_OFF:
+        decision = f"风扇（关后{MIN_OFF}分钟内不重开，还剩{MIN_OFF - int(since_off)}分钟）"
+        reason += f"；关后仅{int(since_off)}分钟，<{MIN_OFF}分钟锁定"
+        new_mode = "fan_locked"
+```
+所以 fan_locked 表示"应该开但被锁定为风扇"。但空调当前可能还在运行（因为之前被建议开启）。
+如果 new_mode="fan_locked"，ac_apply 应该关闭空调（因为风扇模式不需要开空调）。
+但 ac_apply 不处理 "fan_locked"，所以空调会继续运行！
+
+这是一个严重的逻辑错误。fan_locked 应该和 fan/off 一样，关闭空调。
+
+**11. reconcile_state**
+```python
+def reconcile_state(state, now_ts):
+    if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+        sys_off = state.get("_system_off_at")
+        is_system_off = False
+        if sys_off:
+            try:
+                sys_off_dt = datetime.fromisoformat(sys_off) if isinstance(sys_off, str) else sys_off
+                now_dt = datetime.fromisoformat(now_ts) if isinstance(now_ts, str) else now_ts
+                if (now_dt - sys_off_dt).total_seconds() < 180:
+                    is_system_off = True
+            except Exception:
+                pass
+        if not is_system_off:
+            state["manual_off_at"] = now_ts
+        state["mode"] = "off"
+        state["last_off_at"] = now_ts
+        state["run_start"] = None
+        state.pop("_system_off_at", None)
+        return
+
+    if state.get("_system_off_at"):
+        state.pop("_system_off_at", None)
+    if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        state["manual_on_at"] = now_ts
+        state["mode"] = "cooling"
+        state["run_start"] = now_ts
+```
+- 逻辑复杂，但看起来合理
+- 问题：如果 AC_SOCKET 为 None（插座不可达），reconcile_state 不做任何事情，这是正确的
+- 但 state 中的 mode 可能与实际不一致，这是一个已知限制
+
+**12. verify_socket**
+```python
+def verify_socket():
+    if AC_CTRL is None:
+        return None
+    try:
+        s = AC_CTRL.status()
+        return "on" if s.is_on else "off"
+    except Exception:
+        return None
+```
+- 简单明了
+
+**13. apply_state_from_verify**
+```python
+def apply_state_from_verify(state, new_mode, real, now_ts):
+    was_on = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+    if real == "on":
+        if new_mode in ("cooling", "dehumid", "dehumid_alert"):
+            if not was_on:
+                state["run_start"] = now_ts
+                state["last_on_at"] = now_ts
+            state["mode"] = new_mode
+            return None
+        state["mode"] = "cooling"
+        state.pop("last_off_at", None)
+        return True
+    # real == "off"
+    if new_mode in ("fan", "fan_locked", "off"):
+        if was_on:
+            state["last_off_at"] = now_ts
+            state["_system_off_at"] = now_ts
+        state["mode"] = new_mode
+        state["run_start"] = None
+        return None
+    state["mode"] = "off"
+    state["run_start"] = None
+    return True
+```
+- 这里正确处理了 "fan_locked"
+- 但 ac_apply 没有处理 "fan_locked"，所以 verify 会返回 "off"（因为空调没被关闭）
+- 等等，如果 ac_apply 没有关闭空调，verify_socket 会返回 "on"
+- 然后 apply_state_from_verify 会发现 real="on" 但 new_mode="fan_locked"，会返回 True（矛盾）
+- 这会导致 apply_and_commit 返回 failed
+- 但空调实际上还在运行！这是一个问题
+
+**14. apply_and_commit**
+```python
+def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
+    if now_ts is None:
+        now_ts = datetime.now().isoformat(timespec="seconds")
+    ctrl = ac_apply(new_mode, target_temp)
+    if ctrl["status"] == "failed":
+        save_state(state)
+        return ctrl
+    real = verify_socket()
+    if real is None:
+        ctrl = {"status": "failed", "action": ctrl.get("action", ""), "reason": "verify_unreachable"}
+        save_state(state)
+        return ctrl
+    contradict = apply_state_from_verify(state, new_mode, real, now_ts)
+    if contradict:
+        ctrl = {"status": "failed", "action": ctrl.get("action", ""),
+                "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on"}
+    if meta and not contradict:
+        for k, v in meta.items():
+            state[k] = v
+    if not contradict and target_temp is not None:
+        state["target_temp"] = target_temp
+    save_state(state)
+    return ctrl
+```
+- 逻辑清晰
+- 但 save_state 没有异常处理
+- 如果 save_state 失败，状态会丢失
+
+**15. read_ac_power**
+```python
+def read_ac_power(timeout=4.0):
+    global AC_MEASURED_W, AC_SOCKET
+    AC_SOCKET = None
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        ap = cfg.get("ac_partner") or {}
+        if not ap.get("ip") or not ap.get("token"):
+            return None
+        from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
+        d = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
+        st = d.status()
+        AC_SOCKET = "on" if st.is_on else "off"
+        AC_MEASURED_W = None
+        if st.is_on and st.load_power and st.load_power > 0:
+            AC_MEASURED_W = round(st.load_power)
+            return AC_MEASURED_W
+    except Exception:
+        pass
+    return None
+```
+- 每次调用都重新创建 Device 对象，效率低
+- 但这是为了获取最新状态，可以接受
+- 问题：如果空调关闭，AC_MEASURED_W 会被设为 None，但之前测量的值会丢失
+- 在 kwh_est 中，`AC_MEASURED_W or AC_INPUT_W` 会在 AC_MEASURED_W=None 时使用铭牌功率
+- 但如果空调刚关闭，我们可能还想用之前的测量值来估算刚才的耗电
+- 不过在这个系统中，kwh_est 主要用于估算未来耗电，不是事后计算，所以可能没问题
+
+**16. night_cost_lines**
+```python
+def night_cost_lines(indoor_temp, indoor_hum):
+    h = datetime.now().hour
+    if not (h >= 20 or h < 6):
+        return []
+    # ...
+```
+- 逻辑正确
+
+**17. filter_clean_reminder**
+```python
+def filter_clean_reminder():
+    try:
+        with open(FILTER_STATE_FILE, encoding="utf-8") as f:
+            last = json.load(f).get("last_clean")
+        if not last:
+            return "  💡 记得每 15~30 天洗一次滤网（脏滤网=除湿慢+费电）"
+        days = (datetime.now() - datetime.fromisoformat(last)).days
+        if days > FILTER_CLEAN_INTERVAL:
+            return f"  ⚠️ 该洗滤网了（距上次清洗 {days} 天）——滤网脏直接拖累除湿速度"
+        return None
+    except Exception:
+        return None
+```
+- 异常处理合理
+
+**18. main() 函数**
+
+让我仔细审查 main() 的逻辑。
+
+```python
+def main():
+    # ── 1. 获取天气数据 ──
+    wx = fetch_weather()
+    if "error" in wx:
+        print(f"⚠️ 天气API失败: {wx['error']}")
+        print("🏠 上海闵行 · 定频空调省电顾问")
+        print("  数据不可用，请稍后再查")
+        return
+```
+- 天气 API 失败时直接返回，不执行任何控制逻辑
+- 但系统应该能够在没有天气数据的情况下继续运行（使用室内传感器）
+- 这是一个问题：如果天气 API 失败，整个系统就停止工作了
+
+```python
+    # ── 2. 读取室内温湿度 ──
+    indoor_temp, indoor_hum = read_indoor()
+    indoor_ok = indoor_temp is not None and indoor_hum is not None
+    ac_w = read_ac_power()
+    ac_control_init()
+```
+- 读取室内传感器和空调功率
+- 但 read_ac_power 和 ac_control_init 都读取 CONFIG_FILE，重复读取
+
+```python
+    # 主信号：室内优先，室外回退（仅限体感温度，湿度不用室外）
+    signal = feels
+    hum_sig = indoor_hum
+    src = "室外体感"
+    if indoor_ok:
+        signal = indoor_temp
+        hum_sig = indoor_hum
+        src = "室内(净化器)"
+    else:
+        hum_sig = None
+    sig_label = "室内" if indoor_ok else "室外体感"
+```
+- 逻辑正确
+
+```python
+    # ── 3. 读取持久化状态 ──
+    state = load_state()
+    now_ts = datetime.now().isoformat()
+    reconcile_state(state, now_ts)
+    since_on = minutes_since(state.get("run_start"))
+    since_off = minutes_since(state.get("last_off_at"))
+```
+- 注意：now_ts 使用 isoformat() 不带 timespec，可能包含微秒
+- 但在 apply_and_commit 中，now_ts 默认使用 isoformat(timespec="seconds")
+- 这可能导致时间戳格式不一致
+
+```python
+
+============================================================
+📄 审查: 自动监控主程序 (ac_watch.py)
+============================================================
+🔍 longcat(meituan/longcat-2.0:free) 审查中，prompt≈34KB ...
+=== LONGCAIT ANSWER (reasoning) ===
+用户要求我作为HVAC控制系统专家和资深Python代码审查员，对这套空调自动控制系统的源码进行全面审查。我需要通读源码后逐条输出，不要只给泛泛结论。
+
+让我仔细分析这段代码：
+
+1. 系统背景：上海闵行70平，松川KFRd-35GW定频1.5匹空调，米家空调伴侣lumi.acpartner.mcn02红外控制+功率感知，小米空气净化器4 Lite读室内温湿度。Hermes cron每2分钟跑一次ac_watch.py自动闭环。
+
+2. 架构分层：
+- ac_watch.py = 控制层
+- ac_advisor.py = 模块（虽然没给出源码，但通过import和调用可以推断）
+
+3. 关键机制：
+- 室内传感器主信号
+- AH=绝对湿度用于夜间启停
+- 夜间停止先于MIN_RUN守卫
+- 虚拟变频
+- MIN_RUN=40 / MIN_OFF=30
+- 温度<24°C逃生门无条件关
+- 手动关后2h不自动启动、手动开后30min不自动关
+- kWh梯形积分
+
+让我逐行审查代码，找出问题。
+
+首先，我需要理解代码的整体结构：
+
+1. 常量定义区
+2. 工具函数（log, tts_mute, night_hours, dew_point, absolute_humidity, compressor_state, compute_delta_rh, update_rh_history, update_kwh, stale_stop_ts, open_cycle, close_cycle, handle_cycle_after_action）
+3. decide() 决策函数
+4. main() 主函数
+5. _selftest() 自测函数
+
+让我仔细审查每个部分。
+
+**常量定义区审查：**
+
+```python
+QUIET_TTS = (23, 7)         # TTS 静音时段
+NIGHT = (23, 7)             # 夜间节能模式时段
+NIGHT_START_T = 28.0        # 夜间启动温度阈值
+NIGHT_START_AH = 17.0       # 夜间启动绝对湿度阈值 (g/m3)
+NIGHT_STOP_AH = 14.0        # 夜间停止绝对湿度阈值
+NIGHT_STOP_AH_HYST = 1.0    # 夜间停止迟滞带（降到 14 停，升到 15 才重开）
+NIGHT_STOP_T = 26.0         # 夜间停止温度阈值
+NIGHT_TARGET = 26           # 夜间目标温度上限
+NIGHT_MIN_TARGET = 24       # 夜间目标温度下限
+DAY_COOL_STOP_T = 22       # 白天制冷过冷保护
+DAY_COOL_STOP_AH = 15.0    # 白天过冷保护 AH 阈值
+NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
+NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
+NIGHT_EXTEND_RUN = 30       # 超限后单次运行延长(min)
+```
+
+问题1：NIGHT_START_AH = 17.0，但注释说"升到15才重开"，而代码中判断条件是 `ah >= NIGHT_START_AH + NIGHT_STOP_AH_HYST`，即17+1=18。这里存在不一致。注释说"降到14停，升到15才重开"，但代码用的是17+1=18。这明显是逻辑错误。
+
+等等，让我重新看：
+- NIGHT_STOP_AH = 14.0（停止阈值）
+- NIGHT_STOP_AH_HYST = 1.0（迟滞带）
+- NIGHT_START_AH = 17.0（启动阈值）
+
+注释说"降到14停，升到15才重开"，但代码判断启动条件是 `ah >= NIGHT_START_AH + NIGHT_STOP_AH_HYST` = 17 + 1 = 18。
+
+这里有两个问题：
+1. 注释和代码不一致：注释说15，代码用18
+2. 启动阈值17和停止阈值14之间的迟滞是3，但代码又加了1，变成18
+
+这确实是个问题。如果按注释"升到15才重开"，那启动阈值应该是15，而不是17+1=18。
+
+让我继续审查其他部分。
+
+**compressor_state函数：**
+```python
+def compressor_state(load_power):
+    if load_power is None:
+        return "unknown"
+    if load_power > COMPRESSOR_POWER_THRESHOLD:  # >300
+        return "compressor"
+    if load_power > FAN_ONLY_POWER_MAX:  # >50
+        return "unknown"
+    if load_power > 5:
+        return "fan_only"
+    return "off"
+```
+
+问题：当功率在50-300之间时返回"unknown"，但注释说"5~50W=仅风扇"。代码中`load_power > 5`且`load_power <= 50`时返回"fan_only"，这是对的。但`load_power > 50`且`load_power <= 300`时返回"unknown"，这与注释"load_power>300W=压缩机转，5~50W=仅风扇，≤5W=关"一致。
+
+等等，让我重新看注释：
+- load_power>300W=压缩机转
+- 5~50W=仅风扇
+- ≤5W=关
+
+代码逻辑：
+- >300 → compressor
+- >50 且 ≤300 → unknown
+- >5 且 ≤50 → fan_only
+- ≤5 → off
+
+这与注释一致。但有一个边界问题：当功率恰好等于50时，`load_power > FAN_ONLY_POWER_MAX`（50>50）为False，所以进入下一个判断`load_power > 5`（50>5）为True，返回"fan_only"。这是正确的。
+
+当功率恰好等于300时，`load_power > COMPRESSOR_POWER_THRESHOLD`（300>300）为False，进入`load_power > FAN_ONLY_POWER_MAX`（300>50）为True，返回"unknown"。这也是正确的。
+
+当功率恰好等于5时，`load_power > 5`为False，返回"off"。正确。
+
+**decide函数审查：**
+
+```python
+def decide(temp, hum, running, since_on, since_off, is_night,
+           compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None,
+           current_target=26, delta_rh_20min=None, delta_rh_60min=None,
+           minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
+           night_comp_starts=None):
+```
+
+参数很多，容易出错。
+
+**问题1：假运行分支的逻辑**
+
+```python
+if running:
+    if compressor == "fan_only":
+        # ── 假运行（v8.3） ──
+        stop_duration = None
+        if last_compressor_stop_at is not None and since_on is not None:
+            stop_duration = last_compressor_stop_at
+            if stop_duration < 0:
+                stop_duration = None
+```
+
+这里`last_compressor_stop_at`在main中被转换为`stop_duration`（距run_start的分钟数），但在decide中又检查`stop_duration < 0`。这个逻辑有点混乱。
+
+在main中：
+```python
+stop_duration = None
+if last_comp_stop is not None and since_on is not None:
+    try:
+        stop_dt = datetime.fromisoformat(last_comp_stop) if isinstance(last_comp_stop, str) else last_comp_stop
+        run_start = state.get("run_start")
+        if run_start:
+            run_dt = datetime.fromisoformat(run_start) if isinstance(run_start, str) else datetime.fromisoformat(run_start)
+            stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60
+            if stop_duration < 0:
+                stop_duration = None
+    except Exception:
+        pass
+```
+
+这里`stop_duration`被计算为"距run_start的分钟数"，但命名和注释容易混淆。在decide中，`last_compressor_stop_at`参数实际上接收的是这个计算后的分钟数，而不是时间戳。这违反了参数名的语义。
+
+**问题2：decide中的假运行判断**
+
+```python
+if (hum > DEHUMID_LOW_EFF_RH
+        and stop_duration is not None
+        and stop_duration >= COMPRESSOR_FALSE_RUN_MIN
+        and not in_cooldown):
+    new_target = max(DEHUMID_MIN_TARGET, current_target - COMPRESSOR_RESTART_DROP)
+    return ("cooling", new_target,
+            f"压缩机只吹风不制冷已{int(stop_duration)}分钟，湿度{hum:.0f}%仍偏高，降2度重启压缩机")
+```
+
+这里`stop_duration`是距run_start的分钟数，但注释说"已{int(stop_duration)}分钟"。如果`stop_duration`是距run_start的时间，那它代表的是"开机后多久压缩机停"，而不是"压缩机停了多久"。
+
+实际上，在main中的计算：
+```python
+stop_duration = since_on - (stop_dt - run_dt).total_seconds() / 60
+```
+
+这里`since_on`是距run_start的分钟数，`(stop_dt - run_dt).total_seconds() / 60`也是距run_start的分钟数。所以`stop_duration` = since_on - (stop_dt - run_dt) = 当前时间 - stop_dt = 压缩机停了多久。
+
+等等，让我重新计算：
+- since_on = 当前时间 - run_start
+- (stop_dt - run_dt) = stop_dt - run_start
+- stop_duration = since_on - (stop_dt - run_dt) = (当前时间 - run_start) - (stop_dt - run_start) = 当前时间 - stop_dt
+
+所以`stop_duration`确实是"压缩机停了多久"（分钟）。这个计算是对的。
+
+但参数名`last_compressor_stop_at`在decide中接收的是这个分钟数，这违反了命名约定。应该改名为`compressor_stop_minutes`或类似。
+
+**问题3：夜间启动条件**
+
+```python
+if is_night:
+    # 分支 A 夜间对齐：目标永远低于室温 2C（保证定频压缩机启动），clamp 24~26
+    night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
+    if temp >= NIGHT_START_T:
+        return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
+    if ah is not None and ah >= NIGHT_START_AH + NIGHT_STOP_AH_HYST:
+        return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
+    return (None, None, None)
+```
+
+这里`NIGHT_START_AH + NIGHT_STOP_AH_HYST` = 17 + 1 = 18。但注释说"升到15才重开"。这明显不一致。
+
+如果按注释，启动阈值应该是15，那应该是：
+- 停止阈值：14
+- 启动阈值：15（迟滞1）
+
+但代码中：
+- NIGHT_STOP_AH = 14.0
+- NIGHT_START_AH = 17.0
+- NIGHT_STOP_AH_HYST = 1.0
+- 启动条件：ah >= 17 + 1 = 18
+
+这导致：
+- 降到14停
+- 升到18才重开
+
+迟滞是4，不是1。这与注释"升到15才重开"严重不符。
+
+**问题4：过冷保护**
+
+```python
+# 过冷保护（v8.6 白天）：温度已低于舒适下限且不闷 → 停，避免吹到 22°C 以下
+if not is_night and temp <= DAY_COOL_STOP_T:
+    if ah is not None and ah <= DAY_COOL_STOP_AH:
+        return ("off", None, f"室温已降到{temp:.0f}度不闷，过冷保护关机")
+```
+
+这里`DAY_COOL_STOP_T = 22`，`DAY_COOL_STOP_AH = 15`。但系统背景说"温度<24°C逃生门无条件关"。这里22°C才关，与24°C逃生门不一致。
+
+等等，让我重新看系统背景："温度<24°C 逃生门无条件关"。但代码中：
+- 白天过冷保护：temp <= 22 且 ah <= 15 → 关
+- 没有看到24°C的逃生门
+
+在decide函数中，我没有看到`temp < 24`无条件关机的逻辑。这可能是个遗漏。
+
+让我再仔细看decide函数...
+
+在decide中，当running=True时：
+1. 假运行分支
+2. 压缩机运行分支：
+   - 硬上限：comp_min >= WATCH_MAX_RUN → 关
+   - 夜间停止条件
+   - 过冷保护：temp <= 22 且 ah <= 15 → 关
+   - 最短运行保护：comp_min < MIN_RUN → 不动
+   - 湿度达标：hum <= 55 → 关
+   - 虚拟变频
+   - 无效判断
+   - 正常除湿
+   - 低效
+
+没有看到`temp < 24`无条件关机的逻辑。
+
+在main中，也没有看到。
+
+这是一个严重问题：系统背景明确说"温度<24°C 逃生门无条件关"，但代码中没有实现。
+
+**问题5：手动开保护**
+
+```python
+# ── 手动开保护：手动开后 30 分钟内不自动关（防湿度微达标即关） ──
+manual_on = state.get("manual_on_at")
+if manual_on and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+    try:
+        on_dt = datetime.fromisoformat(manual_on) if isinstance(manual_on, str) else manual_on
+        mins = (now_dt - on_dt).total_seconds() / 60
+        if 0 <= mins < 30:
+            log(f"手动开后{int(mins)}分钟，暂不自动关（保护用户意图）")
+            print(f"ac_watch: 手动开后{int(mins)}分钟，暂不自动关")
+            # 跳过本次决策，但仍保存状态（更新 kWh/RH）
+            A.save_state(state)
+            return
+    except Exception:
+        pass
+```
+
+这里的问题是：手动开后30分钟内不自动关，但如果温度<24°C（逃生门）或压缩机硬上限，也应该关。这个保护应该只阻止"非安全类关机"。
+
+但代码中是直接return，连安全类关机也跳过了。这是个安全隐患。
+
+**问题6：压缩机运行时间计算**
+
+```python
+# ── 压缩机运行时间（跨启停累加，仅 AC 关机时清零）──
+comp_on_min = 0
+cycle_comp_total = state.get("cycle_comp_total", 0) or 0
+if comp == "compressor":
+    comp_since = state.get("compressor_on_since")
+    if comp_since:
+        try:
+            elapsed = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(comp_since)).total_seconds() / 60
+            comp_on_min = round(max(0, elapsed), 1)
+        except:
+            comp_on_min += 10  # 异常时保守估计 10 分钟
+    else:
+        state["compressor_on_since"] = now_ts
+        comp_on_min = 0
+    state["compressor_on_min"] = comp_on_min  # 保存当前连续运行时长供下一 tick 读取
+else:
+    # 压缩机停时，把上一 tick 的连续运行时间加入周期累计
+    # 注意：局部 comp_on_min 初始为 0，需读 state 里上一 tick 的值
+    prev_comp_on_min = state.get("compressor_on_min", 0) or 0
+    if prev_comp_on_min > 0:
+        cycle_comp_total = round(cycle_comp_total + prev_comp_on_min, 1)
+    comp_on_min = 0
+    state["compressor_on_min"] = 0
+    state.pop("compressor_on_since", None)
+state["cycle_comp_total"] = cycle_comp_total
+```
+
+这里有个问题：`comp_on_min += 10`在except分支中，但`comp_on_min`初始化为0，所以异常时`comp_on_min = 10`。但注释说"异常时保守估计10分钟"，这会导致压缩机运行时间被高估。
+
+更严重的是，`cycle_comp_total`的计算逻辑：
+- 当压缩机运行时，`comp_on_min`是当前连续运行时长
+- 当压缩机停时，把`prev_comp_on_min`加入`cycle_comp_total`
+
+但`cycle_comp_total`在压缩机运行期间不会被更新，只有在压缩机停时才更新。这意味着如果压缩机一直运行，`cycle_comp_total`不会增加。
+
+在decide中：
+```python
+compressor_run_min=state.get("cycle_comp_total") or state.get("compressor_on_min")
+```
+
+这里用的是`cycle_comp_total`或`compressor_on_min`。如果压缩机正在运行，`cycle_comp_total`是0（因为还没停过），所以会用`compressor_on_min`。但如果压缩机有启停，`cycle_comp_total`会包含之前的运行时间，但不会包含当前正在运行的时间。
+
+这会导致：如果压缩机运行30分钟，停，再运行30分钟，`cycle_comp_total`在第二次运行时是30（第一次的），`compressor_on_min`是当前连续运行时长。decide中用的是`cycle_comp_total`或`compressor_on_min`，但`cycle_comp_total`不包含当前运行时长。
+
+等等，让我重新看：
+```python
+compressor_run_min=state.get("cycle_comp_total") or state.get("compressor_on_min")
+```
+
+如果`cycle_comp_total` > 0，就用它；否则用`compressor_on_min`。
+
+在压缩机运行期间：
+- `cycle_comp_total` = 0（因为还没停过，或者上次停时清零了）
+- `compressor_on_min` = 当前连续运行时长
+
+所以`compressor_run_min` = `compressor_on_min`。这是对的。
+
+但如果压缩机有启停：
+- 第一次运行30分钟，停：`cycle_comp_total` = 30
+- 第二次运行10分钟：`cycle_comp_total` = 30，`compressor_on_min` = 10
+- `compressor_run_min` = 30（因为`cycle_comp_total` > 0）
+
+这不对！应该是30+10=40分钟。
+
+这是个bug。`cycle_comp_total`应该包含当前运行时长。
+
+**问题7：kWh积分**
+
+```python
+def update_kwh(state, now_ts, load_power):
+    """梯形积分更新 estimated_kWh。"""
+    prev_power = state.get("_prev_power")
+    prev_ts = state.get("_prev_kwh_ts")
+    kwh = state.get("estimated_kwh", 0.0)
+    if prev_power is not None and prev_ts is not None and load_power is not None:
+        try:
+            dt_hours = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(prev_ts)).total_seconds() / 3600
+            if dt_hours > 0 and dt_hours < 1:  # 防止异常间隔
+                avg_power = (prev_power + load_power) / 2.0
+                kwh += avg_power * dt_hours / 1000.0
+        except Exception:
+            pass
+    state["estimated_kwh"] = round(kwh, 4)
+    if load_power is not None:
+        state["_prev_power"] = load_power
+        state["_prev_kwh_ts"] = now_ts
+```
+
+这里有个问题：当`load_power` is None时，不更新锚点。但注释说"sensor unknown 不覆盖锚点"。这是对的。
+
+但问题：如果`load_power` is None，不积分，但`estimated_kwh`仍然被更新为`round(kwh, 4)`。这没问题，因为kwh没变。
+
+但`_prev_power`和`_prev_kwh_ts`不更新，这意味着下次恢复时，会用旧的锚点时间，导致积分间隔变大。
+
+例如：
+- 22:00: power=1100, kwh=0
+- 22:10: power=1100, kwh=0.1833
+- 22:20: power=None, kwh=0.1833（不积分，锚点保留在22:10）
+- 22:30: power=50, kwh=0.1833 + (1100+50)/2 * 20min / 1000 = 0.1833 + 0.1917 = 0.375
+
+但22:10到22:30的20分钟内，实际功率可能是0（空调关了），但代码会按1100→50积分，导致kWh被高估。
+
+这是个问题。当sensor unknown时，应该假设功率为0或者不积分，但恢复时应该用当前时间作为新的锚点时间，而不是用旧锚点。
+
+**问题8：decide中的无效判断**
+
+```python
+# 无效（Tier 4）：压缩机实际跑了 60min 以上 RH 降幅不足 → 立即关掉（不空耗）
+if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN
+        and delta_rh_60min is not None
+        and delta_rh_60min > -DEHUMID_STALL_RH_BAND):
+    return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度降幅不足，判定无效空耗关机")
+```
+
+这里`delta_rh_60min > -1.5`表示60分钟内RH降幅不足1.5%（即delta_rh_60min > -1.5）。但注释说"湿度上涨=环境在加湿，不该停；只有下降不足才算无效"。
+
+如果`delta_rh_60min`是正的（湿度上涨），那`delta_rh_60min > -1.5`为True，会触发关机。这与注释矛盾。
+
+实际上，`delta_rh_60min`应该是负值表示湿度下降。如果`delta_rh_60min = -0.5`（下降0.5%），那`-0.5 > -1.5`为True，触发关机。这是对的。
+
+如果`delta_rh_60min = 1.0`（上涨1%），那`1.0 > -1.5`为True，也会触发关机。这与注释"湿度上涨不该停"矛盾。
+
+所以条件应该是`delta_rh_60min > -1.5 and delta_rh_60min < 0`，或者更准确地说`-1.5 < delta_rh_60min < 0`。
+
+但代码中只检查了`delta_rh_60min > -1.5`，没有检查`delta_rh_60min < 0`。
+
+**问题9：虚拟变频恢复条件**
+
+```python
+# v8.9 降温补偿（Laguna 交叉审查）：虚拟变频升温后湿度回升 → 降回重启
+if (hum >= VIRTUAL_INV_RECOVER_RH
+        and current_target > A.TEMP_ABSOLUTE_FLOOR + 1
+        and not in_cooldown):
+    return ("cooling", 24,
+            f"升温缓除后湿度回升到{hum:.0f}%，降回24度继续除湿")
+```
+
+这里`VIRTUAL_INV_RECOVER_RH = 62`，但注释说"填补58%~66%之间的无人区"。如果湿度>=62%就降回24度，那62%确实在58-66之间。
+
+但问题：这个条件在假运行分支中，当`compressor == "fan_only"`时触发。但如果压缩机在运行（`compressor == "compressor"`），这个条件不会检查。
+
+在压缩机运行分支中，有：
+```python
+# 虚拟变频（v8.8）：湿度接近达标（≤58）且已跑够 MIN_RUN → 升温降负载缓除
+if (hum <= VIRTUAL_INV_APPROACH_RH
+        and comp_min is not None and comp_min >= A.MIN_RUN
+        and current_target is not None and current_target < VIRTUAL_INV_MAX_TARGET
+        and minutes_since_last_adjust is not None
+        and minutes_since_last_adjust >= DEHUMID_ADJUST_COOLDOWN):
+    new_target = min(VIRTUAL_INV_MAX_TARGET, current_target + 1)
+    return ("cooling", new_target,
+            f"湿度近达标（{hum:.0f}%），目标升1度到{new_target}度缓除防过冷")
+```
+
+这里`VIRTUAL_INV_APPROACH_RH = 58`，`VIRTUAL_INV_RECOVER_RH = 62`。
+
+如果湿度在58-62之间，虚拟变频不触发（因为>58），恢复也不触发（因为<62）。这就是"无人区"。
+
+但注释说"填补58%~66%之间的无人区"，而代码中恢复条件是>=62，所以58-62之间确实无人覆盖。
+
+等等，让我重新看注释：
+"v8.9 降温补偿（Laguna 交叉审查）：虚拟变频升温后湿度回升 → 降回重启
+填补 58%~66% 之间的"无人区"（假运行检测只覆盖 >66%）"
+
+注释说假运行检测只覆盖>66%，但代码中假运行检测是`hum > DEHUMID_LOW_EFF_RH`即`hum > 66`。所以假运行检测覆盖>66%。
+
+虚拟变频恢复条件是`hum >= 62`，所以覆盖>=62%。
+
+那62-66%之间呢？假运行检测覆盖>66%，恢复覆盖>=62%，所以62-66%被恢复覆盖。
+
+但注释说"填补58%~66%之间的无人区"，而代码中恢复条件是>=62，所以58-62之间还是无人区。
+
+这确实是个问题。如果湿度在58-62之间，虚拟变频不触发（>58），恢复不触发（<62），假运行检测不触发（<=66）。这就是无人区。
+
+**问题10：main中的running判断**
+
+```python
+if socket is None:
+    running = None  # 未知 → decide 返回 None，本次不动作（避免误控）
+else:
+    running = socket == "on" or state.get("mode") in ("cooling", "

@@ -188,3 +188,31 @@ cat ~/.hermes/cron/output/fc62a2bfd83d/$(ls -t ~/.hermes/cron/output/fc62a2bfd83
 ### 2026-08-15 cron 全天化（修复凌晨无人巡检）
 - `空调自动监控` job `1d6c5460de5e`：schedule `*/10 7-23 * * *` → `*/10 * * * *`（脚本内夜间模式 NIGHT=(23,7) 本就设计通宵运行，此前被外层 cron 窗口卡死，凌晨 0–7 点零巡检）
 - 事件：23:50 停机 T=23/RH=69 → 01:25 闷到 27°C/71%/AH=18.3 无人开；手动 tick 即自动开机 27°C
+
+## 2026-08-16 v8.12-v8.14 改动记录（OpenCode 接续 + 三模型交叉审查）
+
+> 版本线：v8.12（OpenCode 接续）→ v8.13（glm-5.2 + nemotron 审查）→ v8.14（E 谷电积极版）。全部在 `ac_watch.py`，git 已提交（`0fa8a5f`）。
+
+### v8.12（OpenCode 接续，审计 A-D 方案）
+1. **P1 修 bug**：关机分支只清 `cycle_comp_total`，遗留 `compressor_on_min`/`compressor_on_since` → 下周期时长虚高（实测 16:30 周期 24min = 残留14+实际10）。修复：off 分支同时清零
+2. **除湿起步 24→25°C**（`DEHUMID_START_TARGET=25`）：治 27°C 开机 12 分钟吹到 23°C 触发逃生门早停
+3. **cycle_log 透传 `abort_reason`**：停机原因可审计
+4. **效率统计只算完整周期**（`MIN_COMP_MIN=40`）：剔除污染短周期，报告自愈
+
+### v8.13（glm-5.2 + nemotron-3-ultra-free 交叉审查，三处）
+1. **假运行盲区兜底（F1）**：压缩机停 + 湿度 56~66% 时既不重启也不关机 → 风扇空耗。修复：停运≥10min 且 RH≤66% 直接关机
+2. **升温也写冷却锁（F2）**：`last_dehumid_adjust_at` 从 `target < current_target` 改为 `!=`，防虚拟变频升温后 Tier2 立即降回震荡
+3. **夜间 AH 启动温差守卫（F3）**：`temp - night_target >= 1°C` 才允许启动，防定频机压缩机不转只吹风
+
+### v8.14（E 方案，谷电积极版）
+- 22-6 谷电半价时段除湿启动阈值 65→62（`VALLEY_START_RH=62`），更早压湿省钱；峰电维持 65 不推迟
+- E 原案"峰电完全不开除湿"已评估**不建议**（省钱上限 31 元/月，白天 54% 时间闷着），量化依据见 Obsidian 审计文档
+
+### 模型可用性快照（2026-08-16 实测）
+- ✅ sensenova/deepseek-v4-flash（默认）、sensenova/glm-5.2（推理型，需大 max_tokens）、opencode-zen/nemotron-3-ultra-free、opencode-zen/laguna-s-2.1-free、orca/orcarouter/free、nous/meituan-longcat-2.0:free（**带 :free 后缀**，付费版 404 余额不足）
+- ❌ tokenfaucet（Sonnet5/Kimi/Qwen/V4Pro 402）、cline（Sonnet4.6 404、Gemini2.5Pro 402）、nvidia（410 EOL）、tencent MiMo（402）、freemodel（401）
+
+### 验证
+- 每次改动均过 `py_compile` + `python ac_watch.py --dry` + 纯函数冒烟
+- 长期效果对比脚本：`python verify_v814_effect.py`（按 v8.12 落地时间分组，5 指标对比，`--snapshot` 存基线）
+- 审查产物：`_review_strong_*.txt`（glm-5.2/nemotron/龙猫），审查脚本 `review_strong_models.py` 已入库

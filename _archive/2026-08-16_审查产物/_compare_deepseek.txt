@@ -1,0 +1,88 @@
+We need answer in Chinese, format requested. Need review state machine decision function. Need identify vulnerabilities and improvements. Need be concise, no fluff. Need inspect code. Let's parse function.
+
+We need output items with level 🔴/🟡/🔵, location, problem, fix suggestion. Overall conclusion.
+
+Need analyze thoroughly.
+
+Function decide(...). Uses global datetime? imported. Parameters: temp, hum, running, since_on, since_off, is_night, compressor=None, last_compressor_stop_at=None, cooldown_until_dt=None, current_target=26, delta_rh_20min=None, delta_rh_60min=None, minutes_since_last_adjust=None, ah=None, compressor_run_min=None, night_comp_starts=None.
+
+Need examine logic.
+
+First if running is None return (None,None,None). OK defensive.
+
+If running:
+- if compressor == "fan_only":
+  stop_duration = None
+  if last_compressor_stop_at is not None and since_on is not None:
+    stop_duration = last_compressor_stop_at
+    if stop_duration < 0: stop_duration=None
+  in_cooldown = False
+  if cooldown_until_dt is not None:
+    in_cooldown = datetime.now() < cooldown_until_dt
+  if (hum > 66 and stop_duration is not None
+      and stop_duration >= 10 and not in_cooldown):
+    new_target = max(16, current_target - 2)
+    return ("cooling", new_target, f"压缩机只吹风不转，降{new_target}度重启")
+  return (None,None,None)
+- if comp_min is not None and comp_min >= 90:
+  return ("off", None, f"连续运行{int(comp_min)}分钟，硬上限关机")
+
+Wait `comp_min` variable not defined in parameters? There is `compressor_run_min` parameter, but code uses `comp_min`. This is a bug! If running and compressor not fan_only, code checks `comp_min` which is undefined -> NameError. However perhaps in original function comp_min is global? In provided signature doesn't include. Need call out. Actually parameter `compressor_run_min` likely intended. So line `if comp_min is not None and comp_min >= 90:` should be `compressor_run_min`. This is critical 🔴. Unless comp_min is variable from outer scope? In Python, if not assigned, NameError. So yes.
+
+Also if running and compressor == "cooling"? The code if running and not fan_only, check comp_min. If compressor is None? Maybe running means fan? Need understand.
+
+"running" likely fan/AC running? compressor states. Need identify logic issues.
+
+Then if since_off is not None and since_off < 30: return (None,None,None). This protects short cycling after off. But note if running is False? Actually after running block, this line executes for running=False. Good. If running=True and returned earlier? If running True and compressor "fan_only" and no action returns; if comp_min check no action then falls to since_off? Wait after running block, if no return, it continues to since_off check. That means if running=True (but not fan_only and comp_min<90) and since_off<30, it returns None. That might suppress actions during initial 30 min after off? Since running True and since_off maybe time since off before this run? Ambiguous. It may be okay? Need inspect.
+
+Then is_night logic:
+```
+if is_night:
+    night_target = max(24, min(26, round(temp - 2)))
+    if temp >= 28:
+        return ("cooling", night_target, f"夜间室温{temp}度偏热")
+    return (None,None,None)
+```
+Night: target = clamp(temp - 2, 24,26). If temp >=28, cooling with target. For temp 28, target = min(26, 26) =26. For temp 30, round(28)=28 -> min(26,28)=26. For temp 27, round(25)=25 but no action because temp <28. So if temp is 27.5, no action. Night target 25? But no action. Fine? Maybe should cool if temp > current_target? Need discuss.
+
+Then if temp >= 28:
+```
+t = round(max(26, min(28, temp - 2)))
+return ("cooling", t, f"室内{temp}度偏热")
+```
+For temp 28: t = round(max(26, min(28,26))) = 26. For temp 29: round(max(26,min(28,27)))=27. For temp 30: round(max(26,min(28,28)))=28. For temp 31: round(max(26,min(28,29)))=28. For temp 40: round(max(26,min(28,38)))=28. So target capped 28. Fine.
+
+Need find holes:
+
+1. `comp_min` undefined / mismatch. 🔴.
+
+2. `last_compressor_stop_at` parameter likely a timestamp/datetime? But code assigns to stop_duration and compares to 10, then later "stop_duration = last_compressor_stop_at" not subtract now. If it is timestamp, stop_duration = datetime object? Then comparing to 10 TypeError. The name says stop_at, not duration. In function call, `last_compressor_stop_at` likely datetime of last compressor stop. In code:
+```
+stop_duration = None
+if last_compressor_stop_at is not None and since_on is not None:
+    stop_duration = last_compressor_stop_at
+    if stop_duration < 0: stop_duration = None
+...
+if hum >66 and stop_duration is not None and stop_duration >= 10 ...
+```
+If last_compressor_stop_at is datetime, `stop_duration < 0` TypeError. If it's seconds since stop? Name says at. Need call out. The intended likely compute `now - last_compressor_stop_at` seconds. The fix: `stop_duration = (datetime.now() - last_compressor_stop_at).total_seconds() / 60` maybe. Also `since_on` not used. Need identify.
+
+3. Night logic: `night_target = max(24, min(26, round(temp - 2)))`; If temp is 28, target=26. If temp is 28.4, round(26.4)=26. If temp 28.5, round(26.5)=26? Python bankers rounding? Actually round(26.5) = 26? Because banker's rounding to even. Could be issue. But not major. Need mention? Perhaps.
+
+4. Decision thresholds: if temp >=28 always returns cooling, regardless of current target or hysteresis. Could cause short cycling if setpoint 26 and temp 28.1. Once cooling runs, compressor will lower temp; but function may decide cooling every 2 minutes until temp below 28. It doesn't check current_target or whether compressor is already cooling. Wait if running True and compressor == "cooling", after comp_min check, if comp_min <90, it will fall through to since_off? If since_off from previous? Since_on? Let's consider: Running True, compressor "cooling", since_off perhaps 0 (since just started?) But since_off <30 -> return None. When compressor running, since_off likely maybe 0? Actually since_off is time since compressor turned off, not relevant when running. This code after running block checks `since_off` unconditionally. If running True and since_off <30, it returns None, meaning during first 30 minutes after an off event, even if cooling is running, decision suppressed. That may prevent modifying target or stopping. But after 30 min, if temp still >=28, it could issue "cooling" again even if compressor is already cooling, resetting target to temp-2? Is that intended? The state machine should decide actions based on current state. The function returns action none if already cooling? It doesn't check `compressor == "cooling"` before returning cooling. So every 2 min while temp>=28 and since_off >=30, it will return ("cooling", t, "室内偏热") even if compressor already cooling. That may be redundant, likely no-op but could reset target every cycle or cause excessive adjustments. Need call out.
+
+Actually function's purpose "空调状态机决策" likely returns desired next state/target. If already in "cooling" and target same, returning cooling same target is harmless but message. But if current_target differs, it may lower target? Example current_target=26, temp=28.1, t=26, same. If temp=29, t=27; if current_target=27, same. If current_target=30 from previous, t=27 lowers target. Good. But if current_target=26 and temp=29, t=27? Wait formula max(26,min(28,temp-2)) =27, so it raises target to 27. That seems wrong: If room 29 and target 26, should continue cooling at target 26, not set target 27. But maybe target in return is "compressor target" (temperature to achieve) and current_target is setpoint? Actually max 26 min 28 temp-2 gives target roughly 2 degrees below current temp but at least 26. For temp 29, target=27, so it asks compressor to cool to 27. That's warmer than current_target 26. Could be a strategy to avoid overcool? Need understand. The file says "上海定频1.5匹，每2分钟运行一次" likely rule-based. The target maybe "temp threshold" (if temp above, cool to temp-2? Actually set temperature is user target? current_target=26. If temp=29, target 27. That would lower from current target? Hmm current_target is 26; action cooling with target 27 means set temperature to 27? That's less cool. Maybe to reduce compressor load? But "降2度重启" in fan_only branch: new_target = current_target - 2, so target is a threshold? Need not infer.
+
+5. Fixed 30-min short-cycle protection: `if since_off is not None and since_off < 30: return (None,None,None)` means after off, wait 30 minutes before any cooling. But if temperature high, no cooling. In real A/C compressor may need 3-min delay not 30; but each decision every 2 min, 30 is 1 hour? Actually since_off maybe minutes. 30 minutes could be too conservative for comfort; but maybe intentionally. Need assess. Also when `since_off` is None, no protection; if sensor missing, can short-cycle. Should handle None. But `since_off is not None` condition. If None, can immediately cool. Need mention: if since_off is None, should assume unknown and wait? Depends.
+
+6. `running is None` returns None. But if running False, all good.
+
+7. `humidity` only used in fan_only branch. It doesn't use `delta_rh_20min`, `delta_rh_60min`, `minutes_since_last_adjust`, `ah`, `compressor_run_min` in main logic. Several parameters unused. "漏洞" maybe? Not necessarily.
+
+8. In fan_only branch, `last_compressor_stop_at is not None and since_on is not None` but then `stop_duration = last_compressor_stop_at`; if `last_compressor_stop_at` is timestamp, no. If it's already seconds, variable name confusing. Also if `since_on` is None, stop_duration remains None, so no restart even if humidity high. Why require `since_on`? It should use time since compressor stop, not since fan on. Also condition `hum > 66` and `stop_duration >= 10` means if compressor stopped for at least 10 minutes and fan-only running. But if in cooldown, no restart. Good. But "not in_cooldown" is correct.
+
+9. `cooldown_until_dt` check uses datetime.now() each call; if timezone aware? If cooldown_until_dt naive vs aware, comparison TypeError. Need mention maybe. Also `cooldown_until_dt` not used elsewhere; if compressor restart is prohibited due cooldown, but after "cooldown_until_dt" expires, restart. Good.
+
+10. `compressor_run_min` variable intended hard limit 90. But if `compressor_run_min` is None, no hard off. If compressor runs 90+ and temp below target, maybe off. But if temp still high, will turn off, then after 30min maybe on again. Could be OK as hard limit. However the check is after fan_only branch and before short-cycle. If running True and compressor is "cooling" with compressor_run_min=100, returns off. Good. But if compressor is None? The code doesn't check compressor state; if running True and compressor is not "fan_only", it might apply hard limit to a "dry" or "heat" mode? Maybe.
+
+11. If running True and compressor == "fan_only" and humidity high but stop_duration <10, it returns None. It doesn't check if temp high. If temp >=28 and compressor fan-only? Maybe return cooling? But due compressor stopped 5 min, short-cycle? Actually if compressor is fan_only and temp high, should maybe start cooling? It doesn't because branch returns None if humidity not high. So hot room but compressor off/fan only: no cooling. But if compressor "fan_only" implies compressor off; if temp >=28, should potentially turn on cooling.
