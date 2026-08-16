@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-空调自动监控 v8.15 — 每 2 分钟自动闭环（Hermes cron: */2 * * *）
+空调自动监控 v8.16 — 每 2 分钟自动闭环（Hermes cron: */2 * * *）
+
+v8.16 数据可信度 + 白天双轴停止（2026-08-16，ZCode 深查落地）：
+  1. kWh 严格 gap：积分仅在相邻有效采样 ≤10min 内（KWH_MAX_GAP_MIN）——
+     原跨空窗用 stale 压缩机功率外推，开机首读虚记 ~0.5 度（16:30→16:32 实录 2min 虚记 0.62 度），
+     cycle_log kwh_used 系统性虚高 2-4 倍，污染 ΔAH/kWh 效率模型
+  2. 白天双轴停止：AH≤14.5 且 RH≤62 且压缩机≥10min → 关（DAY_STOP_AH/DAY_EXIT_RH_MAX/
+     DUAL_STOP_MIN_COMP）——RH 单轴在低热负荷时段会拖到过冷逃生门才停（16:30 周期：
+     AH 6min 达标，T 12min 冲 23°C）；AH 达标即收手，少吹冷少耗电，与夜间 AH 逻辑对齐
 
 v8.15 fail-safe（2026-08-16，AGENTS.md 待办落地）：
   1. load_state 损坏不再静默 → 打印 ERROR + _state_load_failed 标记
@@ -102,6 +110,9 @@ NIGHT_TARGET = 26           # 夜间目标温度上限（=clamp(室温-2,24,26)�
 NIGHT_MIN_TARGET = 24       # 夜间目标温度下限（防过冷）
 DAY_COOL_STOP_T = 22       # 白天制冷过冷保护：≤22°C 且 AH≤15 → 停（防过冷不停）
 DAY_COOL_STOP_AH = 15.0    # 白天过冷保护 AH 阈值（独立常量，不与夜间 NIGHT_STOP_AH 耦合）
+DAY_STOP_AH = 14.5         # v8.16 白天双轴停止：AH（真实含水量）达标线
+DAY_EXIT_RH_MAX = 62       # 双轴停止 RH 门（须 RH≤62 且 AH 达标；防"高温不潮"误停，T≥27 时 AH 天然 >15）
+DUAL_STOP_MIN_COMP = 10    # 双轴停止压缩机地板(min)：低于 MIN_RUN 因"目标完成≈安全类"允许早停
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
 
@@ -115,6 +126,13 @@ FAN_ONLY_POWER_MAX = 50            # 5~50W = 仅风扇，压缩机停
 COMPRESSOR_FALSE_RUN_MIN = 10      # 压缩机停连续多久判定为"假运行"(min)
 COMPRESSOR_RESTART_COOLDOWN = 30   # 压缩机重启后 30min 内不再次调温
 COMPRESSOR_RESTART_DROP = 2        # 假运行时降 2C 重启压缩机
+
+# ── v8.16 kWh 严格 gap 语义 ──
+# 实锤（2026-08-16）：关机期 read_ac_power 返回 None，_prev_power 残留压缩机 1167W，
+# 下次开机跨 30+min 空窗被梯形外推 → 16:30→16:32 两分钟虚记 0.62 度（≈18.7kW，物理不可能），
+# cycle_log 的 kwh_used 系统性虚高 2-4 倍，污染 ΔAH/kWh 效率模型。
+# 修法：只在相邻有效采样间隔 ≤10min（5 个 tick 容忍度）内积分，跨 gap 只重置锚点不外推。
+KWH_MAX_GAP_MIN = 10
 
 # ── v8.4 除湿效率参数 ──
 DEHUMID_EXIT_RH = 55               # 湿度达标退出线（与 HUM_DEHUMID_ON=65 保持 10% 滞回，防频繁启停）
@@ -220,14 +238,16 @@ def update_rh_history(state, now_ts, rh):
 
 def update_kwh(state, now_ts, load_power):
     """梯形积分更新 estimated_kWh。
-    每次 tick 调用一次，用当前 load_power 与上一 tick 的功率做梯形积分。"""
+    每次 tick 调用一次，用当前 load_power 与上一 tick 的功率做梯形积分。
+    v8.16 严格 gap：相邻有效采样间隔 >KWH_MAX_GAP_MIN 视为空窗，不外推
+    （空窗另一端可能是关机期待机 77W，用 stale 压缩机功率外推会虚记账），只重置锚点。"""
     prev_power = state.get("_prev_power")
     prev_ts = state.get("_prev_kwh_ts")
     kwh = state.get("estimated_kwh", 0.0)
     if prev_power is not None and prev_ts is not None and load_power is not None:
         try:
             dt_hours = (datetime.fromisoformat(now_ts) - datetime.fromisoformat(prev_ts)).total_seconds() / 3600
-            if dt_hours > 0 and dt_hours < 1:  # 防止异常间隔
+            if dt_hours > 0 and dt_hours <= KWH_MAX_GAP_MIN / 60.0:
                 avg_power = (prev_power + load_power) / 2.0
                 kwh += avg_power * dt_hours / 1000.0
         except Exception:
@@ -398,6 +418,16 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # 先于 MIN_RUN 守卫：安全类关机不等最短运行时间（补白天过冷 AH>15 的空区）
         if temp < A.TEMP_ABSOLUTE_FLOOR:
             return ("off", None, f"室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门无条件关机")
+
+        # v8.16 白天双轴停止（AH+RH）：低热负荷时段 RH 单轴会拖到过冷逃生门才停
+        # （2026-08-16 16:30 周期实录：AH 6min 即到 14.0，T 却在 12min 冲到 23°C 触发逃生门）。
+        # AH=真实含水量，达标即收手，室温可停在 25°C 而不是吹到 23°C；
+        # 自带 10min 压缩机地板（低于 MIN_RUN：AH 达标≈目标完成，类比安全类早停，
+        # 配合 MIN_OFF=30 → 白天最多 ~2 次启动/小时，远低于夜间上限 4 次）。
+        if (not is_night and ah is not None and hum <= DAY_EXIT_RH_MAX
+                and ah <= DAY_STOP_AH
+                and comp_min is not None and comp_min >= DUAL_STOP_MIN_COMP):
+            return ("off", None, f"含水量已达标（AH={ah:.1f}，RH={hum:.0f}%），关机防过冷")
 
         # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
         if comp_min is not None and comp_min < A.MIN_RUN:
@@ -786,11 +816,18 @@ def _selftest():
     update_kwh(st, "2026-08-14T22:30:00", None)
     assert st["_prev_power"] == 25, f"unknown_prev={st['_prev_power']}"
     assert abs(st["estimated_kwh"] - 0.2771) < 0.01, f"unknown_kwh={st['estimated_kwh']}"
+    # v8.16 严格 gap：恢复采样距上一有效采样 20min > 10min 上限 → 不外推（原会虚记 0.0125）
     update_kwh(st, "2026-08-14T22:40:00", 50)
-    assert abs(st["estimated_kwh"] - 0.2896) < 0.01, f"recover_kwh={st['estimated_kwh']}"
+    assert abs(st["estimated_kwh"] - 0.2771) < 0.01, f"recover_gap_kwh={st['estimated_kwh']}"
     assert st["_prev_power"] == 50
     update_kwh(st, "2026-08-14T22:50:00", 45)
-    assert abs(st["estimated_kwh"] - 0.2975) < 0.01, f"after_recover_kwh={st['estimated_kwh']}"
+    assert abs(st["estimated_kwh"] - 0.2850) < 0.01, f"after_recover_kwh={st['estimated_kwh']}"
+    # v8.16 实锤场景：关机期 None 空窗后开机读 1100W，stale 高功率不得跨空窗外推
+    update_kwh(st, "2026-08-14T23:30:00", None)   # 关机期待机（读不到）
+    update_kwh(st, "2026-08-14T23:35:00", 1100)   # 开机首读，距 22:50 空窗 45min
+    assert abs(st["estimated_kwh"] - 0.2850) < 0.01, f"stale_gap_kwh={st['estimated_kwh']}"
+    update_kwh(st, "2026-08-14T23:37:00", 1100)   # 正常相邻采样恢复积分
+    assert abs(st["estimated_kwh"] - (0.2850 + 1100 * 2 / 60 / 1000)) < 0.01, f"resume_kwh={st['estimated_kwh']}"
 
     # ── 夜间模式 decide ──
     _future = datetime.now() + timedelta(hours=1)
@@ -809,7 +846,19 @@ def _selftest():
     r = decide(27, 75, True, 30, 90, False, "fan_only", 15, None, 26, 0, 0, None, None, None, None, fake_run_count=FAKE_RUN_MAX_CYCLES)
     assert r[0] == "off", f"fake_run #{FAKE_RUN_MAX_CYCLES} should stop, got {r}"
 
-    print("ac_watch selftest: ALL PASS (v8.10)")
+    # v8.16 白天双轴停止（AH+RH）：位置参数 ah=14th, compressor_run_min=15th
+    # ① AH 达标 + RH 过门 + 压缩机跑够 10min 地板 → 早于 MIN_RUN(40) 停（16:30 周期实录场景）
+    assert decide(25, 61, True, 12, 90, False, "compressor", None, None, 25, -2.0, None, None, 14.0, 10)[:2] == ("off", None)
+    # ② AH 未达标（16.0）→ 继续跑
+    assert decide(25, 61, True, 12, 90, False, "compressor", None, None, 25, -2.0, None, None, 16.0, 10)[:2] == (None, None)
+    # ③ RH 63 > 62 门 → 不停（防"高温不潮"误停）
+    assert decide(27, 63, True, 50, 90, False, "compressor", None, None, 25, -1.0, None, None, 14.0, 45)[:2] == (None, None)
+    # ④ 压缩机仅 5min < 10min 地板 → 不停（压缩机保护）
+    assert decide(25, 61, True, 6, 90, False, "compressor", None, None, 25, -2.0, None, None, 14.0, 5)[:2] == (None, None)
+    # ⑤ 夜间不吃白天双轴规则（夜间有自己的 AH 线 14.0 与 20min 地板）
+    assert decide(25, 61, True, 30, 90, True, "compressor", None, None, 25, 0, 0, None, 14.2, 25)[:2] == (None, None)
+
+    print("ac_watch selftest: ALL PASS (v8.16)")
 
 
 if __name__ == "__main__":
