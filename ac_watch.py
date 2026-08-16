@@ -103,9 +103,9 @@ WATCH_MAX_RUN = 90      # 硬上限，防死锁
 QUIET_TTS = (23, 7)         # TTS 静音时段
 NIGHT = (23, 7)             # 夜间节能模式时段
 NIGHT_START_T = 28.0        # 夜间启动温度阈值
-NIGHT_START_AH = 17.0       # 夜间启动绝对湿度阈值 (g/m3)
+NIGHT_START_AH = 15.5       # 夜间启动绝对湿度阈值 (g/m3)（2026-08-16：17→15.5，用户 26°C/AH16.3 体感刺挠，压湿提前；迟滞带 14→16）
 NIGHT_STOP_AH = 14.0        # 夜间停止绝对湿度阈值
-NIGHT_START_AH_HYST = 1.0   # 夜间启动迟滞（停 AH≤14，升到 AH≥18(NIGHT_START_AH+HYST) 才重开）
+NIGHT_START_AH_HYST = 0.5   # 夜间启动迟滞（停 AH≤14，升到 AH≥16(NIGHT_START_AH+HYST) 才重开）
 NIGHT_TARGET = 26           # 夜间目标温度上限（=clamp(室温-2,24,26)，分支 A 夜间对齐）
 NIGHT_MIN_TARGET = 24       # 夜间目标温度下限（防过冷）
 DAY_COOL_STOP_T = 22       # 白天制冷过冷保护：≤22°C 且 AH≤15 → 停（防过冷不停）

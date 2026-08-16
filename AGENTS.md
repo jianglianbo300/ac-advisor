@@ -1,7 +1,7 @@
 # AGENTS.md — 定频空调省电顾问（ac_advisor）
 
 > 给 AI 代理的接续指南。**新会话开工前先读本文件**，10 秒恢复上下文。
-> 最后更新：2026-08-14（v8.2.1 + Xiaomi Sound TTS 语音接入专项）
+> 最后更新：2026-08-16（v8.19 手动控制修复 + 夜间压湿提前）
 
 ## 项目是什么
 
@@ -216,3 +216,18 @@ cat ~/.hermes/cron/output/fc62a2bfd83d/$(ls -t ~/.hermes/cron/output/fc62a2bfd83
 - 每次改动均过 `py_compile` + `python ac_watch.py --dry` + 纯函数冒烟
 - 长期效果对比脚本：`python verify_v814_effect.py`（按 v8.12 落地时间分组，5 指标对比，`--snapshot` 存基线）
 - 审查产物：`_review_strong_*.txt`（glm-5.2/nemotron/龙猫），审查脚本 `review_strong_models.py` 已入库
+
+## 2026-08-16 v8.16 改动记录（ZCode 深查：数据可信度 + 白天双轴停止，commit 5568441）
+
+1. **kWh 严格 gap**（ac_watch.py）：`KWH_MAX_GAP_MIN=10`——实锤 16:30→16:32 两分钟虚记 0.62 度（关机期功率 None 空窗用 stale 1167W 外推，物理不可能 18.7kW）；cycle_log kwh_used 此前虚高 2-4 倍，**效率模型数据从此可信**。selftest +4
+2. **白天双轴停止**（ac_watch.py）：`DAY_STOP_AH=14.5 / DAY_EXIT_RH_MAX=62 / DUAL_STOP_MIN_COMP=10`——AH 达标即收手，不再拖到 23°C 逃生门（16:30 周期实录：AH 6min 达标、T 12min 冲 23）。夜间不吃此规则。selftest +5
+3. **ac_off_alert → 心跳看门狗**：真实代码 `ac_watchdog.py`（本目录，唯一维护点），cron 侧沿用 `ac_off_alert.py` 文件名（薄包装器，免动 jobs.json）；ac_watch.log 静默 >20min 微信报警（2h 防轰炸）+ 恢复通知；原逻辑备份 scripts 目录 `.bak-20260816`；cron `cca8361f1c4c` 全天化 `*/30 * * * *`
+4. cop_analysis.py 补提交（v8.8 遗漏）；`_effect_snapshots.jsonl` / `ac_watchdog_state.json` 入 gitignore
+5. 验证：py_compile + 两个 selftest 全过 + --dry 正常 + 生产 tick 18:40 起无异常（cron 每 tick 重 exec = 即时部署）
+6. 深查遗留待办（下次）：COP 分析幸存者偏差（≥40min 过滤把 24/25°C 对照组剔光）→ 工况匹配/每压缩机分钟 ΔAH 分层；temp_history + 傍晚自然降温守卫；开门事件检测（ΔRH>+3%/6min 且 T 同升 → cycle_log 打 tag、COP 剔除）
+
+## 2026-08-16 v8.19 改动记录（手动控制修复 + 夜间压湿提前）
+
+1. **ac.py 手动控制修复**：`_commit()` 补 `ac_control_init()` + AC_CTRL 空检查——v1.1 重构后 on/off/temp 全部报 `control_unavailable`（撞 AGENTS.md 第 10 条同款坑：复用 apply_and_commit 必须先初始化句柄），手动开关空调失效。实测 `temp 24` 恢复。
+2. **夜间压湿提前**（ac_watch.py）：`NIGHT_START_AH 17→15.5`、`NIGHT_START_AH_HYST 1.0→0.5`——启动线 AH≥18 降到 ≥16（26°C/RH68% 即 AH16.3 时用户体感刺挠）。停止线 AH≤14 不变，迟滞带 14→16。
+3. 验证：py_compile + 内置 selftest ALL PASS + 边界用例（24°C 守卫拒开 / 25.5°C 正常开 / MIN_OFF 锁定）+ `--dry` 正常。审查备注：夜间迟滞带收紧后启停周期约 40-50min，在 NIGHT_MAX_STARTS_PER_H/MIN_OFF 保护内，如需更省电把 HYST 调回 0.8~1.0。

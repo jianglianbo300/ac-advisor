@@ -49,6 +49,12 @@ def cmd_status():
 
 def _commit(new_mode, target_temp=None):
     """走 apply_and_commit 统一接口：执行 → verify → 按真实结果写 state。"""
+    # 必须先初始化控制句柄，否则 ac_apply 返回 control_unavailable
+    # （AGENTS.md 第 10 条：任何复用 apply_and_commit 的入口必须先 ac_control_init()）
+    ac_advisor.ac_control_init()
+    if ac_advisor.AC_CTRL is None:
+        print("❌ 空调插座不可达（检查 miio_config.json 的 ac_partner）")
+        sys.exit(1)
     state = ac_advisor.load_state()
     ctrl = ac_advisor.apply_and_commit(new_mode, target_temp, state)
     if ctrl["status"] == "failed":
