@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-空调自动监控 v8.14 — 每 2 分钟自动闭环（Hermes cron: */2 * * *）
+空调自动监控 v8.15 — 每 2 分钟自动闭环（Hermes cron: */2 * * *）
+
+v8.15 fail-safe（2026-08-16，AGENTS.md 待办落地）：
+  1. load_state 损坏不再静默 → 打印 ERROR + _state_load_failed 标记
+  2. ac_watch 检测到标记 → 本次 tick 不执行开/关（防丢 MIN_OFF 锚点）
 
 v8.14 E 方案（谷电积极版，2026-08-16）：
   1. 峰谷电价感知：22-6 谷电半价时段除湿启动阈值 65→62，更早压一轮省电费
@@ -484,6 +488,12 @@ def main():
             temp = hum = None
 
     state = A.load_state()
+    # v8.15 fail-safe（2026-08-14 审查待办落地）：状态文件损坏 → 本次 tick 不执行任何开/关，
+    # 避免"假装没状态继续跑"悄悄丢失 MIN_OFF/manual 锚点；等下次 tick 状态正常或人工处理
+    if state.get("_state_load_failed"):
+        log("[ERROR] 状态文件损坏，本次 tick fail-safe 跳过（不执行开/关）")
+        print("ac_watch: 状态文件损坏，fail-safe 跳过（不执行开/关）")
+        return
     A.reconcile_state(state, now_ts)
 
     # v8.10 传感器断连超时升级

@@ -137,7 +137,11 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
             return {**default, **json.load(f)}
-    except Exception:
+    except Exception as e:
+        # v8.15 待办落地（2026-08-14 审查）：损坏不再静默——打印 ERROR 并打标记，
+        # 由调用方（ac_watch）fail-safe：本次 tick 不执行开/关，避免假装没状态继续跑丢锚点
+        print(f"[ERROR] state load failed: {type(e).__name__}: {e}")
+        default["_state_load_failed"] = True
         return default
 
 
