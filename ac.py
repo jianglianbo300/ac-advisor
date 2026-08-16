@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""空调统一命令入口 v1.0 —— 所有空调操作一个命令搞定。
+"""空调统一命令入口 v1.1 —— 所有空调操作一个命令搞定。
 
 用法:
   ac.py status              查看空调/插座/室内状态（功率、温度、湿度）
@@ -10,6 +10,10 @@
   ac.py advice              跑完整顾问（读功率+决策+自动控制+TTS，同 cron）
 
 依赖: D:\\work\\ac-advisor\\ac_advisor.py（自动控制/实测功率都在那维护）
+
+v1.1（2026-08-16）: on/off/temp 改为走 apply_and_commit 统一接口
+（command→verify→按真实设备状态写 ac_state.json），修掉手动操作后
+watcher 读到 stale state 的问题（AGENTS.md P2-b 待办）。
 """
 import os
 import runpy
@@ -43,37 +47,59 @@ def cmd_status():
         print("🌡️  室内传感器不可用")
 
 
+def _commit(new_mode, target_temp=None):
+    """走 apply_and_commit 统一接口：执行 → verify → 按真实结果写 state。"""
+    state = ac_advisor.load_state()
+    ctrl = ac_advisor.apply_and_commit(new_mode, target_temp, state)
+    if ctrl["status"] == "failed":
+        reason = ctrl.get("reason", "")
+        print(f"⚠️  执行未完成（{reason}）—— 设备状态未变更/未落盘，勿重复操作")
+        sys.exit(1)
+    action = ctrl.get("action", "") or "无需动作（状态已一致）"
+    print(f"✅ {action}")
+
+
 def cmd_on():
-    get_ctrl().send_command("set_power", ["on"])
-    print("✅ 已开机（保持当前模式/温度）")
+    # 保持当前目标温度（state.target_temp），走制冷开
+    state = ac_advisor.load_state()
+    target = state.get("target_temp")
+    _commit("cooling", target if isinstance(target, int) else None)
 
 
 def cmd_off():
-    get_ctrl().send_command("set_power", ["off"])
-    print("✅ 已关机")
+    _commit("off")
 
 
 def cmd_temp(n):
-    d = get_ctrl()
-    st = d.status()
-    if not st.is_on:
-        d.send_command("set_power", ["on"])
-        print("已开机", end="  ")
-    if st.mode is None or st.mode.value != "cool":
-        d.send_command("set_mode", ["cool"])
-        print("已切制冷", end="  ")
-    d.send_command("set_tar_temp", [n])
-    print(f"设定 {n}°C")
+    _commit("cooling", n)
 
 
 def cmd_mode(m):
     if m not in ("cool", "dry", "heat", "fan", "auto"):
         print(f"❌ 模式 {m} 无效（cool/dry/heat/fan/auto）")
         sys.exit(1)
+    # apply_and_commit 支持 cooling(cool)/dehumid(dry)/fan/off；
+    # heat/auto 为手动裸模式（advisor 状态机不建模）→ send_command + 手动对账 state
+    if m == "cool":
+        _commit("cooling", None)
+        return
+    if m == "dry":
+        _commit("dehumid")
+        return
     d = get_ctrl()
     d.send_command("set_power", ["on"])
     d.send_command("set_mode", [m])
-    print(f"✅ 已开机并切到 {m}")
+    # 手动对账：裸模式按"运行中"记账（模式未知按 cooling 计，同 reconcile_state 惯例）
+    state = ac_advisor.load_state()
+    now_ts = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+    was_on = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+    if not was_on:
+        state["run_start"] = now_ts
+        state["last_on_at"] = now_ts
+    state["mode"] = "cooling"
+    state.pop("last_off_at", None)
+    ac_advisor.save_state(state)
+    print(f"✅ 已开机并切到 {m}（手动裸模式，状态按运行中记账）")
 
 
 def cmd_advice():

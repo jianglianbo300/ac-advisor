@@ -72,7 +72,7 @@ cat ~/.hermes/cron/output/fc62a2bfd83d/$(ls -t ~/.hermes/cron/output/fc62a2bfd83
 - [ ] iLink 限流（30s cooldown）：早上多个 cron 集中发消息会触发，属临时现象；若频繁出现考虑错峰或加重试
 - [ ] **已知设计盲点（部分已解）**：B 分支"集中除湿一轮"原只有决策语义，无自动停止执行器——**v8.2.1 ac_watch 已实现自动停止（MIN_RUN≥40 且 RH≤66 → 关，硬上限 90min）**；完整 v9 burst lifecycle（run_reason/planned_off_at/独立执行器）仍为未来项
 - [x] **B 类：`load_state()` 失败静默返回 default 偏危险** —— **v8.15 已修（2026-08-16）**：损坏时打印 `[ERROR] state load failed: ...` + `_state_load_failed` 标记；ac_watch 检测到标记 → 本次 tick fail-safe 跳过（不执行开/关），防丢 MIN_OFF 锚点
-- [ ] **P2-b / CLI execution path parity（2026-08-14 实测发现）**：自动路径（07:00 顾问 + v8.2.1 watcher）均走统一接口 `apply_and_commit()`（唯一状态写入者，v8.2.1 审查后已彻底收权）✓；但 `ac.py on/off/temp/mode` 手动 CLI 仍为裸 `send_command`，**不经 verify/commit** → 手动关机会留 stale state（实测：off 后 state 仍 mode=cooling/last_off_at 旧值，已人工对账修正）。最小修复目标：ac.py 统一调用 `apply_and_commit`，勿各复制一套控制逻辑。**冻结中**，先看 07:00 cron 主链路，再单独排期
+- [x] **P2-b / CLI execution path parity** —— **v1.1 已修（2026-08-16）**：ac.py on/off/temp/mode cool/dry 改走 `apply_and_commit()`（command→verify→按真实设备写 state），手动操作不再留 stale state；mode heat/auto 为手动裸模式（状态机不建模）走 send_command + 手动对账记账
 
 ## v9 路线图（2026-08-14 GPT 战略评审，按优先级）
 
