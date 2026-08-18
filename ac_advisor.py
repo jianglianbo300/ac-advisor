@@ -228,6 +228,10 @@ def find_pre_cool_window(schedule, current_hour):
 
 # ── 自适应阈值学习（v9.0 新增，持久化） ────
 LEARN_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_learned.json")
+# v8.23 回评时窗：决策后至少等 EVAL_DELAY_MIN 才有资格回评（此前是"刚做完就评"，
+# 温度还没变化必然判失败）；超过 EVAL_STALE_MIN 则视为跨了别的事件，消费但不学习。
+EVAL_DELAY_MIN = 30
+EVAL_STALE_MIN = 120
 
 def load_learned() -> dict:
     """读取学习结果，包含 adjusted_thresholds 和 decision_log"""
@@ -252,11 +256,23 @@ def evaluate_and_learn(state, now_ts):
     成功→阈值不变；失败→阈值 ±1°C，写入 ac_learned.json"""
     learned = load_learned()
     log = learned.get("decision_log", [])
-    # 检查 30 分钟前的决策结果
-    cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
+    # 只回评「已经过了观察窗口」的决策。
+    # v8.23 修反向条件：原写法 `time < cutoff → continue` 实际是"丢弃超过 30 分钟的"，
+    # 于是刚做完的决策立刻被回评——此时温度根本还没变化，temp_drop≈0 必然判失败、
+    # 阈值 -1。这是偏移一路撞到 -2 下限的根因（单向棘轮只是让它无法恢复）。
+    # 实测印证：ac_learned.json 两条日志时间戳相隔 13 秒却都已 evaluated=true。
+    # 正确语义：决策时间早于 cutoff（已满观察期）才有资格回评。
+    cutoff = (datetime.now() - timedelta(minutes=EVAL_DELAY_MIN)).isoformat()
+    stale = (datetime.now() - timedelta(minutes=EVAL_STALE_MIN)).isoformat()
     adjusted = learned.get("adjusted_thresholds", {})
     for entry in log:
-        if entry.get("evaluated") or entry.get("time", "") < cutoff:
+        ts = entry.get("time", "")
+        if entry.get("evaluated"):
+            continue
+        if ts > cutoff:
+            continue                     # 还没到观察期，留到下一轮
+        if ts < stale:
+            entry["evaluated"] = True    # 太久远（可能跨了别的事件），消费但不学习
             continue
         # 30 分钟前做了决策，现在回评
         pre_temp = entry.get("pre_temp")
@@ -270,26 +286,31 @@ def evaluate_and_learn(state, now_ts):
             continue
         success = True
         if action in ("cooling", "dehumid"):
-            # 开了制冷/除湿：温度应该降了至少 0.5°C，或湿度降了至少 5%
             temp_drop = pre_temp - cur_temp
             hum_drop = (pre_hum or 0) - (cur_hum or 0)
-            if temp_drop < 0.3 and hum_drop < 3:
-                success = False  # 没降到位
+            # v11.1 功率闸门（本文件 2026-08-19 补齐，此前只做在 home_living.py）：
+            # 1.5 匹带 65 平米先天功率不足，压缩机真在转时降温慢是物理限制而非阈值问题。
+            # 少了这道闸门会把"慢降温"误判为失败，把阈值一路往下推。
+            comp_running = (AC_MEASURED_W or 0) > 300
+            if comp_running:
+                success = True
+            elif temp_drop < 0.3 and hum_drop < 3:
+                success = False
         elif action in ("off", "fan"):
-            # 没开：温度不应该升太多，湿度不应该爆表
             temp_rise = cur_temp - pre_temp
             if temp_rise > 2.0 or (cur_hum is not None and cur_hum > 80):
-                success = False  # 闷了
-        # 调整阈值
+                success = False
+        # v8.23 修单向棘轮：原实现两个分支都只 -1、成功时不做任何事，于是无论
+        # 评估结果如何阈值只降不升，必然漂到下限（实测已撞 -2 并停在那里）。
+        # v11.1 只加了钳位止损，没修方向性。现在成功时向 0 收敛一步，
+        # 让偏移量能回到中性，而不是永久停在边界上。
+        cur_adj = adjusted.get("temp_cooling", 0)
         if not success:
-            if action in ("cooling", "dehumid"):
-                # 开了但没降到位 → 降低阈值（更早开）
-                cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = cur_adj - 1
-            elif action in ("off", "fan"):
-                # 没开但闷了 → 降低阈值（更早开）
-                cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = cur_adj - 1
+            adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
+        elif cur_adj < 0:
+            adjusted["temp_cooling"] = cur_adj + 1      # 决策成功 → 向中性回收
+        elif cur_adj > 0:
+            adjusted["temp_cooling"] = cur_adj - 1
         entry["evaluated"] = True
     learned["adjusted_thresholds"] = adjusted
     learned["decision_log"] = log[-50:]  # 只保留最近 50 条

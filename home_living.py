@@ -104,6 +104,10 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "home_state.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "miio_config.json")
 LEARN_FILE = os.path.join(SCRIPT_DIR, "ac_learned.json")
+# v8.23 回评时窗（与 ac_advisor 对齐）：决策后至少等 EVAL_DELAY_MIN 才回评；
+# 超过 EVAL_STALE_MIN 视为跨了别的事件，消费但不学习。
+EVAL_DELAY_MIN = 30
+EVAL_STALE_MIN = 120
 ERR_STATE_FILE = os.path.join(SCRIPT_DIR, "vent_error_state.json")
 
 # -- Weather API (QW CMA) --
@@ -276,13 +280,23 @@ def evaluate_and_learn(state, now_ts):
     """
     learned = load_learned()
     log = learned.get("decision_log", [])
-    cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
+    # v8.23 修反向条件：原 `time < cutoff → continue` 实际是"丢弃超过 30 分钟的"，
+    # 于是刚做完的决策立刻被回评，温度还没变化必然判失败、阈值 -1 —— 这是偏移
+    # 一路撞到 -2 下限的根因。正确语义：已满观察期才有资格回评。
+    cutoff = (datetime.now() - timedelta(minutes=EVAL_DELAY_MIN)).isoformat()
+    stale = (datetime.now() - timedelta(minutes=EVAL_STALE_MIN)).isoformat()
     adjusted = learned.get("adjusted_thresholds", {})
     # Power gate: is the compressor actually drawing power right now?
     comp_power = state.get("_prev_power") or state.get("measured_w")
     comp_running = (comp_power or 0) > 300
     for entry in log:
-        if entry.get("evaluated") or entry.get("time", "") < cutoff:
+        ts = entry.get("time", "")
+        if entry.get("evaluated"):
+            continue
+        if ts > cutoff:
+            continue                     # 还没到观察期
+        if ts < stale:
+            entry["evaluated"] = True    # 太久远，消费但不学习
             continue
         pre_temp = entry.get("pre_temp")
         pre_hum = entry.get("pre_hum")
@@ -306,13 +320,16 @@ def evaluate_and_learn(state, now_ts):
             temp_rise = cur_temp - pre_temp
             if temp_rise > 2.0 or (cur_hum is not None and cur_hum > 80):
                 success = False
+        # v8.23 修单向棘轮：原实现两个分支都只 -1、成功时不做任何事，于是阈值只降
+        # 不升，必然漂到下限（实测 ac_learned.json 已撞 -2 并停住）。v11.1 的钳位
+        # 只是止损，没修方向性。成功时向 0 收敛一步，让偏移能回到中性。
+        cur_adj = adjusted.get("temp_cooling", 0)
         if not success:
-            if action in ("cooling", "dehumid"):
-                cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
-            elif action in ("off", "fan"):
-                cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
+            adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
+        elif cur_adj < 0:
+            adjusted["temp_cooling"] = cur_adj + 1
+        elif cur_adj > 0:
+            adjusted["temp_cooling"] = cur_adj - 1
         entry["evaluated"] = True
     learned["adjusted_thresholds"] = adjusted
     learned["decision_log"] = log[-50:]
