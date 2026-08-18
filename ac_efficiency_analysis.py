@@ -19,6 +19,9 @@ MIN_COMP_MIN = 40  # 只统计完整周期（压缩机累计运行 >= ac_advisor
 #    kWh 类指标只认纪元后
 # 3) 污染过滤——rh_spike=True 的周期（开门/晾衣事件）剔除出效率统计（LongCat 待办#5）
 HONEST_KWH_SINCE = datetime(2026, 8, 16, 18, 46)
+# v8.21 数据陷阱阈值（cycle_log 51 周期实测）
+ZERO_COMP_MAX_DAH = 0.5  # 压缩机 0 分钟时允许的最大 ΔAH(g/m3)；超过必是自然漂移
+DUTY_MAX = 1.01          # 占空比上限（留 1% 容差给取样抖动）
 
 def load_cycles(days=7):
     """读取最近 N 天的周期数据"""
@@ -43,10 +46,31 @@ def load_cycles(days=7):
     return cycles
 
 def _eff_ok(c):
-    """效率统计准入：无 rh_spike 污染 + ΔAH 可算。"""
+    """效率统计准入：无 rh_spike 污染 + ΔAH 可算 + 物理自洽。
+
+    v8.21 补两项实测陷阱（cycle_log 51 周期审查）：
+    1) 零压缩机却 AH 大降 —— 8/51 周期 compressor_runtime_min=0 但 ΔAH 最高
+       6.02 g/m3，物理上不可能是空调除湿，实为自然漂移/换气。计入会把天气的
+       功劳算给空调。
+    2) 占空比 > 1 —— 3/51 周期压缩机分钟数超过周期时长（最高 2.00），计量 bug
+       残留。v8.21 起 close_cycle 会写 duty_invalid 标记；对历史行则现算兜底。
+    """
     if c.get("rh_spike"):
         return False
-    return c.get("start_AH") is not None and c.get("end_AH") is not None
+    if c.get("start_AH") is None or c.get("end_AH") is None:
+        return False
+    comp = c.get("compressor_runtime_min")
+    dah = c["start_AH"] - c["end_AH"]
+    # 压缩机没转却"除湿"了 → 不是空调干的
+    if (comp is None or comp <= 0) and dah > ZERO_COMP_MAX_DAH:
+        return False
+    # 占空比越界（新数据看标记，老数据现算）
+    if c.get("duty_invalid"):
+        return False
+    dur = c.get("duration_min")
+    if comp and dur and dur > 0 and comp / dur > DUTY_MAX:
+        return False
+    return True
 
 def analyze(cycles):
     """按目标温度分组，算效率指标"""
