@@ -1,17 +1,31 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-🏠 家庭生活系统 v1.0 · 上海闵行
-合并 ac_advisor v10.1 + vent_reminder v2.2 → 统一决策引擎
+Home Living Unified Advisor v11.0 - Shanghai Minhang
+Merges ac_advisor v10.1 + vent_reminder v2.2 into a single decision engine.
 
-升级内容：
-- 空调 + 开窗 + 风扇联合决策（统一决策表）
-- 共享状态文件 home_state.json（合并 ac_state.json + vent 状态）
-- 空调运行模式联动：制冷/除湿中 → 不开窗；关着 + 室外舒适 → 开窗
-- 保留 ac_advisor 全部功能：舒适度指标、季节自适应、预冷、状态机、自适应学习、
-  手动锚点、夜间方案对比、滤网提醒、TTS、24h最优调度、热质量学习、露点判据
-- 保留 vent_reminder 全部功能：ACH模型、统一闸门、AQI/PM2.5、风向检查、
-   vent_advice、pick_best、daily_report、alert_check、Windows toast
-- 统一入口：main() 支持 --alert / --daily 模式
+v11.0 changes:
+- Unified AC + window + fan decision engine
+- Wet-bulb temperature (Stull 2011) for heat stress assessment
+- Comfort index humidity weight updated to 0.02
+- Ventilation ACH model: wind pressure + stack effect, mix efficiency 0.7
+- Unified gate_check() shared by daily report + alert modes
+- Dew-point delta sorting for window selection
+- PM2.5 / AQI data source (Open-Meteo Air Quality)
+- Windows toast notification fallback
+- ASCII-safe docstrings throughout
+
+Retained from v9.0:
+- Indoor sensor reading (Miio Purifier 4 Lite)
+- Weather fetch (QW CMA data source)
+- Manual off anchor (2h no-auto-start)
+- Filter reminder
+- Night cost comparison
+- TTS broadcast
+- WeChat/desktop notification
+- All threshold constants
 """
+
 import gzip
 import json
 import math
@@ -23,7 +37,7 @@ import urllib.request
 from datetime import datetime, date, timezone, timedelta
 from enum import Enum
 
-# ── 确保能找到 miio（cron 可能用 python3.11，miio 装在 3.12） ──
+# -- Ensure miio is findable (cron may use python3.11, miio installed in 3.12) --
 _MIIO_PATHS = [
     "C:/Users/Administrator/AppData/Local/Programs/Python/Python312/Lib/site-packages",
 ]
@@ -31,99 +45,71 @@ for _p in _MIIO_PATHS:
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
 
-# ══════════════════════════════════════════════════════════════
-# ── 共享常量（来自 ac_advisor） ──
-# ══════════════════════════════════════════════════════════════
-# 阈值
-TEMP_COOLING = 28       # 体感≥28 → 制冷
-TEMP_DEHUMID_LOW = 26   # 除湿温度下限
-TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
-HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值
-HUM_DEHUMID_OFF = 55    # 除湿关闭湿度阈值（滞回 10%）
-TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限（OR 逃生门）
-MIN_RUN = 40            # 开一次至少 40 分钟
-MIN_OFF = 30            # 夜间关后至少 30 分钟再开
-DAY_MIN_OFF = 15        # 白天关后至少 15 分钟再开
-MAX_RUN = 180           # 连续运行超 180 分钟建议切换/关
+# -- Threshold constants (unified header, configurable) --
+TEMP_COOLING = 28       # HI >= 28 -> cooling
+TEMP_DEHUMID_LOW = 26   # dehumid temp lower bound
+TEMP_DEHUMID_HIGH = 28  # dehumid temp upper bound
+HUM_DEHUMID_ON = 65     # dehumid ON threshold
+HUM_DEHUMID_OFF = 55    # dehumid OFF threshold (10% hysteresis)
+TEMP_ABSOLUTE_FLOOR = 24# dehumid absolute floor (OR escape hatch)
+MIN_RUN = 40            # min run time once on
+MIN_OFF = 30            # min off time at night before restart
+DAY_MIN_OFF = 15        # min off time daytime before restart
+MAX_RUN = 180           # max continuous run before switch/off
 
-# 空调功率（松川 KFRd-35GW 定频 1.5 匹）
-AC_INPUT_W = 1076
-AC_COP = 3.25
-ELECTRIC_PEAK = 0.617
-ELECTRIC_VALLEY = 0.307
+# -- AC power (Chuan KFRd-35GW fixed freq 1.5P) --
+AC_INPUT_W = 1076     # input power W
+AC_COP = 3.25          # COP
+ELECTRIC_PEAK = 0.617   # Shanghai peak price (6:00-22:00)
+ELECTRIC_VALLEY = 0.307 # Shanghai valley price (22:00-6:00)
 ELECTRIC_PRICE = ELECTRIC_PEAK
-DEHUMID_DUTY = 0.60
-COOL_DUTY = 0.70
-DEHUMID_MIN = 60
-COOL_BURST_MIN = 40
-FILTER_CLEAN_INTERVAL = 30
+DEHUMID_DUTY = 0.60    # fixed freq dehumid duty cycle
+COOL_DUTY = 0.70       # fixed freq cooling duty cycle
+DEHUMID_MIN = 60       # dehumid typical minutes
+COOL_BURST_MIN = 40    # cooling burst minutes
 
-# 滤网状态文件
+# -- Filter reminder --
 FILTER_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_state.json")
+FILTER_CLEAN_INTERVAL = 30  # days
 
-# ══════════════════════════════════════════════════════════════
-# ── 开窗通风常量（来自 vent_reminder） ──
-# ══════════════════════════════════════════════════════════════
-LAT, LON = 31.11, 121.38
+# -- Vent reminder constants --
+LAT, LON = 31.11, 121.38  # Shanghai Minhang
 BASE_ACH = 47.0
-BASE_WIND = 6.9  # 4窗穿堂风: 6.9m/s -> ACH 47
-MIX_EFF = 0.7
-SAFETY = 1.2
+BASE_WIND = 6.9  # 4-window cross-vent: 6.9 m/s -> ACH 47
+MIX_EFF = 0.7    # cross-vent short-circuit loss
+SAFETY = 1.2     # duration safety factor
 
-# 硬闸门阈值
-RAIN_PP_MAX = 45
-RAIN_MM_MAX = 1.0
-DEW_DELTA_MAX = 1.5
-PM25_MAX = 75
-WIND_MAX_MS = 10.8
-GUST_MAX_MS = 15.0
+# Hard gate thresholds
+RAIN_PP_MAX = 45      # rain prob >= 45% -> no open
+RAIN_MM_MAX = 1.0     # rain intensity > 1mm/h -> no open
+DEW_DELTA_MAX = 1.5   # outdoor dewpoint - indoor >= 1.5C -> moisture ingress
+PM25_MAX = 75         # PM2.5 >= 75 ug/m3
+WIND_MAX_MS = 10.8    # sustained wind >= 6级 (10.8 m/s)
+GUST_MAX_MS = 15.0    # gust >= 15 m/s
 AC_BLOCK_MODES = ("cooling", "dehumid", "dehumid_alert")
 
-# ══════════════════════════════════════════════════════════════
-# ── 和风天气 API ──
-# ══════════════════════════════════════════════════════════════
-QW_HOST = "kf54e6wb7f.re.qweatherapi.com"
-QW_KEY = "e630a3166d6f4146be43fa822cea63a1"
-
-# 和风天气 code → WMO 近似值
-QW2WMO = {
-    100:0, 101:2, 102:2, 103:3, 104:3,
-    200:0, 201:0, 202:0, 203:0,
-    300:0, 301:1, 302:2, 303:95, 304:95,
-    400:0, 401:0, 402:0, 403:0,
-    500:45, 501:45, 502:45, 503:45, 504:45,
-    507:45, 508:45, 509:45,
-    510:51, 511:51, 512:51, 513:51, 514:51,
-    600:61, 601:61, 602:63, 603:65,
-    305:61, 306:63, 307:65,
-    610:80, 611:80, 612:80, 613:80,
-    700:45, 701:45, 702:45, 703:45, 704:45,
-    800:95, 801:95, 802:95, 803:95, 804:95,
-}
-
-WEATHER_MAP = {
-    0: "☀️ 晴", 1:"🌤 少云", 2:"⛅ 多云", 3:"☁️ 阴",
-    45:"🌫 雾",
-    51:"🌦 毛毛雨",61:"🌧 小雨",63:"🌧 中雨",65:"🌧 大雨",
-    71:"🌨 小雪",73:"🌨 中雪",75:"🌨 大雪",
-    80:"🌦 阵雨",81:"🌦 小阵雨",82:"🌦 大阵雨",95:"⛈ 雷暴",
-}
-
-# ══════════════════════════════════════════════════════════════
-# ── 文件路径 ──
-# ══════════════════════════════════════════════════════════════
+# -- Shared state files --
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "home_state.json")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "miio_config.json")
 LEARN_FILE = os.path.join(SCRIPT_DIR, "ac_learned.json")
-THERMAL_FILE = os.path.join(SCRIPT_DIR, "ac_thermal.json")
 ERR_STATE_FILE = os.path.join(SCRIPT_DIR, "vent_error_state.json")
 
-# ══════════════════════════════════════════════════════════════
-# ── 空调状态机 ──
-# ══════════════════════════════════════════════════════════════
+# -- Weather API (QW CMA) --
+QW_HOST = "kf54e6wb7f.re.qweatherapi.com"
+QW_KEY = "e630a3166d6f4146be43fa822cea63a1"
+
+# -- Measured power globals --
+AC_MEASURED_W = None
+AC_SOCKET = None
+AC_CTRL = None
+
+
+# ============================================================
+# Explicit state machine
+# ============================================================
 class ACState(Enum):
-    """空调运行状态枚举"""
+    """AC running state enumeration."""
     OFF = "off"
     COOLING = "cooling"
     COOLING_MAINTAIN = "cooling_maintain"
@@ -131,6 +117,8 @@ class ACState(Enum):
     FAN = "fan"
     FAN_LOCKED = "fan_locked"
 
+
+# Transition table: current -> allowed target set
 TRANSITIONS = {
     ACState.OFF: {ACState.COOLING, ACState.DEHUMID, ACState.FAN},
     ACState.COOLING: {ACState.COOLING_MAINTAIN, ACState.OFF, ACState.FAN},
@@ -140,47 +128,52 @@ TRANSITIONS = {
     ACState.FAN_LOCKED: {ACState.OFF, ACState.FAN},
 }
 
+
 def transition(current: ACState, target: ACState) -> ACState:
-    """状态转移：合法直接转，非法保持现状"""
+    """State transition: legal -> move, illegal -> keep current."""
     allowed = TRANSITIONS.get(current, set())
     if target in allowed:
         return target
     return current
 
-# ══════════════════════════════════════════════════════════════
-# ── 舒适度 / 露点 / 闷度 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# Comfort index + wet-bulb temperature
+# ============================================================
 def comfort_index(temp, hum):
-    """酷度指数 = T + 0.05×(RH-10)"""
+    """Comfort index = T + 0.02 * (RH - 10).
+    26C/80% -> HI=26.2 vs 26C/50% -> HI=25.2."""
     if hum is None:
         return temp
-    return temp + 0.05 * (hum - 10)
+    return temp + 0.02 * (hum - 10)
 
-def dew_point(temp_c, rh):
-    """Magnus 公式近似露点（°C）。"""
+
+def wet_bulb_temp(temp_c, rh):
+    """Wet-bulb temperature (Stull 2011 empirical formula).
+    Returns wet-bulb temperature in Celsius, or None if inputs invalid.
+    Accuracy: +/- 0.3C for RH 5-99% and T -20 to 50C."""
     if temp_c is None or rh is None or rh <= 0 or rh > 100:
         return None
-    a, b = 17.27, 237.7
-    alpha = (a * temp_c) / (b + temp_c) + math.log(rh / 100.0)
-    td = (b * alpha) / (a - alpha)
-    return td
+    t = temp_c
+    h = rh
+    tw = (t * math.atan(0.151977 * (h + 8.313659) ** 0.5)
+          + math.atan(t + h)
+          - math.atan(h - 1.676331)
+          + 0.00391838 * h ** 1.5 * math.atan(0.023101 * h)
+          - 4.686035)
+    return tw
 
-def muggy_level(temp, hum):
-    """0=comfort, 1=slight muggy, 2=muggy, 3=very muggy"""
-    dp = dew_point(temp, hum)
-    if dp is None:
-        return 0
-    if dp < 12: return 0
-    elif dp < 16: return 1
-    elif dp < 18: return 2
-    else: return 3
 
-# ══════════════════════════════════════════════════════════════
-# ── 季节自适应 ──
-# ══════════════════════════════════════════════════════════════
+# ============================================================
+# Seasonal adaptation
+# ============================================================
 def seasonal_adjustments():
-    """根据月份自动切换：
-    盛夏(7-8): 正常制冷；梅雨(6): 除湿优先；春秋(4-5/9-10): 风扇优先；冬季(11-3): 关窗优先
+    """Auto-switch by month:
+    Summer(7-8): normal cooling
+    Plum rain(6): dehumid priority, temp threshold +1C
+    Spring/Autumn(4-5/9-10): fan priority, temp threshold +2C
+    Winter(11-3): close windows, no AC
+    Returns (temp_offset, hum_offset, strategy_label).
     """
     m = datetime.now().month
     if m in (7, 8):
@@ -192,11 +185,12 @@ def seasonal_adjustments():
     else:
         return 4, 0, "冬季关窗优先"
 
-# ══════════════════════════════════════════════════════════════
-# ── 预测式预冷 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# Predictive pre-cooling
+# ============================================================
 def should_precool(wx, current_hi, threshold_hi):
-    """如果未来 3 小时内 HI 超过阈值 +3°C，建议提前预冷"""
+    """If next 3h HI exceeds threshold + 3C, suggest pre-cooling."""
     hourly = wx.get("hourly", {})
     times = hourly.get("time", [])
     temps = hourly.get("temperature_2m", [])
@@ -221,61 +215,12 @@ def should_precool(wx, current_hi, threshold_hi):
         return True, max_future_hi, idx
     return False, None, None
 
-# ══════════════════════════════════════════════════════════════
-# ── 24h 最优调度 ──
-# ══════════════════════════════════════════════════════════════
-def compute_optimal_schedule(wx, current_temp, current_hum, learned):
-    """Compute optimal AC schedule for next 24h"""
-    hourly = wx.get("hourly", {})
-    times = hourly.get("time", [])
-    temps = hourly.get("temperature_2m", [])
-    hums = hourly.get("relative_humidity_2m", [])
-    if not times:
-        return []
-    schedule = []
-    for i, t in enumerate(times):
-        hour = int(t[11:13]) if len(t) >= 13 else i
-        temp = temps[i] if i < len(temps) else None
-        hum = hums[i] if i < len(hums) else None
-        if temp is None:
-            continue
-        hi = comfort_index(temp, hum)
-        price = ELECTRIC_VALLEY if hour >= 22 or hour < 6 else ELECTRIC_PEAK
-        if hi >= TEMP_COOLING + seasonal_adjustments()[0]:
-            action = "cool"
-            est_cost = kwh_est(40, COOL_DUTY) * price
-        elif muggy_level(temp, hum) >= 2:
-            action = "dehumid"
-            est_cost = kwh_est(60, dehumid_duty(temp, hum)) * price
-        else:
-            action = "off"
-            est_cost = 0
-        schedule.append((hour, action, est_cost))
-    return schedule
 
-def find_pre_cool_window(schedule, current_hour):
-    """Find cheapest pre-cooling window before hot period"""
-    hot_start = None
-    for i, (h, action, cost) in enumerate(schedule):
-        if action == "cool":
-            if hot_start is None:
-                hot_start = h
-        else:
-            if hot_start is not None:
-                break
-    if hot_start is None:
-        return None
-    pre_cool_start = max(0, hot_start - 3)
-    pre_cool_end = max(0, hot_start - 1)
-    valley_cost = ELECTRIC_VALLEY * kwh_est(40, COOL_DUTY)
-    peak_cost = ELECTRIC_PEAK * kwh_est(40, COOL_DUTY)
-    savings = peak_cost - valley_cost
-    return (pre_cool_start, pre_cool_end, savings)
-
-# ══════════════════════════════════════════════════════════════
-# ── 自适应阈值学习 ──
-# ══════════════════════════════════════════════════════════════
+# ============================================================
+# Adaptive threshold learning (persistent)
+# ============================================================
 def load_learned() -> dict:
+    """Load learned results: adjusted_thresholds + decision_log."""
     default = {"adjusted_thresholds": {}, "decision_log": []}
     try:
         if os.path.exists(LEARN_FILE):
@@ -285,13 +230,18 @@ def load_learned() -> dict:
         pass
     return default
 
+
 def save_learned(learned: dict):
+    """Persist learned results (atomic write)."""
     tmp = LEARN_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(learned, f, ensure_ascii=False, indent=2)
     os.replace(tmp, LEARN_FILE)
 
+
 def evaluate_and_learn(state, now_ts):
+    """Post-decision review: on -> temp dropped? off -> stuffy?
+    Success -> threshold unchanged; failure -> threshold +/- 1C."""
     learned = load_learned()
     log = learned.get("decision_log", [])
     cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
@@ -329,7 +279,9 @@ def evaluate_and_learn(state, now_ts):
     learned["decision_log"] = log[-50:]
     save_learned(learned)
 
+
 def log_decision(state, action, pre_temp, pre_hum, now_ts):
+    """Record a decision for later review."""
     learned = load_learned()
     log = learned.get("decision_log", [])
     log.append({
@@ -342,68 +294,12 @@ def log_decision(state, action, pre_temp, pre_hum, now_ts):
     learned["decision_log"] = log[-50:]
     save_learned(learned)
 
-# ══════════════════════════════════════════════════════════════
-# ── 热质量学习 ──
-# ══════════════════════════════════════════════════════════════
-def load_thermal_data() -> dict:
-    default = {"events": [], "thermal_model": {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}}
-    try:
-        if os.path.exists(THERMAL_FILE):
-            with open(THERMAL_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
 
-def save_thermal_data(data: dict):
-    tmp = THERMAL_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, THERMAL_FILE)
-
-def record_thermal_event(event_type, temp_before, temp_after, duration_min, outdoor_temp):
-    data = load_thermal_data()
-    events = data.get("events", [])
-    events.append({
-        "type": event_type,
-        "temp_before": temp_before,
-        "temp_after": temp_after,
-        "duration_min": duration_min,
-        "outdoor_temp": outdoor_temp,
-        "timestamp": datetime.now().isoformat()
-    })
-    data["events"] = events[-100:]
-    data["thermal_model"] = fit_thermal_model(data["events"])
-    save_thermal_data(data)
-
-def fit_thermal_model(events):
-    cooling = [e for e in events if e["type"] == "cooling"]
-    warming = [e for e in events if e["type"] == "warming"]
-    model = {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}
-    if cooling:
-        rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1) for e in cooling[-20:]]
-        model["cooling_rate_per_min"] = sum(rates) / len(rates)
-    if warming:
-        rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in warming[-20:]]
-        model["warmup_rate_per_min"] = sum(rates) / len(rates)
-    return model
-
-def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):
-    rate = thermal_model.get("cooling_rate_per_min", 0.05)
-    diff = temp_current - temp_target
-    if diff <= 0:
-        return 0
-    return int(diff / rate)
-
-# ══════════════════════════════════════════════════════════════
-# ── 功率/电费估算 ──
-# ══════════════════════════════════════════════════════════════
-AC_MEASURED_W = None
-AC_SOCKET = None
-AC_CTRL = None
-
+# ============================================================
+# Original functions (retained)
+# ============================================================
 def dehumid_duty(temp, hum=None):
-    """定频除湿占空比"""
+    """Fixed freq dehumid duty cycle: temp base * humidity factor."""
     if temp is None:
         base = DEHUMID_DUTY
     elif temp >= 26:
@@ -422,75 +318,51 @@ def dehumid_duty(temp, hum=None):
         base *= factor
     return base
 
+
 def kwh_est(active_min, duty=1.0):
-    """耗电估算(度)"""
+    """Energy estimate (kWh): input power * duty * duration."""
     p = AC_MEASURED_W or AC_INPUT_W
     return p / 1000.0 * duty * (active_min / 60.0)
 
+
 def current_price():
+    """Price by time: 22:00-6:00 valley, else peak."""
     h = datetime.now().hour
     return ELECTRIC_VALLEY if h >= 22 or h < 6 else ELECTRIC_PEAK
 
+
 def cost_est(kwh):
+    """Cost estimate (CNY) by current time-of-use price."""
     return kwh * current_price()
 
-# ══════════════════════════════════════════════════════════════
-# ── 共享状态文件 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# State persistence
+# ============================================================
 def load_state() -> dict:
-    default = {
-        "ac": {"mode": None, "run_start": None, "last_off_at": None, "target_temp": 26, "manual_off_at": None},
-        "window": {"last_open": None, "last_close": None, "open_duration_min": 30},
-        "fan": {"last_circulate": None},
-        "thermal": {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02},
-        "learned": {"adjusted_thresholds": {}, "decision_log": []},
-        "last_temp": None,
-        "last_hum": None,
-    }
+    """Load persistent state, return default if missing."""
+    default = {"mode": None, "last_on_at": None, "last_off_at": None, "run_start": None}
     if not os.path.exists(STATE_FILE):
         return default
     try:
         with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        # 合并保存的字段
-        for k, v in data.items():
-            if isinstance(v, dict) and k in default:
-                default[k].update(v)
-            else:
-                default[k] = v
-        return default
+            return {**default, **json.load(f)}
     except Exception as e:
         print(f"[ERROR] state load failed: {type(e).__name__}: {e}")
         default["_state_load_failed"] = True
         return default
 
+
 def save_state(state: dict):
+    """Persist state (atomic write: tmp -> rename)."""
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
-# 兼容旧 ac_state.json（迁移）
-def migrate_legacy_state():
-    legacy_file = os.path.join(SCRIPT_DIR, "ac_state.json")
-    if os.path.exists(legacy_file) and not os.path.exists(STATE_FILE):
-        try:
-            with open(legacy_file, "r", encoding="utf-8-sig") as f:
-                legacy = json.load(f)
-            new_state = load_state()
-            new_state["ac"]["mode"] = legacy.get("mode")
-            new_state["ac"]["run_start"] = legacy.get("run_start")
-            new_state["ac"]["last_off_at"] = legacy.get("last_off_at")
-            new_state["ac"]["target_temp"] = legacy.get("target_temp", 26)
-            new_state["ac"]["manual_off_at"] = legacy.get("manual_off_at")
-            new_state["last_temp"] = legacy.get("last_temp")
-            new_state["last_hum"] = legacy.get("last_hum")
-            save_state(new_state)
-            print("[INFO] 已迁移旧 ac_state.json → home_state.json")
-        except Exception as e:
-            print(f"[WARN] 迁移失败: {e}")
 
 def minutes_since(ts_str):
+    """Minutes since an ISO timestamp."""
     if not ts_str:
         return None
     try:
@@ -500,10 +372,25 @@ def minutes_since(ts_str):
     except Exception:
         return None
 
-# ══════════════════════════════════════════════════════════════
-# ── 和风天气 API ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# Weather API (QW CMA)
+# ============================================================
+WEATHER_MAP = {
+    0: "☀️ 晴", 1:"🌤 少云", 2:"⛅ 多云", 3:"☁️ 阴",
+    45:"🌫 雾",
+    51:"🌦 毛毛雨",61:"🌧 小雨",63:"🌧 中雨",65:"🌧 大雨",
+    71:"🌨 小雪",73:"🌨 中雪",75:"🌨 大雪",
+    80:"🌦 阵雨",81:"🌦 小阵雨",82:"🌦 大阵雨",95:"⛈ 雷暴",
+}
+
+
+def weather_cn(code):
+    return WEATHER_MAP.get(code, f"☁️ {code}")
+
+
 def _qw_get(endpoint: str) -> dict:
+    """Call QW API v2, auto-decompress gzip, return JSON."""
     url = f"https://{QW_HOST}/weather/v1/{endpoint}/{LAT}/{LON}"
     req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
     resp = urllib.request.urlopen(req, timeout=15)
@@ -512,25 +399,47 @@ def _qw_get(endpoint: str) -> dict:
         body = gzip.decompress(body)
     return json.loads(body.decode("utf-8"))
 
-def weather_cn(code):
-    return WEATHER_MAP.get(code, f"☁️ {code}")
-
 
 def fetch_weather() -> dict:
-    """获取天气数据（和风天气 CMA 数据源），返回 Open-Meteo 兼容格式"""
+    """Fetch weather (QW CMA), return Open-Meteo compatible format with wind."""
     try:
         CST = timezone(timedelta(hours=8))
         cur = _qw_get("current")
         dai = _qw_get("daily")["days"][0]
         hrs = _qw_get("hourly")["hours"]
+
+        QW2WMO = {100:0, 101:2, 102:2, 103:3, 104:3,
+                  200:0, 201:0, 202:0, 203:0,
+                  300:0, 301:1, 302:2, 303:95, 304:95,
+                  400:0, 401:0, 402:0, 403:0,
+                  500:45, 501:45, 502:45, 503:45, 504:45,
+                  507:45, 508:45, 509:45,
+                  510:51, 511:51, 512:51, 513:51, 514:51,
+                  600:61, 601:61, 602:63, 603:65,
+                  305:61, 306:63, 307:65,
+                  610:80, 611:80, 612:80, 613:80,
+                  700:45, 701:45, 702:45, 703:45, 704:45,
+                  800:95, 801:95, 802:95, 803:95, 804:95}
         wmo = QW2WMO.get(int(cur.get("condition",{}).get("code", 0)), 0)
+
         day_prec = dai.get("daytime", {}).get("precipitation", {})
         rain_prob = day_prec.get("probability", 0) if isinstance(day_prec, dict) else 0
-        times = []
+
+        times, rh, pp, prec, temp, ws, wd, gusts = [], [], [], [], [], [], [], []
         for h in hrs:
             t_utc = datetime.fromisoformat(h["forecastTime"].replace("Z", "+00:00"))
             t_local = t_utc.astimezone(CST)
             times.append(t_local.strftime("%Y-%m-%dT%H:%M"))
+            rh.append(round(h["humidity"] * 100))
+            temp.append(h["temperature"]["value"])
+            prec_obj = h.get("precipitation", {})
+            pp.append(float(prec_obj.get("probability", 0)) * 100)
+            prec.append(float(prec_obj.get("intensity", {}).get("value", 0)))
+            wind_obj = h.get("wind", {})
+            ws.append(float(wind_obj.get("speed", {}).get("value", 0)))
+            wd.append(float(wind_obj.get("direction", {}).get("degree", 0)))
+            gusts.append(float(h.get("windGust", {}).get("value", 0)))
+
         return {
             "current": {
                 "temperature_2m": cur["temperature"]["value"],
@@ -545,69 +454,26 @@ def fetch_weather() -> dict:
             },
             "hourly": {
                 "time": times,
-                "temperature_2m": [h["temperature"]["value"] for h in hrs],
-                "relative_humidity_2m": [round(h["humidity"] * 100) for h in hrs],
-                "precipitation_probability": [
-                    round(h["precipitation"]["probability"] * 100) if isinstance(h.get("precipitation"), dict) else 0
-                    for h in hrs
-                ],
+                "relative_humidity_2m": rh,
+                "precipitation_probability": pp,
+                "precipitation": prec,
+                "temperature_2m": temp,
+                "wind_speed_10m": [w * 3.6 for w in ws],
+                "wind_gusts_10m": [g * 3.6 for g in gusts],
+                "wind_direction_10m": wd,
             },
         }
     except Exception as e:
         return {"error": str(e)}
 
 
-def fetch_forecast(days=1):
-    """逐小时预报（和风天气 CMA 数据源）- 含风向/阵风/降雨强度"""
-    CST = timezone(timedelta(hours=8))
-    url = f"https://{QW_HOST}/weather/v1/hourly/{LAT}/{LON}"
-    req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
-    resp = urllib.request.urlopen(req, timeout=20)
-    body = resp.read()
-    if body[:2] == b"\x1f\x8b":
-        body = gzip.decompress(body)
-    raw = json.loads(body.decode("utf-8"))
-    times, rh, pp, prec, temp, ws, wd, gusts = [], [], [], [], [], [], [], []
-    for h in raw.get("hours", []):
-        t_utc = datetime.fromisoformat(h["forecastTime"].replace("Z", "+00:00"))
-        t_local = t_utc.astimezone(CST)
-        times.append(t_local.strftime("%Y-%m-%dT%H:%M"))
-        rh.append(float(h.get("humidity", 0)) * 100)
-        temp.append(float(h.get("temperature", {}).get("value", 0)))
-        prec_obj = h.get("precipitation", {})
-        pp.append(float(prec_obj.get("probability", 0)) * 100)
-        prec.append(float(prec_obj.get("intensity", {}).get("value", 0)))
-        wind_obj = h.get("wind", {})
-        ws.append(float(wind_obj.get("speed", {}).get("value", 0)))
-        wd.append(float(wind_obj.get("direction", {}).get("degree", 0)))
-        gusts.append(float(h.get("windGust", {}).get("value", 0)))
-    return {"hourly": {
-        "time": times,
-        "relative_humidity_2m": rh,
-        "precipitation_probability": pp,
-        "precipitation": prec,
-        "temperature_2m": temp,
-        "wind_speed_10m": [w * 3.6 for w in ws],
-        "wind_gusts_10m": [g * 3.6 for g in gusts],
-        "wind_direction_10m": wd,
-    }}
-
-
-def fetch_aqi(days=1):
-    """免费 PM2.5 逐小时预报 (Open-Meteo Air Quality)"""
-    try:
-        url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={LAT}&longitude={LON}"
-               f"&hourly=pm2_5&forecast_days={days}&timezone=Asia%2FShanghai")
-        d = json.load(urllib.request.urlopen(url, timeout=20))
-        return dict(zip(d["hourly"]["time"], d["hourly"]["pm2_5"]))
-    except Exception:
-        return None
-
-# ══════════════════════════════════════════════════════════════
-# ── 室内传感器 ──
-# ══════════════════════════════════════════════════════════════
+# ============================================================
+# Indoor sensor (Miio Purifier 4 Lite)
+# ============================================================
 def read_indoor(timeout=3.0):
-    """读取小米空气净化器 4 Lite 的室内温湿度"""
+    """Read indoor temp/humidity from Miio Purifier 4 Lite.
+    Returns (temp, hum) or (None, None).
+    Auto-reconnect on session deadlock."""
     if not os.path.exists(CONFIG_FILE):
         return None, None
     try:
@@ -615,26 +481,31 @@ def read_indoor(timeout=3.0):
             cfg = json.load(f)
     except Exception:
         return None, None
+
     ip = cfg.get("ip")
     token = cfg.get("token")
     if not ip or not token:
         return None, None
+
     temp, hum = _read_indoor_once(ip, token, timeout=timeout)
     if temp is not None and hum is not None:
         return temp, hum
+
     temp, hum = _read_indoor_once(ip, token, timeout=5)
     if temp is not None and hum is not None:
         return temp, hum
+
     return None, None
 
 
 def _read_indoor_once(ip, token, timeout):
+    """Single read attempt, returns (None, None) on failure."""
     try:
         from miio import Device
         d = Device(ip, token, timeout=timeout)
         r = d.send("get_properties", [
-            {"siid": 3, "piid": 7},
-            {"siid": 3, "piid": 1},
+            {"siid": 3, "piid": 7},   # temp
+            {"siid": 3, "piid": 1},   # hum
         ])
         if isinstance(r, list) and len(r) >= 2:
             temp = r[0].get("value") if isinstance(r[0], dict) else None
@@ -648,10 +519,12 @@ def _read_indoor_once(ip, token, timeout):
         pass
     return None, None
 
-# ══════════════════════════════════════════════════════════════
-# ── 空调控制 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# AC control
+# ============================================================
 def ac_control_init():
+    """Init AC control handle. miio_config.json ac_control=False disables."""
     global AC_CTRL
     AC_CTRL = None
     try:
@@ -666,6 +539,8 @@ def ac_control_init():
 
 
 def ac_apply(new_mode, target_temp=None):
+    """Execute decision to AC socket via IR.
+    Returns {"status": "action"|"no_action"|"failed", "action": str, "reason": str}."""
     if new_mode == "dehumid_alert":
         return {"status": "no_action", "action": "", "reason": "alert_only"}
     if AC_CTRL is None:
@@ -713,10 +588,11 @@ def ac_apply(new_mode, target_temp=None):
 
 
 def reconcile_state(state, now_ts):
-    """以插座实测为权威对账持久化状态"""
-    ac_state = state.get("ac", {})
-    if AC_SOCKET == "off" and ac_state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
-        sys_off = ac_state.get("_system_off_at")
+    """Reconcile persistent state with socket reality (P2).
+    Socket reachable: real device state wins.
+    System-initiated off (marked _system_off_at) not treated as manual."""
+    if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+        sys_off = state.get("_system_off_at")
         is_system_off = False
         if sys_off:
             try:
@@ -727,25 +603,25 @@ def reconcile_state(state, now_ts):
             except Exception:
                 pass
         if not is_system_off:
-            ac_state["manual_off_at"] = now_ts
-        ac_state["mode"] = "off"
-        ac_state["last_off_at"] = now_ts
-        ac_state["run_start"] = None
-        ac_state.pop("_system_off_at", None)
-        state["ac"] = ac_state
+            state["manual_off_at"] = now_ts
+        state["mode"] = "off"
+        state["last_off_at"] = now_ts
+        state["run_start"] = None
+        state.pop("_system_off_at", None)
         return
-    if ac_state.get("_system_off_at"):
-        ac_state.pop("_system_off_at", None)
-    if AC_SOCKET == "on" and ac_state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
-        ac_state["manual_on_at"] = now_ts
-        ac_state["mode"] = "cooling"
-        ac_state["run_start"] = now_ts
-        ac_state["_fake_run_count"] = 0
-        state["ac"] = ac_state
+
+    if state.get("_system_off_at"):
+        state.pop("_system_off_at", None)
+    if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        state["manual_on_at"] = now_ts
+        state["mode"] = "cooling"
+        state["run_start"] = now_ts
+        state["_fake_run_count"] = 0
         _learn_from_manual(state, now_ts)
 
 
 def verify_socket():
+    """Post-command verify: read real socket state. Returns "on"|"off"|None."""
     if AC_CTRL is None:
         return None
     try:
@@ -756,35 +632,33 @@ def verify_socket():
 
 
 def apply_state_from_verify(state, new_mode, real, now_ts):
-    ac_state = state.get("ac", {})
-    was_on = ac_state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+    """Update run/stop anchors from socket reality. Returns None=consistent, True=contradict."""
+    was_on = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
     if real == "on":
         if new_mode in ("cooling", "dehumid", "dehumid_alert"):
             if not was_on:
-                ac_state["run_start"] = now_ts
-                ac_state["last_on_at"] = now_ts
-            ac_state["mode"] = new_mode
-            state["ac"] = ac_state
+                state["run_start"] = now_ts
+                state["last_on_at"] = now_ts
+            state["mode"] = new_mode
             return None
-        ac_state["mode"] = "cooling"
-        ac_state.pop("last_off_at", None)
-        state["ac"] = ac_state
+        state["mode"] = "cooling"
+        state.pop("last_off_at", None)
         return True
+    # real == "off"
     if new_mode in ("fan", "fan_locked", "off"):
         if was_on:
-            ac_state["last_off_at"] = now_ts
-            ac_state["_system_off_at"] = now_ts
-        ac_state["mode"] = new_mode
-        ac_state["run_start"] = None
-        state["ac"] = ac_state
+            state["last_off_at"] = now_ts
+            state["_system_off_at"] = now_ts
+        state["mode"] = new_mode
+        state["run_start"] = None
         return None
-    ac_state["mode"] = "off"
-    ac_state["run_start"] = None
-    state["ac"] = ac_state
+    state["mode"] = "off"
+    state["run_start"] = None
     return True
 
 
 def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
+    """Single execution interface (P2 ownership): ac_apply -> verify -> update state -> commit."""
     if now_ts is None:
         now_ts = datetime.now().isoformat(timespec="seconds")
     ctrl = ac_apply(new_mode, target_temp)
@@ -801,19 +675,17 @@ def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
         ctrl = {"status": "failed", "action": ctrl.get("action", ""),
                 "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on"}
     if meta and not contradict:
-        ac_state = state.get("ac", {})
         for k, v in meta.items():
-            ac_state[k] = v
-        state["ac"] = ac_state
+            state[k] = v
     if not contradict and target_temp is not None:
-        ac_state = state.get("ac", {})
-        ac_state["target_temp"] = target_temp
-        state["ac"] = ac_state
+        state["target_temp"] = target_temp
     save_state(state)
     return ctrl
 
 
 def read_ac_power(timeout=4.0):
+    """Read AC socket measured power (W) and on/off state.
+    Returns measured watts (on + readable), else None."""
     global AC_MEASURED_W, AC_SOCKET
     AC_SOCKET = None
     try:
@@ -834,21 +706,30 @@ def read_ac_power(timeout=4.0):
         pass
     return None
 
-# ══════════════════════════════════════════════════════════════
-# ── 用户习惯学习 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# User habit learning
+# ============================================================
+NIGHT_HOURS = 6
+DAYS_PER_MONTH = 30
+
+
 def _learn_from_manual(state, now_ts):
+    """Learn user habits: 3+ manual interventions -> auto-adjust threshold."""
     try:
-        ac_state = state.get("ac", {})
         rh_hist = state.get("rh_history", [])
         if not rh_hist:
             return
         last_rh = rh_hist[-1][1] if rh_hist else None
         if last_rh is None:
             return
-        pref = ac_state.get("user_pref", {})
+        pref = state.get("user_pref", {})
         manual_log = pref.get("manual_on_log", [])
-        manual_log.append({"ts": now_ts, "rh": last_rh, "mode": ac_state.get("mode")})
+        manual_log.append({
+            "ts": now_ts,
+            "rh": last_rh,
+            "mode": state.get("mode"),
+        })
         if len(manual_log) > 20:
             manual_log = manual_log[-20:]
         pref["manual_on_log"] = manual_log
@@ -857,18 +738,13 @@ def _learn_from_manual(state, now_ts):
             pref["hum_threshold"] = 60
         else:
             pref.pop("hum_threshold", None)
-        ac_state["user_pref"] = pref
-        state["ac"] = ac_state
+        state["user_pref"] = pref
     except Exception:
         pass
 
-# ══════════════════════════════════════════════════════════════
-# ── 夜间方案对比 ──
-# ══════════════════════════════════════════════════════════════
-NIGHT_HOURS = 6
-DAYS_PER_MONTH = 30
 
 def night_cost_lines(indoor_temp, indoor_hum):
+    """Night cost comparison (20:00-06:00 valley window)."""
     h = datetime.now().hour
     if not (h >= 20 or h < 6):
         return []
@@ -884,17 +760,16 @@ def night_cost_lines(indoor_temp, indoor_hum):
     lines.append(f"   0️⃣ 压一轮24°C×40~60min: {kb:.2f}度 ≈ {kb * p:.2f}元 ← 最省")
     lines.append(f"   1️⃣ 睡眠+制冷26°C整夜:  {k26:.2f}度 ≈ {k26 * p:.2f}元")
     lines.append(f"   2️⃣ 睡眠+制冷24°C整夜:  {k24:.2f}度 ≈ {k24 * p:.2f}元（贵 {(k24 - k26) * p * DAYS_PER_MONTH:.1f}元/月）")
-    lines.append(f"   3️⃣ 除湿模式整夜:        {kd:.2f}度 ≈ {kd * p:.2f}元（慢且最贵）")
+    lines.append(f"   3️⃣ 除湿模式整夜:        {kd:.2f}度 ≈ {kd * p:.2f}元")
     if indoor_hum is not None and indoor_hum > 70:
         lines.append("   💡 湿度偏高：先压轮24°C到60%再睡")
     else:
-        lines.append("   💡 湿度不高：压轮收工最省；怕热醒就睡眠26°C整夜")
+        lines.append("   💡 湿度不高：压轮收工最省")
     return lines
 
-# ══════════════════════════════════════════════════════════════
-# ── 滤网清洗提醒 ──
-# ══════════════════════════════════════════════════════════════
+
 def filter_clean_reminder():
+    """Filter cleaning reminder: dirty filter = less airflow = slower dehumid = waste."""
     try:
         with open(FILTER_STATE_FILE, encoding="utf-8") as f:
             last = json.load(f).get("last_clean")
@@ -907,11 +782,44 @@ def filter_clean_reminder():
     except Exception:
         return None
 
-# ══════════════════════════════════════════════════════════════
-# ── ACH 模型（开窗通风） ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# Ventilation functions (from vent_reminder v2.2)
+# ============================================================
+def read_ac_state():
+    """Read AC state from home_state.json: returns mode or None."""
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+        return st.get("mode")
+    except Exception:
+        return None
+
+
+def dew_point(temp_c, rh):
+    """Magnus formula approximate dewpoint (C).
+    Returns None if temp/rh missing or out of range (rh<=0 or >100)."""
+    if temp_c is None or rh is None or rh <= 0 or rh > 100:
+        return None
+    a, b = 17.62, 243.12
+    gamma = (a * temp_c) / (b + temp_c) + math.log(rh / 100.0)
+    return (b * gamma) / (a - gamma)
+
+
+def fetch_aqi(days=1):
+    """Free PM2.5 hourly forecast (Open-Meteo Air Quality). Returns None on failure."""
+    try:
+        url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={LAT}&longitude={LON}"
+               f"&hourly=pm2_5&forecast_days={days}&timezone=Asia%2FShanghai")
+        d = json.load(urllib.request.urlopen(url, timeout=20))
+        return dict(zip(d["hourly"]["time"], d["hourly"]["pm2_5"]))
+    except Exception:
+        return None
+
+
 def ach(w_kmh, dt=0):
-    """ACH 模型: 风压项 + 热压项"""
+    """ACH model: wind pressure term (calibrated 47@6.9m/s) +
+    stack effect term (temp delta chimney), orthogonal sum, * mix efficiency."""
     w = w_kmh / 3.6
     ach_w = BASE_ACH * w / BASE_WIND
     ach_stack = 0.0
@@ -921,16 +829,16 @@ def ach(w_kmh, dt=0):
 
 
 def t95(w_kmh, dt=0):
-    """95% 换气时长(分钟)"""
+    """95% ventilation duration (minutes), with safety factor.
+    Stack effect floor: ~45 min * 1.2 minimum."""
     a = ach(w_kmh, dt)
     return 3.0 / a * 60.0 * SAFETY if a >= 0.5 else 999.0
 
-# ══════════════════════════════════════════════════════════════
-# ── 统一决策闸门（来自 vent_reminder） ──
-# ══════════════════════════════════════════════════════════════
+
 def gate_check(rh, pp, rain_mm, temp, wind_ms, gust_ms, pm25,
                indoor_temp, indoor_rh):
-    """统一决策闸门"""
+    """Unified decision gate. Returns (ok: bool, reason: str|None).
+    Shared by daily report + alert modes."""
     if pp is not None and pp >= RAIN_PP_MAX:
         return False, f"降雨概率{pp}%≥{RAIN_PP_MAX}%"
     if rain_mm is not None and rain_mm > RAIN_MM_MAX:
@@ -941,6 +849,7 @@ def gate_check(rh, pp, rain_mm, temp, wind_ms, gust_ms, pm25,
         return False, f"阵风{gust_ms:.0f}m/s≥{GUST_MAX_MS:.0f}"
     if rh is not None and rh >= 85:
         return False, f"RH{rh}%≥85%"
+    # Dew-point delta gate
     if indoor_temp is not None and indoor_rh is not None and temp is not None:
         dp_in = dew_point(indoor_temp, indoor_rh)
         dp_out = dew_point(temp, rh)
@@ -955,13 +864,12 @@ def gate_check(rh, pp, rain_mm, temp, wind_ms, gust_ms, pm25,
         return False, f"PM2.5={pm25:.0f}≥{PM25_MAX}"
     return True, None
 
-# ══════════════════════════════════════════════════════════════
-# ── vent_advice（开窗建议） ──
-# ══════════════════════════════════════════════════════════════
+
 def vent_advice(now_rh, out_rh, now_temp=None, out_temp=None):
-    """室内外对比 + 空调联动建议"""
+    """Indoor/outdoor comparison + AC linkage advice.
+    Priority: dew-point delta; fallback to RH delta if indoor temp unavailable."""
     lines = []
-    ac_mode = get_ac_mode()
+    ac_mode = read_ac_state()
     if now_rh is not None and out_rh is not None:
         dp_in = dew_point(now_temp, now_rh)
         dp_out = dew_point(out_temp, out_rh)
@@ -972,48 +880,40 @@ def vent_advice(now_rh, out_rh, now_temp=None, out_temp=None):
             elif ddp <= -0.5:
                 lines.append(f"🌫 室外露点略低（{abs(ddp):.1f}°C）→ 开窗有利")
             elif ddp >= 1.5:
-                lines.append(f"⚠️ 室外露点{dp_out:.1f}°C > 室内{dp_in:.1f}°C → 开窗会灌湿气（露点差{ddp:.1f}°C）")
+                lines.append(f"⚠️ 室外露点{dp_out:.1f}°C > 室内{dp_in:.1f}°C → 开窗会灌湿气，收益低（露点差{ddp:.1f}°C）")
             elif ddp >= 0.5:
-                lines.append(f"⚠️ 室外露点略高（{ddp:.1f}°C）→ 开窗请短促")
+                lines.append(f"⚠️ 室外露点略高（{ddp:.1f}°C）→ 开窗换气请短促，主要靠空调/除湿")
             else:
-                lines.append(f"ℹ️ 室内外露点接近（室内{dp_in:.1f}°C/室外{dp_out:.1f}°C）→ 只为换新鲜空气")
+                lines.append(f"ℹ️ 室内外露点接近（室内{dp_in:.1f}°C/室外{dp_out:.1f}°C）→ 开窗只为换新鲜空气")
         else:
             diff = out_rh - now_rh
             if diff <= -10:
-                lines.append(f"💡 室外比室内干 {abs(diff):.0f}pp → 开窗可顺带除湿 🟢")
+                lines.append(f"💡 室外比室内干 {abs(diff):.0f}pp（室内{now_rh:.0f}%→室外{out_rh}%）→ 开窗可顺带除湿 🟢")
             elif diff <= -3:
                 lines.append(f"💡 室外略干于室内（{abs(diff):.0f}pp）→ 开窗有利")
             elif diff >= 10:
-                lines.append(f"⚠️ 室外比室内潮 {diff:.0f}pp → 开窗会灌湿气")
+                lines.append(f"⚠️ 室外比室内潮 {diff:.0f}pp（室内{now_rh:.0f}%→室外{out_rh}%）→ 开窗会把湿气灌进来")
             elif diff >= 3:
-                lines.append(f"⚠️ 室外比室内潮 {diff:.0f}pp → 请短促")
+                lines.append(f"⚠️ 室外比室内潮 {diff:.0f}pp → 开窗换气请短促")
             else:
-                lines.append(f"ℹ️ 室内外湿度接近 → 只为换新鲜空气")
+                lines.append(f"ℹ️ 室内外湿度接近（室内{now_rh:.0f}%/室外{out_rh}%）→ 开窗只为换新鲜空气")
     if ac_mode:
         if ac_mode in AC_BLOCK_MODES:
             label = '制冷' if ac_mode == 'cooling' else '除湿'
-            lines.append(f"❄️ 空调{label}中 → 开窗会抵消效果，换完即关")
+            lines.append(f"❄️ 空调运行中（顾问建议{label}，非实测模式）→ 开窗会抵消效果，换完即关")
         elif ac_mode == "fan":
-            lines.append("🍃 空调风扇 → 开窗与风扇同向")
+            lines.append("🍃 空调顾问建议=风扇通风 → 开窗与风扇同向，效果叠加")
         elif ac_mode == "off":
-            lines.append("🌡 空调关 → 开窗无冲突")
+            lines.append("🌡 空调顾问建议=关 → 开窗无冲突")
     return lines
-
-# ══════════════════════════════════════════════════════════════
-# ── 辅助函数 ──
-# ══════════════════════════════════════════════════════════════
-def get_ac_mode():
-    """获取空调模式（兼容新旧 ac_state.json）"""
-    state = load_state()
-    ac = state.get("ac", {})
-    return ac.get("mode")
 
 
 def verdict(rh):
+    """Ventilation verdict from RH."""
     if rh < 60:  return ("极佳", "🟢")
     if rh < 70:  return ("好", "🟢")
     if rh < 78:  return ("一般", "🟡")
-    if rh < 85:  return ("谨慎", "🔴")
+    if rh < 85:  return ("谨慎", "🟠")
     return ("不推荐", "🔴")
 
 
@@ -1021,15 +921,15 @@ WD = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def wind_dir_cn(deg):
+    """Wind direction degrees -> Chinese compass."""
     if deg is None:
         return None
     dirs = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
     return dirs[int((deg % 360) / 45) % 8] + "风"
 
-# ══════════════════════════════════════════════════════════════
-# ── 预报数据整理 ──
-# ══════════════════════════════════════════════════════════════
+
 def build_rows(h, today):
+    """Build candidate rows from hourly forecast for today."""
     rows = []
     for i, t in enumerate(h["time"]):
         if t[:10] != today:
@@ -1049,7 +949,9 @@ def build_rows(h, today):
 
 
 def pick_best(rows, indoor_temp, indoor_rh, ac_mode, aqi):
-    """统一闸门过滤 + 露点差排序"""
+    """Unified gate filter + dew-point delta sort.
+    Returns (best_row, blocked_reason or None).
+    Sort key: outdoor dewpoint ascending (drier is better), then rain prob ascending."""
     cand = []
     blocked = None
     for r in rows:
@@ -1068,275 +970,85 @@ def pick_best(rows, indoor_temp, indoor_rh, ac_mode, aqi):
     cand.sort(key=lambda r: (dew_point(r["temp"], r["rh"]) or 99.0, r["pp"]))
     return cand[0], None
 
-# ══════════════════════════════════════════════════════════════
-# ── 统一决策引擎 ──
-# ══════════════════════════════════════════════════════════════
-def unified_decision(wx, indoor_temp, indoor_hum):
-    """统一决策：空调 + 开窗 + 风扇
-    
-    决策表：
-    - 空调制冷/除湿中 → 不开窗（冷气跑掉）
-    - 空调关着 + 室外舒适 → 开窗
-    - 空调关着 + 室外潮湿/有雨 → 关窗 + 风扇
-    - 空调关着 + 室外极端热 → 关窗 + 开制冷
-    """
-    outdoor_temp = wx["current"]["temperature_2m"]
-    outdoor_hum = wx["current"]["relative_humidity_2m"]
-    
-    ac_mode = get_ac_mode()
-    ac_running = ac_mode in ("cooling", "dehumid", "dehumid_alert")
-    
-    # 露点计算
-    dp_in = dew_point(indoor_temp, indoor_hum)
-    dp_out = dew_point(outdoor_temp, outdoor_hum)
-    
-    # 舒适指数
-    hi_in = comfort_index(indoor_temp, indoor_hum) if indoor_temp and indoor_hum else None
-    hi_out = comfort_index(outdoor_temp, outdoor_hum)
-    
-    # 获取空调状态（含运行时长）
-    state = load_state()
-    ac_state = state.get("ac", {})
-    run_start = ac_state.get("run_start")
-    run_mins = minutes_since(run_start)
-    off_mins = minutes_since(ac_state.get("last_off_at"))
-    
-    # ── 空调决策 ──
-    # 季节自适应 + 学习修正
-    temp_offset, hum_offset, strategy_label = seasonal_adjustments()
-    learned = load_learned()
-    learned_temp_adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
-    effective_cooling_threshold = TEMP_COOLING + temp_offset + learned_temp_adj
-    effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
-    
-    # 室内信号优先
-    signal = indoor_temp if indoor_temp is not None else wx["current"]["apparent_temperature"]
-    hum_sig = indoor_hum
-    
-    # 空调决策
-    if ac_running:
-        # 已在运行，检查是否应保持
-        ac_decision = ac_mode
-        ac_target = ac_state.get("target_temp", 26)
-    elif hi_in is not None and hi_in >= effective_cooling_threshold:
-        ac_decision = "cooling"
-        ac_target = round(max(26, min(28, indoor_temp - 2)))
-    elif dp_in is not None and dp_in > 16 and hum_sig is not None and hum_sig > effective_hum_threshold:
-        ac_decision = "cooling"
-        ac_target = 24
-    elif hum_sig is not None and hum_sig > effective_hum_threshold:
-        ac_decision = "cooling"
-        ac_target = 24
-    elif signal >= TEMP_DEHUMID_LOW:
-        ac_decision = "fan"
-        ac_target = None
-    else:
-        ac_decision = "off"
-        ac_target = None
-    
-    # 最小运行/停机时间约束
-    if ac_decision in ("cooling", "dehumid") and off_mins is not None and off_mins < MIN_OFF:
-        ac_decision = "fan_locked"
-    elif ac_decision in ("off", "fan") and run_mins is not None and run_mins < MIN_RUN:
-        ac_decision = ac_mode if ac_running else "off"
-    
-    # ── 开窗决策（受空调状态影响） ──
-    if ac_decision in ("cooling", "dehumid"):
-        window_decision = "close"
-        window_reason = "空调运行中，开窗浪费冷气"
-    elif outdoor_temp > 35:
-        window_decision = "close"
-        window_reason = "室外极端热，开窗灌热气"
-    elif dp_out is not None and dp_in is not None and dp_out > dp_in + DEW_DELTA_MAX:
-        window_decision = "close"
-        window_reason = f"室外露点高（差{dp_out - dp_in:.1f}°C），开窗灌湿气"
-    elif hi_in is not None and hi_in < TEMP_COOLING and outdoor_temp < indoor_temp:
-        window_decision = "open"
-        window_reason = "室外舒适，开窗通风"
-    elif outdoor_hum > 85 and (indoor_hum is None or outdoor_hum > indoor_hum + 10):
-        window_decision = "close"
-        window_reason = "室外潮湿，关窗防潮"
-    else:
-        window_decision = "close"
-        window_reason = "室外条件一般，关窗+风扇"
-    
-    # ── 风扇决策 ──
-    if ac_decision in ("off", "fan") and window_decision == "close":
-        fan_decision = "circulate"
-    else:
-        fan_decision = "off"
-    
-    return {
-        "ac_mode": ac_decision,
-        "ac_target": ac_target,
-        "window": window_decision,
-        "window_reason": window_reason,
-        "fan": fan_decision,
-        "outdoor_temp": outdoor_temp,
-        "outdoor_hum": outdoor_hum,
-        "indoor_temp": indoor_temp,
-        "indoor_hum": indoor_hum,
-        "hi_in": hi_in,
-        "dp_in": dp_in,
-        "dp_out": dp_out,
-    }
 
-# ══════════════════════════════════════════════════════════════
-# ── 统一输出 ──
-# ══════════════════════════════════════════════════════════════
-def format_output(decision, wx, power, state, ctrl):
-    """格式化统一输出"""
-    lines = []
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    wcode = wx["current"]["weather_code"]
-    
-    lines.append(f"🏠 上海闵行 · 家庭生活系统 v1.0")
-    lines.append(f"📅 {now_str} · {weather_cn(wcode)}")
-    lines.append("")
-    lines.append("🌡️ 环境")
-    lines.append(f"  室外: {decision['outdoor_temp']:.1f}°C  体感: {wx['current']['apparent_temperature']:.1f}°C  湿度: {decision['outdoor_hum']:.0f}%  露点: {decision['dp_out']:.1f}°C" if decision['dp_out'] else f"  室外: {decision['outdoor_temp']:.1f}°C  湿度: {decision['outdoor_hum']:.0f}%")
-    if decision['indoor_temp'] is not None:
-        lines.append(f"  室内: {decision['indoor_temp']:.1f}°C  湿度: {decision['indoor_hum']:.0f}%  露点: {decision['dp_in']:.1f}°C" if decision['dp_in'] else f"  室内: {decision['indoor_temp']:.1f}°C  湿度: {decision['indoor_hum']:.0f}%")
-        if decision['hi_in'] is not None:
-            lines.append(f"  舒适指数: {decision['hi_in']:.1f}（阈值{TEMP_COOLING}°C）")
-    lines.append("")
-    
-    # 空调
-    lines.append("❄️ 空调")
-    ac_mode = decision['ac_mode']
-    if ac_mode == "cooling":
-        lines.append(f"  💡 制冷模式 {decision['ac_target']}°C + 自动风速")
-    elif ac_mode == "dehumid":
-        lines.append(f"  💡 除湿模式")
-    elif ac_mode == "fan":
-        lines.append(f"  🍃 风扇够用")
-    elif ac_mode == "fan_locked":
-        lines.append(f"  ⏳ 风扇锁定（关后{MIN_OFF}分钟内不重开）")
-    else:
-        lines.append(f"  ❌ 不开")
-    
-    if power:
-        lines.append(f"  🔌 空调运行中（实测 {power}W）")
-    if ctrl and ctrl.get("status") == "action":
-        lines.append(f"  🎛️ 已自动执行: {ctrl['action']}")
-    lines.append("")
-    
-    # 开窗
-    lines.append("🪟 开窗")
-    if decision['window'] == "open":
-        lines.append(f"  ✅ 开窗（{decision['window_reason']}）")
-    else:
-        lines.append(f"  ❌ 关窗（{decision['window_reason']}）")
-    
-    if decision['fan'] == "circulate":
-        lines.append(f"  💨 风扇内循环")
-    lines.append("")
-    
-    return "\n".join(lines)
-
-# ══════════════════════════════════════════════════════════════
-# ── 每日报告（合并 ac_advisor + vent_reminder） ──
-# ══════════════════════════════════════════════════════════════
 def daily_report():
-    """统一每日报告"""
-    # 获取数据
-    wx = fetch_weather()
-    if "error" in wx:
-        return f"⚠️ 天气API失败: {wx['error']}\n🏠 上海闵行 · 家庭生活系统 v1.0"
-    
-    # 室内
-    indoor_temp, indoor_hum = read_indoor()
-    
-    # 统一决策
-    decision = unified_decision(wx, indoor_temp, indoor_hum)
-    
-    # 获取空调状态
-    state = load_state()
-    ac_state = state.get("ac", {})
-    power = read_ac_power()
-    ac_control_init()
-    
-    # 控制
-    ctrl = None
-    if decision['ac_mode'] in ("cooling", "dehumid", "fan", "off", "fan_locked"):
-        ctrl = apply_and_commit(decision['ac_mode'], decision['ac_target'], state)
-    
-    # 输出
-    out = format_output(decision, wx, power, state, ctrl)
-    
-    # ── 开窗最佳窗口 ──
-    forecast_data = fetch_forecast(1)
-    h = forecast_data["hourly"]
+    """Daily ventilation report (08:00 mode)."""
+    data = fetch_weather()
+    if "error" in data:
+        return notify_error_once("weather", data["error"])
+    h = data.get("hourly", {})
+    if not h or not h.get("time"):
+        return notify_error_once("hourly", "no hourly data")
     today = date.today().isoformat()
     rows = build_rows(h, today)
-    
-    if rows:
-        aqi = fetch_aqi(1)
-        best, blocked = pick_best(rows, indoor_temp, indoor_hum, decision['ac_mode'], aqi)
-        if best:
-            vv, emoji = verdict(best["rh"])
-            dt = (best["temp"] - indoor_temp) if indoor_temp is not None else 0
-            dur = t95(best["wind_kmh"], dt)
-            dur_s = f"约 {dur:.0f} 分钟" if dur <= 90 else "风小，配风扇 ~10-15 分钟"
-            lines = ["", "🪟 今日最佳开窗窗口"]
-            lines.append(f"  🏆 {best['hr']:02d}:00  RH{best['rh']}% {best['temp']}°C 风{best['wind_kmh']:.0f}km/h → {emoji}{vv}")
-            _wd = wind_dir_cn(best.get("wind_dir"))
-            if _wd:
-                lines.append(f"     🧭 {_wd} → 迎风1-2扇+背风2扇")
-            lines.append(f"     ⏱ 建议时长: {dur_s}")
-            if indoor_temp is not None:
-                lines.append(f"     📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
-            for x in vent_advice(indoor_hum, best["rh"], indoor_temp, best["temp"]):
-                lines.append(f"     {x}")
-            out += "\n" + "\n".join(lines)
-    
-    # ── 24h 最优调度 ──
-    learned = load_learned()
-    schedule = compute_optimal_schedule(wx, indoor_temp, indoor_hum, learned)
-    if schedule:
-        slines = ["", "📊 未来24h最优计划"]
-        total_cost = 0
-        cool_hours = []
-        dehumid_hours = []
-        for hour, action, est_cost in schedule:
-            total_cost += est_cost
-            if action == "cool":
-                cool_hours.append(hour)
-            elif action == "dehumid":
-                dehumid_hours.append(hour)
-        slines.append(f"   制冷时段: {', '.join(f'{h}时' for h in cool_hours[:8])}{'...' if len(cool_hours) > 8 else ''}")
-        slines.append(f"   除湿时段: {', '.join(f'{h}时' for h in dehumid_hours[:8])}{'...' if len(dehumid_hours) > 8 else ''}")
-        slines.append(f"   预估总电费: {total_cost:.2f}元")
-        out += "\n" + "\n".join(slines)
-    
-    # ── 热质量 ──
-    thermal_data = load_thermal_data()
-    thermal_model = thermal_data.get("thermal_model", {})
-    if thermal_model:
-        cool_rate = thermal_model.get("cooling_rate_per_min", 0.05)
-        warm_rate = thermal_model.get("warmup_rate_per_min", 0.02)
-        out += f"\n\n🏢 房间热惯性：降温{cool_rate:.3f}°C/min，升温{warm_rate:.3f}°C/min"
-    
-    # ── 滤网提醒 ──
-    reminder = filter_clean_reminder()
-    if reminder:
-        out += "\n" + reminder
-    
-    # ── 夜间方案 ──
-    if indoor_temp is not None and indoor_hum is not None:
-        for nl in night_cost_lines(indoor_temp, indoor_hum):
-            out += "\n" + nl
-    
-    return out
+    if not rows:
+        return "⚠️ 预报数据为空，今日换气提醒无法生成"
+    indoor_temp, indoor_hum = read_indoor()
+    ac_mode = read_ac_state()
+    aqi = fetch_aqi(1)
+    best, blocked = pick_best(rows, indoor_temp, indoor_hum, ac_mode, aqi)
+
+    lines = []
+    lines.append(f"🌬️ 今日换气提醒 ({today} {WD[date.today().weekday()]})")
+    lines.append("─" * 18)
+    if best is None:
+        lines.append("🚫 今日无推荐开窗窗口")
+        lines.append(f"   原因: {blocked}")
+        if indoor_temp is not None:
+            lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
+        for x in vent_advice(indoor_hum, None, indoor_temp, None):
+            lines.append(f"   {x}")
+        lines.append("─" * 18)
+        if blocked and ("降雨" in blocked or "降水" in blocked):
+            lines.append("🌧 今天天气不配合，关窗靠空调/除湿机")
+        else:
+            lines.append("🔒 今天不宜开窗，关窗保环境")
+        return "\n".join(lines)
+
+    vv, emoji = verdict(best["rh"])
+    dt = (best["temp"] - indoor_temp) if indoor_temp is not None else 0
+    dur = t95(best["wind_kmh"], dt)
+    pm25 = aqi.get(f"{today}T{best['hr']:02d}:00") if aqi else None
+    dur_s = f"约 {dur:.0f} 分钟" if dur <= 90 else "风小，配风扇 ~10-15 分钟"
+    rain = "☔有雨" if best["pp"] >= 40 else ("🌦有雨概率" if best["pp"] >= 20 else "☀无雨")
+    lines.append(f"🏆 最佳窗口: {best['hr']:02d}:00  RH{best['rh']}% {rain}{best['pp']}%")
+    lines.append(f"   温度{best['temp']}°C 风{best['wind_kmh']:.0f}km/h → {emoji}{vv}")
+    _wd = wind_dir_cn(best.get("wind_dir"))
+    if _wd:
+        lines.append(f"   🧭 {_wd}{best.get('wind_dir')}° → 开迎风1-2扇+背风2扇, 4窗全开最畅")
+    if pm25 is not None:
+        lines.append(f"   🍃 PM2.5 {pm25:.0f}µg/m³ {'✅' if pm25 < 35 else ('🟡' if pm25 < 75 else '❌')}")
+    lines.append(f"   ⏱ 建议时长: {dur_s}")
+    lines.append(f"   操作: 4窗全开+房门全开, 到点关")
+    if indoor_temp is not None:
+        lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
+    for x in vent_advice(indoor_hum, best["rh"], indoor_temp, best["temp"]):
+        lines.append(f"   {x}")
+    lines.append("─" * 18)
+    if best["rh"] >= 85:
+        lines.append("❌ 今天全天高湿/降雨，不宜开窗")
+        lines.append("   除湿请关窗靠空调/除湿机")
+    elif best["rh"] < 70:
+        lines.append(f"✅ 今天可以开窗{emoji}，甚至顺带除湿")
+    elif best["rh"] < 78:
+        lines.append(f"🟡 今天湿度一般，短换即可")
+    else:
+        lines.append(f"🟠 今天湿度偏高，只在 {best['hr']:02d}:00 前后快速换气")
+    lines.append("─" * 18)
+    return "\n".join(lines)
 
 
 def alert_check():
-    """智能模式: 未来90分钟内通过统一闸门的窗口才提醒"""
+    """Alert mode: only alert if window passes gate in next 90 min, else silent."""
     now = datetime.now()
     if now.hour == 8 and now.minute < 30:
         return ""
-    data = fetch_forecast(1)
-    h = data["hourly"]
+    data = fetch_weather()
+    if "error" in data:
+        return ""
+    h = data.get("hourly", {})
+    if not h or not h.get("time"):
+        return ""
     today = date.today().isoformat()
     rows = build_rows(h, today)
     if not rows:
@@ -1346,7 +1058,7 @@ def alert_check():
     if not upcoming:
         return ""
     indoor_temp, indoor_hum = read_indoor()
-    ac_mode = get_ac_mode()
+    ac_mode = read_ac_state()
     aqi = fetch_aqi(1)
     best, _ = pick_best(upcoming, indoor_temp, indoor_hum, ac_mode, aqi)
     if best is None:
@@ -1356,11 +1068,15 @@ def alert_check():
     dur = t95(best["wind_kmh"], dt)
     dur_s = f"约 {dur:.0f} 分钟" if dur <= 90 else "风小，配风扇 ~10-15 分钟"
     rain = "☔降雨" if best["pp"] >= 40 else "🌦" if best["pp"] >= 20 else "☀"
-    lines = [f"⏰ 换气提醒: {now.strftime('%H:%M')}后, {best['hr']:02d}:00 是好窗口"]
+    pm25 = aqi.get(f"{today}T{best['hr']:02d}:00") if aqi else None
+    lines = []
+    lines.append(f"⏰ 换气提醒: {now.strftime('%H:%M')}后, {best['hr']:02d}:00 是好窗口")
     lines.append(f"   RH{best['rh']}% {rain}{best['pp']}%  温度{best['temp']}°C 风{best['wind_kmh']:.0f}km/h → {emoji}{vv}")
     _wd = wind_dir_cn(best.get("wind_dir"))
     if _wd:
         lines.append(f"   🧭 {_wd} → 迎风开1-2扇+背风2扇")
+    if pm25 is not None and pm25 >= 35:
+        lines.append(f"   🍃 PM2.5 {pm25:.0f}µg/m³")
     lines.append(f"   ⏱ 4窗全开换 {dur_s}, 到点关")
     if indoor_temp is not None:
         lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
@@ -1368,11 +1084,9 @@ def alert_check():
         lines.append(f"   {x}")
     return "\n".join(lines)
 
-# ══════════════════════════════════════════════════════════════
-# ── 错误通知 ──
-# ══════════════════════════════════════════════════════════════
+
 def notify_error_once(key, detail):
-    """故障静默"""
+    """Error silence: alert mode silent; daily mode same error 24h max 1."""
     if "--alert" in sys.argv:
         return ""
     try:
@@ -1388,11 +1102,11 @@ def notify_error_once(key, detail):
             json.dump(st, f)
     except Exception:
         pass
-    return f"⚠️ 系统数据异常（{detail[:100]}）→ 今日暂停，明早 08:00 恢复"
+    return f"⚠️ 换气提醒数据异常（{detail[:100]}）→ 今日暂停，明早 08:00 恢复"
 
 
 def notify_windows(title, text):
-    """Windows toast 通知"""
+    """Windows toast notification (parallel with WeChat)."""
     try:
         ps = (
             "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
@@ -1407,30 +1121,346 @@ def notify_windows(title, text):
     except Exception:
         pass
 
-# ══════════════════════════════════════════════════════════════
-# ── 主入口 ──
-# ══════════════════════════════════════════════════════════════
+
+# ============================================================
+# Unified decision engine (v11.0 new)
+# ============================================================
+def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
+    """Unified AC + window + fan decision.
+    Returns dict with ac_mode, vent_open, reason, and details."""
+    # Seasonal + learned offsets
+    temp_offset, hum_offset, strategy_label = seasonal_adjustments()
+    learned = load_learned()
+    learned_temp_adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    effective_cooling_threshold = TEMP_COOLING + temp_offset + learned_temp_adj
+    effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
+
+    # Signal selection
+    cur = wx.get("current", {})
+    temp = cur.get("apparent_temperature", cur.get("temperature_2m", 0))
+    hum_out = cur.get("relative_humidity_2m")
+    signal = indoor_temp if indoor_temp is not None else temp
+    hum_sig = indoor_hum if indoor_hum is not None else None
+
+    hi = comfort_index(signal, hum_sig)
+
+    # Ventilation check
+    hourly = wx.get("hourly", {})
+    h_time = hourly.get("time", [])
+    h_hum = hourly.get("relative_humidity_2m", [])
+    h_precip = hourly.get("precipitation_probability", [])
+    h_ws = hourly.get("wind_speed_10m", [])
+    h_wd = hourly.get("wind_direction_10m", [])
+    h_gust = hourly.get("wind_gusts_10m", [])
+    h_temp = hourly.get("temperature_2m", [])
+
+    vent_ok = False
+    vent_reason = None
+    best_window = None
+    today = date.today().isoformat()
+    rows = build_rows(hourly, today) if hourly else []
+    aqi = fetch_aqi(1)
+    ac_mode_state = state.get("mode")
+    best_win, blocked = pick_best(rows, indoor_temp, indoor_hum, ac_mode_state, aqi) if rows else (None, None)
+
+    if best_win is not None:
+        pm25 = aqi.get(f"{today}T{best_win['hr']:02d}:00") if aqi else None
+        ok, reason = gate_check(best_win["rh"], best_win["pp"], best_win["rain_mm"],
+                                best_win["temp"], best_win["wind_kmh"] / 3.6,
+                                best_win["gust_ms"], pm25,
+                                indoor_temp, indoor_hum)
+        vent_ok = ok
+        vent_reason = reason
+
+    # AC decision (same tree as v9.0 main)
+    decision = None
+    reason = ""
+    new_mode = None
+    burst_set = None
+
+    precool, max_future_hi, _ = should_precool(wx, hi, effective_cooling_threshold)
+
+    if hi >= effective_cooling_threshold:
+        reco = round(max(26, min(28, signal - 2)))
+        burst_set = reco
+        decision = f"制冷模式 {reco}°C + 自动风速"
+        reason = f"HI={hi:.1f}（{signal:.1f}°C/{hum_sig}%）≥ {effective_cooling_threshold}°C"
+        new_mode = "cooling"
+    elif (TEMP_ABSOLUTE_FLOOR <= signal < TEMP_DEHUMID_LOW
+          and hum_sig is not None and hum_sig > effective_hum_threshold):
+        burst_set = 23
+        decision = "制冷 23°C 强制除湿一轮"
+        reason = f"低温高湿：{signal:.1f}°C / 湿度{hum_sig:.0f}%"
+        new_mode = "cooling"
+    elif (TEMP_DEHUMID_LOW <= signal < TEMP_DEHUMID_HIGH
+          and hum_sig is not None and hum_sig > effective_hum_threshold):
+        running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+        since_on = minutes_since(state.get("run_start"))
+        over_max = running and since_on is not None and since_on >= MAX_RUN
+        if over_max:
+            decision = "建议切换制冷或关"
+            reason = f"除湿已连续运行≥{MAX_RUN}分钟"
+            new_mode = "dehumid_alert"
+        else:
+            burst_set = 24
+            decision = "制冷 24°C 集中除湿一轮"
+            reason = f"湿度{hum_sig:.0f}% > {effective_hum_threshold}%"
+            new_mode = "cooling"
+    elif signal >= TEMP_DEHUMID_LOW:
+        decision = "风扇够用，不用开空调"
+        reason = f"{signal:.1f}°C，不算热"
+        new_mode = "fan"
+    else:
+        if signal < TEMP_ABSOLUTE_FLOOR:
+            decision = "关掉除湿！已经过冷"
+            reason = f"温度{signal:.1f}°C < {TEMP_ABSOLUTE_FLOOR}°C"
+            new_mode = "off"
+        else:
+            decision = "不用开空调，开窗通风+风扇"
+            reason = f"温度{signal:.1f}°C，凉快"
+            new_mode = "off"
+
+    if precool and new_mode in ("fan", "off", "fan_locked"):
+        decision = f"预冷建议：未来3h HI={max_future_hi:.1f}°C"
+        reason = f"当前HI={hi:.1f}°C，未来3h将达{max_future_hi:.1f}°C"
+        burst_set = round(max(26, min(28, signal - 2)))
+        new_mode = "cooling"
+
+    # State machine validation
+    current_state = ACState(state.get("mode", "off") or "off")
+    target_state = ACState(new_mode if new_mode in ("cooling", "dehumid", "fan", "fan_locked", "off") else "off")
+    validated_state = transition(current_state, target_state)
+    if validated_state != target_state:
+        new_mode = validated_state.value
+        reason += f"（状态机校验：{current_state.value}→{target_state.value} 非法，保持{validated_state.value}）"
+
+    # Min run/off constraints
+    since_off = minutes_since(state.get("last_off_at"))
+    since_on = minutes_since(state.get("run_start"))
+    if new_mode in ("cooling", "dehumid", "dehumid_alert"):
+        if since_off is not None and since_off < MIN_OFF:
+            decision = f"风扇（关后{MIN_OFF}分钟内不重开）"
+            reason += f"；关后仅{int(since_off)}分钟"
+            new_mode = "fan_locked"
+    elif new_mode in ("fan", "fan_locked", "off"):
+        if since_on is not None and since_on < MIN_RUN:
+            decision = f"继续开着（开够{MIN_RUN}分钟再关）"
+            reason += f"；开仅{int(since_on)}分钟"
+            new_mode = state.get("mode", "unknown")
+
+    return {
+        "ac_mode": new_mode,
+        "decision": decision,
+        "reason": reason,
+        "burst_set": burst_set,
+        "vent_ok": vent_ok,
+        "vent_reason": vent_reason,
+        "best_window": best_window,
+        "strategy_label": strategy_label,
+        "effective_cooling_threshold": effective_cooling_threshold,
+        "hi": hi,
+    }
+
+
+def format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert):
+    """Format unified output string."""
+    lines = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    cur = wx.get("current", {})
+    dai = wx.get("daily", {})
+    temp = cur.get("temperature_2m", 0)
+    feels = cur.get("apparent_temperature", 0)
+    hum_out = cur.get("relative_humidity_2m")
+    wcode = cur.get("weather_code", 0)
+    max_t = dai.get("temperature_2m_max", [0])[0]
+    rain = dai.get("precipitation_probability_max", [0])[0]
+
+    lines.append(f"🏠 上海闵行 · 家居生活统一顾问 v11.0")
+    lines.append(f"📅 {now_str} · {weather_cn(wcode)}")
+    lines.append("")
+    lines.append(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
+    if indoor_temp is not None:
+        lines.append(f"  室内: {indoor_temp:.1f}°C  湿度: {indoor_hum:.0f}%")
+    else:
+        lines.append(f"  室内传感器不可用")
+    lines.append(f"  今日最高: {max_t:.1f}°C  降雨: {rain:.0f}%")
+    lines.append(f"  舒适度HI: {result['hi']:.1f}（阈值{result['effective_cooling_threshold']:.0f}°C，{result['strategy_label']}）")
+    if run_info:
+        lines.append(run_info)
+    if ac_w:
+        lines.append(f"  🔌 空调实测功率: {ac_w}W")
+    if ctrl and ctrl.get("status") == "action":
+        lines.append(f"  🎛️ 已自动执行: {ctrl['action']}")
+    elif ctrl and ctrl.get("status") == "no_action":
+        lines.append("  🎛️ 已处目标状态，无需动作")
+    elif ctrl:
+        lines.append(f"  ⚠️ 自动控制失败（{ctrl.get('reason', '')}）")
+    lines.append("")
+    lines.append(f"  💡 {result['decision']}")
+    lines.append(f"     ({result['reason']})")
+    if ac_alert:
+        lines.append(ac_alert)
+    lines.append("")
+    return lines
+
+
+# ============================================================
+# Main
+# ============================================================
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    
-    # 迁移旧状态
-    migrate_legacy_state()
-    
-    out = None
+    # -- 1. Fetch weather --
+    wx = fetch_weather()
+    if "error" in wx:
+        print(f"⚠️ 天气API失败: {wx['error']}")
+        print("🏠 上海闵行 · 家居生活统一顾问 v11.0")
+        print("  数据不可用，请稍后再查")
+        return
+
+    # -- 2. Read indoor + AC --
+    indoor_temp, indoor_hum = read_indoor()
+    indoor_ok = indoor_temp is not None and indoor_hum is not None
+    ac_w = read_ac_power()
+    ac_control_init()
+
+    # -- 3. Load state --
+    state = load_state()
+    now_ts = datetime.now().isoformat()
+    now_dt = datetime.now()
+    reconcile_state(state, now_ts)
+
+    # Manual off anchor
+    _manual_anchor = False
+    _manual_anchor_mins = None
+    manual_off = state.get("manual_off_at")
+    if manual_off and state.get("mode") in (None, "off"):
+        try:
+            off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
+            mins = (now_dt - off_dt).total_seconds() / 60
+            if 0 <= mins < 30:
+                _manual_anchor = True
+                _manual_anchor_mins = int(mins)
+            if mins >= 720:
+                state.pop("manual_off_at", None)
+        except Exception:
+            pass
+
+    # -- 4. Unified decision --
+    result = unified_decision(wx, indoor_temp, indoor_hum, state, now_ts)
+    new_mode = result["ac_mode"]
+    burst_set = result["burst_set"]
+
+    # Manual anchor override
+    if _manual_anchor and new_mode in ("cooling", "dehumid", "dehumid_alert"):
+        new_mode = "off"
+        result["decision"] = "保持现状（手动关后" + str(_manual_anchor_mins) + "分钟内不自动启动）"
+        result["reason"] = "manual_off_anchor"
+        burst_set = None
+
+    # -- 5. Log + apply --
+    log_decision(state, new_mode, indoor_temp, indoor_hum, now_ts)
+    state["last_temp"] = indoor_temp
+    state["last_hum"] = indoor_hum
+    ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
+    evaluate_and_learn(state, now_ts)
+
+    # -- 6. Build output --
+    run_info = ""
+    if AC_SOCKET == "on":
+        run_info = "  🔌 空调运行中（插座实测）"
+    elif AC_SOCKET == "off":
+        run_info = "  🔌 空调已关（插座实测）"
+    elif new_mode in ("cooling", "dehumid", "dehumid_alert"):
+        run_now = minutes_since(state.get("run_start"))
+        if run_now is not None:
+            if run_now < 1:
+                run_info = "  本轮刚建议开启"
+            else:
+                run_info = f"  已运行: {int(run_now)} 分钟"
+                if run_now >= MAX_RUN:
+                    run_info += f" ⚠️ 超 {MAX_RUN} 分钟"
+
+    # Humidity alert
+    ac_alert = ""
+    _alert_state = {}
+    _alert_file = os.path.join(SCRIPT_DIR, "ac_alert_state.json")
     try:
-        if "--alert" in sys.argv:
-            out = alert_check()
+        if os.path.exists(_alert_file):
+            with open(_alert_file, "r", encoding="utf-8") as f:
+                _alert_state = json.load(f)
+    except Exception:
+        pass
+    _today = datetime.now().strftime("%Y-%m-%d")
+    if (new_mode in ("fan", "fan_locked", "off")
+            and indoor_hum is not None and indoor_hum > 78
+            and indoor_temp is not None and indoor_temp >= TEMP_ABSOLUTE_FLOOR
+            and _alert_state.get("last_alert_day") != _today):
+        _alert_state["last_alert_day"] = _today
+        _alert_state["updated_at"] = datetime.now().isoformat()
+        try:
+            with open(_alert_file, "w", encoding="utf-8") as f:
+                json.dump(_alert_state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        ac_alert = (f"  ⚠️ 湿度{indoor_hum:.0f}%偏高：就算不热，也该开空调压轮湿度"
+                    f"（制冷集中 40~60 分钟，到 60% 关）")
+
+    # Format + print
+    out_lines = format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert)
+
+    # Ventilation advice
+    hum_out = wx.get("current", {}).get("relative_humidity_2m")
+    vent_lines = vent_advice(indoor_hum, hum_out, indoor_temp,
+                             wx.get("current", {}).get("temperature_2m"))
+    if vent_lines:
+        out_lines.append("  🌬 通风建议:")
+        for vl in vent_lines:
+            out_lines.append(f"     {vl}")
+    out_lines.append("")
+
+    # Window close reminder
+    dai = wx.get("daily", {})
+    rain = dai.get("precipitation_probability_max", [0])[0]
+    if rain >= 45:
+        out_lines.append("  ⚠️ 今日有雨，请勿开窗（防潮）")
+    elif hum_out is not None and hum_out >= 85:
+        out_lines.append(f"  ⚠️ 室外潮湿({hum_out:.0f}%)，请勿开窗（防潮）")
+
+    # AC tips
+    if new_mode in ("cooling", "dehumid"):
+        out_lines.append(f"  ⏱ 开够 {MIN_RUN} 分钟再关，关后等 {MIN_OFF} 分钟再开")
+        if new_mode == "dehumid":
+            out_lines.append(f"  ⏱ 温度<{TEMP_ABSOLUTE_FLOOR}°C 或 湿度<{HUM_DEHUMID_OFF}% 可关")
         else:
-            out = daily_report()
-    except Exception as e:
-        out = notify_error_once("generic", str(e))
-    
-    if out:
-        notify_windows("家庭生活提醒", out.splitlines()[0] if out else "")
-        print(out)
-    print()
-    print("─" * 40)
-    print("数据: 和风天气 + Open-Meteo + 小米净化器4Lite · v1.0")
+            out_lines.append(f"  💡 湿度<60%且温度≤27 / 湿度60-70%且≤26 → 可关")
+            out_lines.append(f"  🔁 省电：制冷设 {burst_set or TEMP_DEHUMID_LOW}°C 集中 40~60 分钟 → 湿度到60%即关")
+
+    # Filter reminder
+    reminder = filter_clean_reminder()
+    if reminder:
+        out_lines.append(reminder)
+
+    # Night cost comparison
+    for nl in night_cost_lines(indoor_temp, indoor_hum):
+        out_lines.append(nl)
+
+    out_lines.append("")
+    out_lines.append("─" * 40)
+    out_lines.append("数据: Open-Meteo + 小米净化器4Lite · 统一决策v11.0")
+
+    print("\n".join(out_lines))
+
+    # TTS broadcast
+    try:
+        _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
+        if _tts_dir not in sys.path:
+            sys.path.insert(0, _tts_dir)
+        from ac_tts import speak
+        speak(result["decision"][:50])
+        if ac_alert:
+            speak(ac_alert, force=True)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
