@@ -50,3 +50,9 @@ ac_thermal.json
 # 阈值自学习数据（evaluate_and_learn 运行时生成，不入库）
 ac_learned.json
 
+# 家庭生活系统运行时状态（home_living.py 生成，不入库）
+home_state.json
+
+# 通风周期状态机（vent_cycle_step 生成，不入库）
+vent_cycle_state.json
+

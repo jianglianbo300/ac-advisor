@@ -116,6 +116,10 @@ DUAL_STOP_MIN_COMP = 10    # 双轴停止压缩机地板(min)：低于 MIN_RUN �
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
 
+# ── v8.19 天气感知：晴天/室外高温提前制冷（用户反馈：阴天调参后晴天觉得热）──
+OUTDOOR_HOT_T = 30           # 室外≥30°C 视为炎热晴天
+TEMP_COOLING_HOT_DAY = 27    # 炎热天白天制冷启动阈值（原 TEMP_COOLING=28 → 提前到27）
+
 # fallback：传感器不可达时的保守动作
 SENSOR_FALLBACK_OFF_ALLOWED = True  # 读不到 → 允许关（安全动作）
 SENSOR_FALLBACK_ON_ALLOWED = False  # 读不到 → 禁止开（危险动作）
@@ -399,7 +403,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            compressor=None, compressor_stop_duration_min=None, cooldown_until_dt=None,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
-           night_comp_starts=None, fake_run_count=None, evening=False):
+           night_comp_starts=None, fake_run_count=None, evening=False,
+           outdoor_temp=None, outdoor_rain=None):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
@@ -550,7 +555,9 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         return (None, None, None)
 
     # ── 未运行 ──
-    if since_off is not None and since_off < A.MIN_OFF:
+    # 白天/夜间用不同 MIN_OFF：白天温度回升快，15min 即可；夜间保持 30min 防短循环
+    effective_min_off = A.MIN_OFF if is_night else A.DAY_MIN_OFF
+    if since_off is not None and since_off < effective_min_off:
         return (None, None, None)
     if is_night:
         # 分支 A 夜间对齐：目标永远低于室温 2C（保证定频压缩机启动），clamp 24~26
@@ -563,12 +570,17 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                 and temp - night_target >= 1):
             return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
         return (None, None, None)
-    if temp >= A.TEMP_COOLING:
+    # v8.19 天气感知制冷启动：室外炎热(≥30°C)时启动阈值 28→27，提前开别等太热
+    eff_cool = A.TEMP_COOLING
+    if outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T:
+        eff_cool = TEMP_COOLING_HOT_DAY
+    if temp >= eff_cool:
         # v8.11: 高湿时优先除湿，降目标温度到24°C，避免26°C早停→湿度反弹→逃生门关机的死循环
         if hum >= A.HUM_DEHUMID_ON:
             return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度先除湿")
         t = round(max(26, min(28, temp - 2)))
-        return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度")
+        wx_note = "（室外炎热提前制冷）" if eff_cool != A.TEMP_COOLING else ""
+        return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度{wx_note}")
     # v8.14 E 方案（谷电积极版）：22-6 谷电半价 → 除湿启动阈值 65→62 更早压湿；
     # 峰电维持原阈值不推迟（保舒适，不牺牲体验）
     if temp >= A.TEMP_DEHUMID_LOW and hum >= (VALLEY_START_RH if A.current_price() < A.ELECTRIC_PEAK else A.HUM_DEHUMID_ON):
@@ -599,15 +611,31 @@ def main():
             temp = hum = None
 
     state = A.load_state()
-    # v8.15 fail-safe（2026-08-14 审查待办落地）：状态文件损坏 → 本次 tick 不执行任何开/关，
-    # 避免"假装没状态继续跑"悄悄丢失 MIN_OFF/manual 锚点；等下次 tick 状态正常或人工处理
+    # v8.15 fail-safe：状态文件损坏 → 本次 tick 不执行任何开/关
     if state.get("_state_load_failed"):
         log("[ERROR] 状态文件损坏，本次 tick fail-safe 跳过（不执行开/关）")
         print("ac_watch: 状态文件损坏，fail-safe 跳过（不执行开/关）")
         return
     A.reconcile_state(state, now_ts)
 
-    # v8.10 传感器断连超时升级
+    # v8.20 传感器离线回退：传感器坏时用天气预报的室外温湿度兜底继续决策
+    # 必须在 load_state() 之后——cached_outdoor 需要 state 做 30min TTL 缓存。
+    # （室内外湿度差异大，但比完全不决策强；仅用于避免"传感器一挂就彻底失控"）
+    wx_fallback_used = False
+    if temp is None or hum is None:
+        try:
+            _wx_fallback = cached_outdoor(state, now_dt)
+        except Exception as e:
+            _wx_fallback = None
+            log(f"[WARN] 天气兜底获取失败：{type(e).__name__}: {e}")
+        if _wx_fallback and _wx_fallback.get("t") is not None:
+            temp = _wx_fallback["t"]
+            # 室外湿度不能代表室内，缺省 50（中等）让决策只走温度分支，不误触除湿
+            hum = _wx_fallback.get("rh") if _wx_fallback.get("rh") is not None else 50
+            wx_fallback_used = True
+            log(f"传感器离线，回退到天气预报 T={temp}°C RH={hum}%")
+
+    # v8.20 传感器断连超时升级（仅当连天气兜底都拿不到时才跳过）
     if temp is None or hum is None:
         sensor_off_since = state.get("_sensor_off_since")
         if sensor_off_since is None:
@@ -622,13 +650,19 @@ def main():
                     state.pop("_sensor_off_since", None)
                     A.save_state(state)
                     return
-        log(f"传感器不可达跳过 socket={socket}, sensor_off_since={state.get('_sensor_off_since', 'now')}")
-        print("ac_watch: 室内传感器不可达，本次跳过")
+        log(f"传感器不可达且无天气兜底，跳过 socket={socket}, sensor_off_since={state.get('_sensor_off_since', 'now')}")
+        print("ac_watch: 室内传感器不可达且无天气兜底，本次跳过")
         A.save_state(state)
         return
 
-    # 传感器恢复正常 → 清除断连标记
-    state.pop("_sensor_off_since", None)
+    if wx_fallback_used:
+        # 仍算断连：保留 _sensor_off_since 以便真传感器长期不回来时触发保守关机
+        log("传感器不可达但有天气预报兜底，继续控制（保留断连计时）")
+        if state.get("_sensor_off_since") is None:
+            state["_sensor_off_since"] = now_ts
+    else:
+        # 传感器恢复正常 → 清除断连标记
+        state.pop("_sensor_off_since", None)
 
     # ── 手动关后 2 小时内不自动启动，但不超过 12h TTL ──
     manual_off = state.get("manual_off_at")
@@ -637,11 +671,37 @@ def main():
             off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
             mins = (now_dt - off_dt).total_seconds() / 60
             # v8.10 TTL：不超过 MANUAL_ANCHOR_TTL min（12h），过期后恢复自动逻辑
-            if 0 <= mins < 120 and mins < MANUAL_ANCHOR_TTL:
-                log(f"手动关后{int(mins)}分钟，跳过自动启动（尊重用户意图）")
-                print(f"ac_watch: 手动关后{int(mins)}分钟，跳过自动启动")
-                A.save_state(state)
-                return
+            if 0 <= mins < 30 and mins < MANUAL_ANCHOR_TTL:
+                # v8.21 温度回升覆盖：冷却期内温度回升 ≥1°C → 解除冷却，按实时温湿度决策
+                temp_at_off = None
+                off_dt_str = state.get("manual_off_at")
+                if off_dt_str:
+                    try:
+                        off_dt = datetime.fromisoformat(off_dt_str) if isinstance(off_dt_str, str) else off_dt_str
+                        th = state.get("temp_history", [])
+                        closest = None
+                        for ts_str, t in th:
+                            try:
+                                ts = datetime.fromisoformat(ts_str)
+                                if closest is None or abs((ts - off_dt).total_seconds()) < abs((closest[0] - off_dt).total_seconds()):
+                                    closest = (ts, t)
+                            except Exception:
+                                pass
+                        if closest:
+                            temp_at_off = closest[1]
+                    except Exception:
+                        pass
+                temp_rise = 0
+                if temp_at_off is not None and temp is not None:
+                    temp_rise = temp - temp_at_off
+                if temp_rise >= 1.0:
+                    log(f"手动关后{int(mins)}分钟，温度回升{temp_rise:.1f}°C，解除冷却期恢复自动")
+                    # 不 return，继续走后续决策逻辑
+                else:
+                    log(f"手动关后{int(mins)}分钟，跳过自动启动（尊重用户意图）")
+                    print(f"ac_watch: 手动关后{int(mins)}分钟，跳过自动启动")
+                    A.save_state(state)
+                    return
             if mins >= MANUAL_ANCHOR_TTL:
                 log(f"手动关锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑")
                 state.pop("manual_off_at", None)
@@ -775,6 +835,14 @@ def main():
         except Exception:
             pass
 
+    # v8.19 天气感知：取室外温/雨（30min 缓存，失败 None 不阻塞决策）
+    try:
+        _wx = cached_outdoor(state, now_dt)
+    except Exception:
+        _wx = None
+    _outdoor_t = _wx["t"] if (_wx and "t" in _wx) else None
+    _outdoor_rain = _wx.get("rain") if _wx else None
+
     new_mode, target, reason = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
                               compressor_stop_duration_min=stop_duration,
@@ -787,7 +855,9 @@ def main():
                               compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0),
                               night_comp_starts=state.get("_night_comp_starts"),
                               fake_run_count=fake_run_count,
-                              evening=evening)
+                              evening=evening,
+                              outdoor_temp=_outdoor_t,
+                              outdoor_rain=_outdoor_rain)
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
