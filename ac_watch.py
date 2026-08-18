@@ -164,8 +164,14 @@ DAY_STARTS_OVERRIDE_T = 29.0 # 启停上限的安全阀：室温 >= 该值说明
                              # 抖振的特征是 26-27°C 反复触发，29°C 是真实热负荷。
 
 # ── v8.19 天气感知：晴天/室外高温提前制冷（用户反馈：阴天调参后晴天觉得热）──
-TEMP_COOLING_HOT_DAY = 26.5  # 炎热天白天制冷启动阈值（2026-08-19：TEMP_COOLING 降到 27 后
-                             # 原值 27 已无提前效果，同步降到 26.5 保持"室外炎热就早开"的语义）
+# v8.22 重做：传感器分辨率实测为 1°C（2384 次采样 0 个小数），故 26.5 这类值是
+# 伪精度——26 不触发、27 触发，与常规线 27 完全等价，"炎热日提前开"实际失效。
+# 若真降到 26 则死区只剩 1°C（目标 25），会重新引发刚修掉的抖振。
+# 改为【不动启动线、压低目标】：室外炎热时房间回温快，一次多降 1°C 换更长的
+# 停机间隔，比提前开机更省电且不抖振。死区 27-24=3°C。
+OUTDOOR_HOT_T = 30            # 室外≥30°C 视为炎热晴天
+HOT_DAY_TEMP_DROP = 3         # 炎热日目标偏移：室温-3（常规 -2）→ 27°C 时目标 24，死区 3°C
+HOT_DAY_TARGET_FLOOR = 24     # 炎热日目标地板（防过冷；常规 25）
 
 # fallback：传感器不可达时的保守动作
 SENSOR_FALLBACK_OFF_ALLOWED = True  # 读不到 → 允许关（安全动作）
@@ -676,11 +682,10 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if (night_comp_starts and len(night_comp_starts) >= DAY_MAX_STARTS_PER_H
             and temp < DAY_STARTS_OVERRIDE_T):
         return (None, None, None)
-    # v8.19 天气感知制冷启动：室外炎热(≥30°C)时启动阈值 28→27，提前开别等太热
-    eff_cool = A.TEMP_COOLING
-    if outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T:
-        eff_cool = TEMP_COOLING_HOT_DAY
-    if temp >= eff_cool:
+    # v8.22 天气感知改为「压低目标」而非「提前启动」：见 HOT_DAY_TARGET_FLOOR 注释，
+    # 1°C 分辨率下提前一档会把死区压到 1°C，重新引发抖振。
+    hot_day = outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T
+    if temp >= A.TEMP_COOLING:
         # v8.11: 高湿时优先除湿，降目标温度到24°C，避免26°C早停→湿度反弹→逃生门关机的死循环
         if hum >= A.HUM_DEHUMID_ON:
             return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度先除湿")
@@ -690,8 +695,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # 下限改 25 恢复 2°C 死区（实测启停 10→7、均周期 12.0→17.6min）。
         # 25 也与手动开机路径一致（那里本就是 max(24, min(26, temp-2))），
         # 且定频机目标须显著低于室温才能持续制冷，26 对 27°C 室温太近容易到温停机。
-        t = round(max(25, min(28, temp - 2)))
-        wx_note = "（室外炎热提前制冷）" if eff_cool != A.TEMP_COOLING else ""
+        # 炎热日多压 1°C：注意不能靠"改下限"实现——max(24, temp-2) 在 27°C 时仍得 25，
+        # 下限只是地板抬不下去。要真多降必须动 temp-N 这个偏移量。
+        drop = HOT_DAY_TEMP_DROP if hot_day else 2
+        t = round(max(HOT_DAY_TARGET_FLOOR if hot_day else 25, min(28, temp - drop)))
+        wx_note = f"（室外{outdoor_temp:.0f}度炎热，多压1度少启停）" if hot_day else ""
         return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度{wx_note}")
     # v8.14 E 方案（谷电积极版）：22-6 谷电半价 → 除湿启动阈值 65→62 更早压湿；
     # 峰电维持原阈值不推迟（保舒适，不牺牲体验）

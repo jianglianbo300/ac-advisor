@@ -15,7 +15,8 @@
 同时验证同批阈值调整（用户在 27.0°C 反馈热）：
   NIGHT_START_T 28.0 -> 27.0
   TEMP_COOLING     28 -> 27
-  TEMP_COOLING_HOT_DAY 27 -> 26.5
+  TEMP_COOLING_HOT_DAY 废弃（1°C 分辨率下 26.5 等价 27 = 伪精度），
+    改为 HOT_DAY_TARGET_FLOOR=24：炎热日不提前开、而是目标多压 1°C（死区 3°C）
   白天开机目标下限 26 -> 25（恢复 2°C 死区，见 test_day_short_cycle [7]）
 
 纯函数测试，不动真空调。
@@ -99,9 +100,29 @@ print("\n[6] 启动阈值下调")
 R_.check(f"NIGHT_START_T = 27.0（原 28.0）", W.NIGHT_START_T == 27.0,
          f"got={W.NIGHT_START_T}")
 R_.check(f"TEMP_COOLING = 27（原 28）", A.TEMP_COOLING == 27, f"got={A.TEMP_COOLING}")
-R_.check("炎热日线仍严于常规线（保持提前语义）",
-         W.TEMP_COOLING_HOT_DAY < A.TEMP_COOLING,
-         f"hot={W.TEMP_COOLING_HOT_DAY} normal={A.TEMP_COOLING}")
+# 炎热日改为「压低目标」而非「提前启动」：传感器 1°C 分辨率下提前一档会把死区
+# 压到 1°C 重新引发抖振，故 TEMP_COOLING_HOT_DAY 已废弃，改用 HOT_DAY_TARGET_FLOOR。
+R_.check("炎热日目标下限严于常规（多压一度）",
+         W.HOT_DAY_TARGET_FLOOR < 25,
+         f"hot_floor={W.HOT_DAY_TARGET_FLOOR}")
+R_.check("废弃的 TEMP_COOLING_HOT_DAY 已移除（1°C 分辨率下是伪精度）",
+         not hasattr(W, "TEMP_COOLING_HOT_DAY"))
+# 炎热日实际行为：室外 32°C、室内 27°C → 目标应为 24（死区 3°C）
+_m, _t, _r = W.decide(
+    temp=27.0, hum=50, running=False, since_on=None, since_off=99, is_night=False,
+    compressor=None, current_target=26, ah=13.0, compressor_run_min=None,
+    night_comp_starts=[], outdoor_temp=32.0,
+)
+R_.check(f"炎热日 27°C 开机目标 = {W.HOT_DAY_TARGET_FLOOR}（死区 {27 - W.HOT_DAY_TARGET_FLOOR}°C）",
+         _m == "cooling" and _t == W.HOT_DAY_TARGET_FLOOR, f"got mode={_m} target={_t}")
+# 非炎热日同温度 → 目标 25
+_m2, _t2, _ = W.decide(
+    temp=27.0, hum=50, running=False, since_on=None, since_off=99, is_night=False,
+    compressor=None, current_target=26, ah=13.0, compressor_run_min=None,
+    night_comp_starts=[], outdoor_temp=25.0,
+)
+R_.check("非炎热日 27°C 开机目标 = 25", _m2 == "cooling" and _t2 == 25,
+         f"got mode={_m2} target={_t2}")
 
 # 27.0°C 必须能触发夜间开机（这是用户的核心诉求）
 ah_27 = W.absolute_humidity(27.0, 51)
