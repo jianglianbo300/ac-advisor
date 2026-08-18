@@ -57,9 +57,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ac_advisor as A
 
 # ── 并发锁（v8.10 Windows 兼容版 + atexit 清理） ──
+# v8.21：改为惰性获取。原先在 module import 阶段就抢锁，并在抢不到时直接
+# sys.exit(0)——于是任何 import ac_watch 的进程（单元测试、离线分析脚本）都会被
+# 当作"重复运行的 ac_watch"静默退出，表现为测试无输出却 exit 0 的假通过。
+# 现在只有真正要执行控制循环时（main / --selftest）才抢锁。
 _LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ac_watch.lock")
 _LOCK_FD = None
+_LOCK_STALE_SEC = 120      # 锁文件超过该秒数视为前一轮异常退出，可覆盖
 import atexit
+
 
 def _cleanup_lock():
     global _LOCK_FD
@@ -75,26 +81,36 @@ def _cleanup_lock():
     except Exception:
         pass
 
-try:
-    import msvcrt
-    _LOCK_FD = open(_LOCK_FILE, "w")
+
+def acquire_lock():
+    """抢并发锁。返回 True=拿到（或平台不支持锁，放行），False=上一轮仍在跑。
+
+    调用方负责决定拿不到时怎么办；本函数不再 sys.exit，以免影响 import 者。"""
+    global _LOCK_FD
     try:
-        msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
-        atexit.register(_cleanup_lock)
-    except OSError:
-        _LOCK_FD.close()
-        _LOCK_FD = None
-        # 检查锁文件是否过期（>5分钟 = 前一轮异常退出）
-        lock_age = (datetime.now() - datetime.fromtimestamp(os.path.getmtime(_LOCK_FILE))).total_seconds() if os.path.exists(_LOCK_FILE) else 0
-        if lock_age < 120:
-            print("ac_watch: 上一轮还在运行，跳过")
-            sys.exit(0)
-        # 锁文件过期 → 覆盖
+        import msvcrt
+    except ImportError:
+        return True          # 非 Windows：不加锁，交给 cron 自身串行
+    try:
         _LOCK_FD = open(_LOCK_FILE, "w")
-        msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
-        atexit.register(_cleanup_lock)
-except Exception:
-    pass  # 锁失败不影响主逻辑
+        try:
+            msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
+            atexit.register(_cleanup_lock)
+            return True
+        except OSError:
+            _LOCK_FD.close()
+            _LOCK_FD = None
+            age = ((datetime.now() - datetime.fromtimestamp(os.path.getmtime(_LOCK_FILE)))
+                   .total_seconds()) if os.path.exists(_LOCK_FILE) else 0
+            if age < _LOCK_STALE_SEC:
+                return False
+            # 锁文件过期（前一轮异常退出没清理）→ 覆盖接管
+            _LOCK_FD = open(_LOCK_FILE, "w")
+            msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
+            atexit.register(_cleanup_lock)
+            return True
+    except Exception:
+        return True          # 锁机制本身故障不该阻断控制逻辑
 
 WATCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_watch.log")
 WATCH_MAX_RUN = 90      # 硬上限，防死锁
@@ -115,6 +131,36 @@ DAY_EXIT_RH_MAX = 62       # 双轴停止 RH 门（须 RH≤62 且 AH 达标；�
 DUAL_STOP_MIN_COMP = 10    # 双轴停止压缩机地板(min)：低于 MIN_RUN 因"目标完成≈安全类"允许早停
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
+
+# ── v8.21 白天短循环根治（2026-08-19，cycle_log 51 周期实测诊断）──
+# 病象：08-18 下午 10 个「12min 开 / 16min 停」周期，一天 15 次启停。
+# 诊断（数据支撑）：
+#   1. 判据错配是根因。这批周期启动时 RH 仅 56-59%，低于 HUM_DEHUMID_ON=65 也低于
+#      谷电线 62 —— 不可能由湿度分支触发，只能是温度分支 temp>=TEMP_COOLING。
+#      即「温度驱动开机，却用湿度(AH<=14.5)判据收手」，一开机 AH 立刻达标，
+#      跑满 10min 地板就停，室温根本没压下去 → 16min 后温度又到 → 循环。
+#   2. 白天无迟滞带，且与夜间不对称：夜间停 AH<=14.0 / 启 AH>=16.0（2.0 闭环同量），
+#      白天停 AH<=14.5 / 启却看 RH 或温度（跨量对比）。实测白天 AH 平均只回升
+#      1.70 g/m3 就重新触发。
+#   3. 原注释「配合 MIN_OFF=30 → 白天最多 ~2 次启动/小时」算错了：第 559 行实走
+#      DAY_MIN_OFF=15，真实下限是 10min 开 + 15min 停 = 2.4 次/小时，与实录 16min
+#      间隔吻合。DUAL_STOP_MIN_COMP=10 事实上架空了 MIN_RUN=40。
+# 对策：温度驱动的周期必须把室温压到目标附近才允许用湿度判据收手；
+#       白天补 AH 迟滞带与夜间对称；并给白天启停次数加显式上限。
+DAY_STOP_AH_HYST = 2.0       # 白天 AH 迟滞带（对齐夜间 2.0）：AH 达标停机后，
+                             # 需回升到 DAY_STOP_AH + 该值才允许湿度分支再开
+DAY_TEMP_REACHED_SLACK = 0.0 # 温度驱动周期的收手条件：室温须真正降到 target 才允许
+                             # 用湿度判据收手。取 0 而非正容差的理由：
+                             #   slack=+1.0 → target=26 时 26.9 就算"达标"，回温 4min
+                             #     即再触发（闭环实测 6h 8 次启停，平均周期仅 16min）
+                             #   slack=+0.5 → 停在 26.5，等于没兑现 26°C 的设定值
+                             #   slack=0.0  → 兑现设定值，理论 ~13 次/12h（+0.5 是 ~17 次）
+                             # 这不是"过冷"：目标本身就是用户/策略选定的舒适温度，
+                             # 降到它才叫达标。再往负走才是拿舒适换启停次数，不做。
+DAY_MAX_STARTS_PER_H = 2     # 白天每小时启动上限（夜间为 4；白天热负荷高但不该抖振）
+DAY_STARTS_OVERRIDE_T = 29.0 # 启停上限的安全阀：室温 >= 该值说明真的热（不是抖振），
+                             # 无条件放行开机。抖振要压，但不能因为"压次数"把人热着——
+                             # 抖振的特征是 26-27°C 反复触发，29°C 是真实热负荷。
 
 # ── v8.19 天气感知：晴天/室外高温提前制冷（用户反馈：阴天调参后晴天觉得热）──
 OUTDOOR_HOT_T = 30           # 室外≥30°C 视为炎热晴天
@@ -338,17 +384,24 @@ def stale_stop_ts(old_ts, run_start_ts):
         return False
 
 
-def open_cycle(state, now_ts, ah, rh):
-    """开机动作(apply+verify 通过)时记录周期开始快照。纯数据层，不影响决策。"""
+def open_cycle(state, now_ts, ah, rh, temp=None, outdoor_temp=None):
+    """开机动作(apply+verify 通过)时记录周期开始快照。纯数据层，不影响决策。
+
+    v8.21 补 temp/outdoor_temp：原先只记 AH/RH，而策略同时按温度和湿度决策，
+    导致温度侧完全无法复盘——诊断 08-18 短循环时只能靠 RH 反推"是温度分支触发的"。
+    有了温度才能回答"这轮到底热不热、压下去了没、舒适度达成了吗"。"""
     state["cycle_start"] = {
         "ts": now_ts,
         "ah": ah,
         "rh": rh,
+        "temp": temp,
+        "outdoor_temp": outdoor_temp,
         "kwh": state.get("estimated_kwh", 0.0) or 0.0,
     }
 
 
-def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_reason=None):
+def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_reason=None,
+                temp=None, outdoor_temp=None):
     """关机动作(apply+verify 通过)时追加一条完整周期记录到 cycle_log.jsonl。
     无 cycle_start（异常/失败路径）→ 不写假周期。append-only，幂等。"""
     cs = state.get("cycle_start")
@@ -367,6 +420,11 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
         if hist[i][1] - hist[i - 2][1] >= 3:
             spike = True
             break
+    # v8.21 占空比自校验：压缩机分钟数不该超过周期时长（实录 3/51 条占空>1，
+    # 最高 2.00——计量 bug 残留）。写盘时标记而非静默，让分析端能剔除脏行。
+    duty = None
+    if dur_min and comp_min is not None and dur_min > 0:
+        duty = round(comp_min / dur_min, 3)
     rec = {
         "start_ts": cs["ts"],
         "end_ts": now_ts,
@@ -374,10 +432,16 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
         "end_AH": ah,
         "start_RH": cs.get("rh"),
         "end_RH": rh,
+        "start_temp": cs.get("temp"),
+        "end_temp": temp,
+        "start_outdoor_temp": cs.get("outdoor_temp"),
+        "end_outdoor_temp": outdoor_temp,
         "target_temp": target_temp,
         "compressor_runtime_min": round(comp_min, 1) if comp_min is not None else None,
         "kwh_used": round(max(0.0, end_kwh - cs.get("kwh", 0.0)), 4),
         "duration_min": dur_min,
+        "duty": duty,
+        "duty_invalid": bool(duty is not None and duty > 1.01),
         "abort_reason": abort_reason,
         "rh_spike": spike,
     }
@@ -388,14 +452,18 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
     return True
 
 
-def handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target, comp_min, path=None, abort_reason=None):
+def handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target,
+                              comp_min, path=None, abort_reason=None,
+                              temp=None, outdoor_temp=None):
     """apply+verify 通过后按动作类型维护周期记录（main 的唯一入口，纯数据层）。
-    开机 → open_cycle；关机 → close_cycle；其余动作 → 不写。"""
+    开机 → open_cycle；关机 → close_cycle；其余动作 → 不写。
+    v8.21：temp/outdoor_temp 透传，补齐温度侧复盘数据。"""
     if new_mode == "cooling" and mode_before != "cooling":
-        open_cycle(state, now_ts, ah, hum)
+        open_cycle(state, now_ts, ah, hum, temp=temp, outdoor_temp=outdoor_temp)
         return True
     if new_mode == "off" and mode_before in ("cooling", "dehumid", "dehumid_alert"):
-        return close_cycle(state, now_ts, ah, hum, running_target, comp_min, path=path, abort_reason=abort_reason)
+        return close_cycle(state, now_ts, ah, hum, running_target, comp_min, path=path,
+                           abort_reason=abort_reason, temp=temp, outdoor_temp=outdoor_temp)
     return False
 
 
@@ -502,15 +570,23 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
         # v8.16 白天双轴停止（AH+RH）：低热负荷时段 RH 单轴会拖到过冷逃生门才停
         # （2026-08-16 16:30 周期实录：AH 6min 即到 14.0，T 却在 12min 冲到 23°C 触发逃生门）。
-        # AH=真实含水量，达标即收手，室温可停在 25°C 而不是吹到 23°C；
-        # 自带 10min 压缩机地板（低于 MIN_RUN：AH 达标≈目标完成，类比安全类早停，
-        # 配合 MIN_OFF=30 → 白天最多 ~2 次启动/小时，远低于夜间上限 4 次）。
+        # AH=真实含水量，达标即收手，室温可停在 25°C 而不是吹到 23°C。
         # v8.18：晚间巡航时豁免舒适类停止（双轴/RH达标/无效判定）——巡航目标是恒温，
         # 只保留安全类（过冷逃生门/白天过冷保护/传感器失效），除湿收手逻辑留给日/夜模式
+        #
+        # v8.21 补温度达标前置（修短循环根因）：AH 达标只说明"不潮"，不说明"不热"。
+        # 若本周期是温度驱动开的（室温还在目标之上），AH 一达标就停会让室温原地不动，
+        # 十几分钟后温度再次触发 → 抖振。故要求室温已降到 target+SLACK 以内才允许
+        # 用湿度判据收手；否则交给下方 MIN_RUN 守卫继续跑，真正把温度压下去。
+        # 拿不到 current_target 时退化为旧行为（宁可早停也不要因缺参数一直吹）。
         if (not is_night and not evening and ah is not None and hum <= DAY_EXIT_RH_MAX
                 and ah <= DAY_STOP_AH
                 and comp_min is not None and comp_min >= DUAL_STOP_MIN_COMP):
-            return ("off", None, f"含水量已达标（AH={ah:.1f}，RH={hum:.0f}%），关机防过冷")
+            temp_reached = (current_target is None
+                            or temp <= current_target + DAY_TEMP_REACHED_SLACK)
+            if temp_reached:
+                return ("off", None, f"含水量已达标（AH={ah:.1f}，RH={hum:.0f}%），关机防过冷")
+            # 温度未达标：不收手，落到 MIN_RUN 守卫继续制冷（避免"除湿达标但还热"的抖振）
 
         # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
         if comp_min is not None and comp_min < A.MIN_RUN:
@@ -555,7 +631,10 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         return (None, None, None)
 
     # ── 未运行 ──
-    # 白天/夜间用不同 MIN_OFF：白天温度回升快，15min 即可；夜间保持 30min 防短循环
+    # 白天/夜间用不同 MIN_OFF：白天温度回升快，15min 即可；夜间保持 30min 防短循环。
+    # 注意：白天 DAY_MIN_OFF=15 + DUAL_STOP_MIN_COMP=10 → 理论最快 25min 一轮 =
+    # 2.4 次/小时（旧注释误称"配合 MIN_OFF=30 → ~2 次/小时"，算错了基数）。
+    # 真正的抖振闸门是 v8.21 的 DAY_MAX_STARTS_PER_H，不要指望 MIN_OFF 兜住。
     effective_min_off = A.MIN_OFF if is_night else A.DAY_MIN_OFF
     if since_off is not None and since_off < effective_min_off:
         return (None, None, None)
@@ -570,6 +649,15 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                 and temp - night_target >= 1):
             return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
         return (None, None, None)
+
+    # ── v8.21 白天启停次数上限：抖振时直接不开，等热负荷真正累积起来 ──
+    # 白天上限 2 次/小时（夜间 4）。定频机每次启动都有浪涌且头几分钟无有效制冷，
+    # 08-18 实录 15 次/天（下午 10 次 12min 周期）纯属做无用功。
+    # 安全阀：室温 >= DAY_STARTS_OVERRIDE_T 时无条件放行——抖振的特征是 26-27°C
+    # 反复触发，29°C 是真实热负荷，压次数不能压到把人热着。
+    if (night_comp_starts and len(night_comp_starts) >= DAY_MAX_STARTS_PER_H
+            and temp < DAY_STARTS_OVERRIDE_T):
+        return (None, None, None)
     # v8.19 天气感知制冷启动：室外炎热(≥30°C)时启动阈值 28→27，提前开别等太热
     eff_cool = A.TEMP_COOLING
     if outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T:
@@ -583,7 +671,14 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度{wx_note}")
     # v8.14 E 方案（谷电积极版）：22-6 谷电半价 → 除湿启动阈值 65→62 更早压湿；
     # 峰电维持原阈值不推迟（保舒适，不牺牲体验）
+    #
+    # v8.21 补 AH 迟滞带（与夜间对称）：白天原先停看 AH<=14.5、启看 RH，跨量对比等于
+    # 没有迟滞——实测 AH 平均只回升 1.70 就重新触发。夜间是停 AH<=14.0 / 启 AH>=16.0
+    # 的 2.0 闭环同量迟滞。这里要求 AH 真正回升过迟滞线才允许湿度分支重开。
+    # 只挡湿度分支：温度分支（上方 temp>=eff_cool）属"热了就该开"，不能被湿度迟滞拦住。
     if temp >= A.TEMP_DEHUMID_LOW and hum >= (VALLEY_START_RH if A.current_price() < A.ELECTRIC_PEAK else A.HUM_DEHUMID_ON):
+        if ah is not None and ah < DAY_STOP_AH + DAY_STOP_AH_HYST:
+            return (None, None, None)
         return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度强力除湿")
     # v8.18 晚间恒温巡航：温度优先（闷热除湿分支在上方先判，RH≥65/62 仍走深除）
     if evening and temp >= EVENING_START_T:
@@ -757,12 +852,12 @@ def main():
         state["last_compressor_start_at"] = now_ts
         # 压缩机启动 → 清空假运行计数器
         state["_fake_run_count"] = 0
-        # 夜间压缩机启动次数跟踪（用于 NIGHT_MAX_STARTS_PER_H）
-        if night_hours(now_dt):
-            starts = state.get("_night_comp_starts", [])
-            starts.append(now_ts)
-            cutoff = (now_dt - timedelta(hours=1)).isoformat(timespec="seconds")
-            state["_night_comp_starts"] = [s for s in starts if s >= cutoff]
+        # 压缩机启动次数跟踪（1h 滑窗）。v8.21：原先只在夜间记，导致白天无从判断
+        # 抖振；改为全天记录，夜间用 NIGHT_MAX_STARTS_PER_H、白天用 DAY_MAX_STARTS_PER_H。
+        starts = state.get("_night_comp_starts", [])
+        starts.append(now_ts)
+        cutoff = (now_dt - timedelta(hours=1)).isoformat(timespec="seconds")
+        state["_night_comp_starts"] = [s for s in starts if s >= cutoff]
     elif comp == "fan_only" and state_comp_before == "compressor":
         state["last_compressor_stop_at"] = now_ts
         last_comp_stop = now_ts
@@ -925,7 +1020,9 @@ def main():
             state["cycle_comp_total"] = 0
             state["compressor_on_min"] = 0
             state.pop("compressor_on_since", None)
-        handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target, comp_min_at_apply, abort_reason=reason)
+        handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target,
+                                  comp_min_at_apply, abort_reason=reason,
+                                  temp=temp, outdoor_temp=_outdoor_t)
         state.pop("manual_off_at", None)
         A.save_state(state)
         # 换气提醒
@@ -1070,6 +1167,11 @@ def _selftest():
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
+        # selftest 是纯函数验证，不碰硬件也不写状态 → 不抢锁，
+        # 否则紧接 cron 一轮运行时会"跳过"并 exit 0，造成假通过。
         _selftest()
     else:
+        if not acquire_lock():
+            print("ac_watch: 上一轮还在运行，跳过")
+            sys.exit(0)
         main()
