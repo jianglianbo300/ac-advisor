@@ -107,8 +107,26 @@ LEARN_FILE = os.path.join(SCRIPT_DIR, "ac_learned.json")
 ERR_STATE_FILE = os.path.join(SCRIPT_DIR, "vent_error_state.json")
 
 # -- Weather API (QW CMA) --
-QW_HOST = "kf54e6wb7f.re.qweatherapi.com"
-QW_KEY = "e630a3166d6f4146be43fa822cea63a1"
+# Forecast (temp/humidity/precip/wind) comes from QW CMA = China Meteorological
+# Administration data. Only PM2.5 uses Open-Meteo. fetch_weather() emits an
+# Open-Meteo compatible shape, hence the temperature_2m style field names
+# downstream - the data itself is QW.
+def _load_env():
+    """Read .env next to this script (gitignored); keys stay out of the source."""
+    f = os.path.join(SCRIPT_DIR, ".env")
+    try:
+        for line in open(f, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+_load_env()
+QW_HOST = os.environ.get("QW_HOST", "kf54e6wb7f.re.qweatherapi.com")
+QW_KEY = os.environ.get("QW_API_KEY", "")
 
 # -- Measured power globals --
 AC_MEASURED_W = None
@@ -530,7 +548,13 @@ def weather_cn(code):
 
 
 def _qw_get(endpoint: str) -> dict:
-    """Call QW API v2, auto-decompress gzip, return JSON."""
+    """Call QW API v2, auto-decompress gzip, return JSON.
+
+    Raises when the key is missing instead of returning empty: fetch_weather
+    turns it into {"error": ...} and every caller already has a degraded path,
+    so a missing .env degrades the forecast without stopping AC control."""
+    if not QW_KEY:
+        raise RuntimeError("QW_API_KEY not configured (expected in .env next to this script)")
     url = f"https://{QW_HOST}/weather/v1/{endpoint}/{LAT}/{LON}"
     req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
     resp = urllib.request.urlopen(req, timeout=15)

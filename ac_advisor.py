@@ -452,13 +452,38 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "ac_state.json")
 
 # ── 天气 API（和风天气 CMA 数据源） ────────
+# 预报（温湿度/降水/风）走和风 CMA = 中国气象局官方数据；只有 PM2.5 用 Open-Meteo。
+# fetch_weather() 输出 Open-Meteo 兼容格式，所以下游字段名是 temperature_2m 等，
+# 但数据来自和风——改数据源时记得同时改用户可见落款。
 LAT, LON = 31.11, 121.38
-QW_HOST = "kf54e6wb7f.re.qweatherapi.com"
-QW_KEY = "e630a3166d6f4146be43fa822cea63a1"
+
+
+def _load_env():
+    """读取同目录 .env（git 已忽略），key 不硬编码在代码里"""
+    f = os.path.join(SCRIPT_DIR, ".env")
+    try:
+        for line in open(f, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+
+
+_load_env()
+QW_HOST = os.environ.get("QW_HOST", "kf54e6wb7f.re.qweatherapi.com")
+QW_KEY = os.environ.get("QW_API_KEY", "")
+
 
 def _qw_get(endpoint: str) -> dict:
-    """调用和风天气 API v2，自动解 gzip，返回 JSON"""
+    """调用和风天气 API v2，自动解 gzip，返回 JSON。
+
+    缺 key 时抛异常而非静默返回空：fetch_weather 会捕获成 {"error": ...}，
+    调用方（main / decide 链）已有降级分支，空调控制不会因此中断。"""
     import gzip
+    if not QW_KEY:
+        raise RuntimeError("QW_API_KEY 未配置（应放在同目录 .env）")
     url = f"https://{QW_HOST}/weather/v1/{endpoint}/{LAT}/{LON}"
     req = urllib.request.Request(url, headers={"X-QW-Api-Key": QW_KEY, "Accept-Encoding": "identity"})
     resp = urllib.request.urlopen(req, timeout=15)
