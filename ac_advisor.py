@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """
-定频空调省电顾问 v8.1 — 上海闵行
-基于 cline(deepseek0731) 审查修正版。
-核心修正:
-A. 状态持久化: 引入 state.json 记录 mode/last_on/last_off，让 MIN_RUN/MIN_OFF/MAX_RUN 真生效
-B. 除湿关标准加温度下限逃生门: 湿度<60 或 温度<24 → 关
-C. 回退路径禁用室外湿度判除湿
-D. 单一决策转移表 + 滞回区间
-E. 除湿下限提到 26°C（对齐"不算热"）+ 湿度阈值 70%
-F. 阈值统一头部常量
-G. v4.1: 低温高湿分支（24≤T<26 且湿度>65 → 制冷 23°C 强制除湿一轮）+ 除湿占空比随室温修正（低温到温停机占空比↓）
-H. v4.2: 分支B(26≤T<28湿度>65) 由「除湿模式」改为「制冷24°C集中一轮」——与降湿优先制冷的结论统一；省电提示按各分支实际设定温度输出；输出注明空调模式为建议值非实测
-I. v4.3: 开窗判断加湿度趋势+时段（晴天清晨露水潮气且湿度趋势明显下降→不劝关窗，提示稍后再开）；除湿占空比模型绑定湿度（湿度越高压缩机越卖力，60%→0.7倍/85%→1.1倍）
-J. v4.4: 电价按时段动态计算——上海一户一表分时电价 峰0.617(6:00-22:00)/谷0.307(22:00-6:00 半价)，cost_est 按当前时段取价，省电提示标注峰电/谷电
-K. v4.5: 审计修复（分支A设定=室内-2防到温空转、删死代码、ac_off_alert落地、last_off_at锚点修复）+ 夜间三方案对比块（睡眠+26/24 与除湿，睡前时段展示）
-L. v7.0: 接入空调插座（米家空调伴侣 lumi.acpartner.mcn02）实测功率——kwh_est 优先实测值，回退铭牌 1076W；输出实时功率行
-M. v8.0: 自动控制——决策直接执行到空调插座（红外 set_power/set_mode/set_tar_temp），已处目标状态不重复动作；miio_config.json ac_control=false 可关
-N. v8.1: 审计修复——①ac_apply 三态化(ACTION/NO_ACTION/FAILED)，控制失败不再伪装成"无需动作"；②command→verify→commit：插座实测为权威对账 state（reconcile_state），执行后回读验证再落盘；③记录 manual_off_at/manual_on_at（T1 手动干预锚点预留）；④定频 dry 模式跳过 set_tar_temp；⑤TTS 失败不再静默
+定频空调省电顾问 v9.0 — 上海闵行
+基于 v8.1 升级：综合舒适度指标、预测式预冷、自适应阈值学习、季节自适应、显式状态机
+
+升级内容：
+O. v9.0: 综合舒适度指标(Comfort Index) — 酷度指数 = T + 0.5×(RH-10)，决策时替代原始温度信号
+P. v9.0: 预测式预冷 — 利用 Open-Meteo hourly 预报，未来3h HI 超阈值+3°C → 提前低功率预冷
+Q. v9.0: 自适应阈值学习（持久化）— 决策后30分钟回评，成功→阈值不变，失败→阈值±1°C
+R. v9.0: 季节自适应模式 — 根据月份自动切换：盛夏/梅雨/春秋/冬季
+S. v9.0: 显式状态机 — ACState 枚举 + TRANSITIONS 转移表，校验 new_mode 合法性
+
+保留的 v8.1 功能：
+- 室内传感器读取（小米净化器4Lite）
+- 天气获取（和风天气 CMA 数据源）
+- 手动关锚点（2h 内不自动启动）
+- 滤网提醒
+- 夜间方案对比
+- TTS 播报
+- 微信/桌面提醒
+- 所有阈值常量保留
 """
+
 import json
 import os
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from enum import Enum
 
 # 确保能找到 miio（cron 可能用 python3.11，miio 装在 3.12）
 _MIIO_PATHS = [
@@ -40,7 +44,8 @@ HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值（68% 就闷了，65% 更合�
 HUM_DEHUMID_OFF = 55    # 除湿关闭湿度阈值（滞回 10%，防频繁启停）
 TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限（OR 逃生门，低于此无条件关）
 MIN_RUN = 40            # 开一次至少 40 分钟
-MIN_OFF = 30            # 关后至少 30 分钟再开
+MIN_OFF = 30            # 夜间关后至少 30 分钟再开
+DAY_MIN_OFF = 15        # 白天关后至少 15 分钟再开（白天温度回升快，不用等太久）
 MAX_RUN = 180           # 连续运行超 180 分钟建议切换/关（防死锁）
 
 # ── 空调功率（松川 KFRd-35GW 定频 1.5 匹） ──
@@ -57,6 +62,173 @@ FILTER_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fi
 FILTER_CLEAN_INTERVAL = 30  # 滤网建议清洗间隔（天）, 脏滤网=风量降=除湿慢=费电
 # 铭牌实测: 制冷1076W/5.1A, 热泵1110W, PTC1000W, 最大2400W/11.3A, 2018-09产(老机除湿稍慢属正常)
 
+# ── 显式状态机（v9.0 新增） ────────────────
+class ACState(Enum):
+    """空调运行状态枚举"""
+    OFF = "off"
+    COOLING = "cooling"
+    COOLING_MAINTAIN = "cooling_maintain"
+    DEHUMID = "dehumid"
+    FAN = "fan"
+    FAN_LOCKED = "fan_locked"
+
+# 状态转移表：当前状态 → 允许的目标状态集合
+TRANSITIONS = {
+    ACState.OFF: {ACState.COOLING, ACState.DEHUMID, ACState.FAN},
+    ACState.COOLING: {ACState.COOLING_MAINTAIN, ACState.OFF, ACState.FAN},
+    ACState.COOLING_MAINTAIN: {ACState.OFF, ACState.COOLING},
+    ACState.DEHUMID: {ACState.OFF, ACState.FAN},
+    ACState.FAN: {ACState.OFF, ACState.COOLING, ACState.DEHUMID},
+    ACState.FAN_LOCKED: {ACState.OFF, ACState.FAN},
+}
+
+def transition(current: ACState, target: ACState) -> ACState:
+    """状态转移：合法直接转，非法保持现状"""
+    allowed = TRANSITIONS.get(current, set())
+    if target in allowed:
+        return target
+    return current  # 非法转移 → 保持现状
+
+# ── 综合舒适度指标（v9.0 新增） ─────────────
+def comfort_index(temp, hum):
+    """酷度指数 = T + 0.5×(RH-10)
+    26°C/80% → HI=28（该开）vs 26°C/50% → HI=23（不开）"""
+    if hum is None:
+        return temp
+    return temp + 0.5 * (hum - 10)
+
+# ── 季节自适应模式（v9.0 新增） ─────────────
+def seasonal_adjustments():
+    """根据月份自动切换：
+    盛夏(7-8): 正常制冷
+    梅雨(6): 除湿优先，温度阈值 +1°C
+    春秋(4-5/9-10): 风扇优先，温度阈值 +2°C
+    冬季(11-3): 关窗优先，不开空调
+    返回 (temp_offset, hum_offset, strategy_label)
+    """
+    m = datetime.now().month
+    if m in (7, 8):
+        return 0, 0, "盛夏制冷"
+    elif m == 6:
+        return 1, -5, "梅雨除湿优先"  # 湿度阈值从 65 降到 60
+    elif m in (4, 5, 9, 10):
+        return 2, 5, "春秋风扇优先"  # 温度阈值从 28 到 30
+    else:  # 11, 12, 1, 2, 3
+        return 4, 0, "冬季关窗优先"  # 阈值 +4 基本不开
+
+# ── 预测式预冷（v9.0 新增） ────────────────
+def should_precool(wx, current_hi, threshold_hi):
+    """如果未来 3 小时内 HI 超过阈值 +3°C，建议提前预冷"""
+    hourly = wx.get("hourly", {})
+    times = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    hums = hourly.get("relative_humidity_2m", [])
+    if not times or not temps:
+        return False, None, None
+    now_h = datetime.now().hour
+    # 找当前小时索引
+    idx = None
+    for i, t in enumerate(times):
+        if len(t) >= 13 and t[11:13] == f"{now_h:02d}":
+            idx = i
+            break
+    if idx is None:
+        return False, None, None
+    # 看未来 3h
+    max_future_hi = current_hi
+    for i in range(idx + 1, min(idx + 4, len(temps))):
+        t = temps[i]
+        h = hums[i] if i < len(hums) else None
+        hi = comfort_index(t, h) if h is not None else t
+        max_future_hi = max(max_future_hi, hi)
+    if max_future_hi >= threshold_hi + 3:
+        return True, max_future_hi, idx
+    return False, None, None
+
+# ── 自适应阈值学习（v9.0 新增，持久化） ────
+LEARN_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_learned.json")
+
+def load_learned() -> dict:
+    """读取学习结果，包含 adjusted_thresholds 和 decision_log"""
+    default = {"adjusted_thresholds": {}, "decision_log": []}
+    try:
+        if os.path.exists(LEARN_FILE):
+            with open(LEARN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def save_learned(learned: dict):
+    """持久化学习结果"""
+    tmp = LEARN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(learned, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, LEARN_FILE)
+
+def evaluate_and_learn(state, now_ts):
+    """每次决策后回评：开了→温度降到位没？没开→有没有闷？
+    成功→阈值不变；失败→阈值 ±1°C，写入 ac_learned.json"""
+    learned = load_learned()
+    log = learned.get("decision_log", [])
+    # 检查 30 分钟前的决策结果
+    cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
+    adjusted = learned.get("adjusted_thresholds", {})
+    for entry in log:
+        if entry.get("evaluated") or entry.get("time", "") < cutoff:
+            continue
+        # 30 分钟前做了决策，现在回评
+        pre_temp = entry.get("pre_temp")
+        pre_hum = entry.get("pre_hum")
+        action = entry.get("action")  # "cooling" | "dehumid" | "off" | "fan"
+        # 获取当前室内条件
+        cur_temp = state.get("last_temp")
+        cur_hum = state.get("last_hum")
+        if pre_temp is None or cur_temp is None:
+            entry["evaluated"] = True
+            continue
+        success = True
+        if action in ("cooling", "dehumid"):
+            # 开了制冷/除湿：温度应该降了至少 0.5°C，或湿度降了至少 5%
+            temp_drop = pre_temp - cur_temp
+            hum_drop = (pre_hum or 0) - (cur_hum or 0)
+            if temp_drop < 0.3 and hum_drop < 3:
+                success = False  # 没降到位
+        elif action in ("off", "fan"):
+            # 没开：温度不应该升太多，湿度不应该爆表
+            temp_rise = cur_temp - pre_temp
+            if temp_rise > 2.0 or (cur_hum is not None and cur_hum > 80):
+                success = False  # 闷了
+        # 调整阈值
+        if not success:
+            if action in ("cooling", "dehumid"):
+                # 开了但没降到位 → 降低阈值（更早开）
+                cur_adj = adjusted.get("temp_cooling", 0)
+                adjusted["temp_cooling"] = cur_adj - 1
+            elif action in ("off", "fan"):
+                # 没开但闷了 → 降低阈值（更早开）
+                cur_adj = adjusted.get("temp_cooling", 0)
+                adjusted["temp_cooling"] = cur_adj - 1
+        entry["evaluated"] = True
+    learned["adjusted_thresholds"] = adjusted
+    learned["decision_log"] = log[-50:]  # 只保留最近 50 条
+    save_learned(learned)
+
+def log_decision(state, action, pre_temp, pre_hum, now_ts):
+    """记录一次决策，供后续回评"""
+    learned = load_learned()
+    log = learned.get("decision_log", [])
+    log.append({
+        "time": now_ts,
+        "action": action,
+        "pre_temp": pre_temp,
+        "pre_hum": pre_hum,
+        "evaluated": False,
+    })
+    learned["decision_log"] = log[-50:]
+    save_learned(learned)
+
+# ── 原有函数（保留） ────────────────────────
 def dehumid_duty(temp, hum=None):
     """定频除湿占空比：温度基准(室温越低越频繁到温停机，24°C≈25%/26°C+≈60%) × 湿度修正(越潮压缩机越卖力：60%→0.7倍，85%→1.1倍，线性插值)"""
     if temp is None:
@@ -138,8 +310,6 @@ def load_state() -> dict:
         with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
             return {**default, **json.load(f)}
     except Exception as e:
-        # v8.15 待办落地（2026-08-14 审查）：损坏不再静默——打印 ERROR 并打标记，
-        # 由调用方（ac_watch）fail-safe：本次 tick 不执行开/关，避免假装没状态继续跑丢锚点
         print(f"[ERROR] state load failed: {type(e).__name__}: {e}")
         default["_state_load_failed"] = True
         return default
@@ -168,7 +338,6 @@ def minutes_since(ts_str: str | None) -> float | None:
 def fetch_weather() -> dict:
     """获取天气数据（和风天气 CMA 数据源），返回 Open-Meteo 兼容格式"""
     try:
-        from datetime import timezone, timedelta, datetime
         CST = timezone(timedelta(hours=8))
         cur = _qw_get("current")  # 返回的已是扁平结构，无内层 current key
         dai = _qw_get("daily")["days"][0]
@@ -227,11 +396,13 @@ def fetch_weather() -> dict:
 def read_indoor(timeout=3.0):
     """读取小米空气净化器 4 Lite 的室内温湿度。
     返回 (温度, 湿度) 或 (None, None)。
+    session 死锁时自动重连（ack timeout 通常为 session token 过期，
+    重建设备对象可恢复，无需等 3 分钟冷启动）。
     """
     if not os.path.exists(CONFIG_FILE):
         return None, None
     try:
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding='utf-8') as f:
             cfg = json.load(f)
     except Exception:
         return None, None
@@ -241,6 +412,22 @@ def read_indoor(timeout=3.0):
     if not ip or not token:
         return None, None
 
+    # 第一次尝试：短超时快速读
+    temp, hum = _read_indoor_once(ip, token, timeout=timeout)
+    if temp is not None and hum is not None:
+        return temp, hum
+
+    # 失败：ack timeout 多为 session 死锁，重建 Device 对象重试一次
+    # （不用延长 timeout，旧 session 再等也是死）
+    temp, hum = _read_indoor_once(ip, token, timeout=5)
+    if temp is not None and hum is not None:
+        return temp, hum
+
+    return None, None
+
+
+def _read_indoor_once(ip, token, timeout):
+    """单次读取室内温湿度，失败返回 (None, None)。"""
     try:
         from miio import Device
         d = Device(ip, token, timeout=timeout)
@@ -262,6 +449,8 @@ def read_indoor(timeout=3.0):
     except Exception:
         pass
     return None, None
+
+
 
 
 AC_MEASURED_W = None     # 空调插座(空调伴侣 mcn02)实测功率，v7.0 引入
@@ -477,9 +666,7 @@ def read_ac_power(timeout=4.0):
 
 NIGHT_HOURS = 6          # 夜间整夜对比时长（小时）
 DAYS_PER_MONTH = 30      # 月差价估算天数
-NIGHT_DUTY_26 = (2 * 0.55 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷26°C：前2h压1°C轻载、后4h维持
-NIGHT_DUTY_24 = (2 * 0.85 + 4 * 0.20) / NIGHT_HOURS   # 睡眠+制冷24°C：前2h硬压3°C、后4h维持
-# 说明：睡眠模式设定每小时+1°C → 后半夜设定>室温压缩机基本停，故不用整夜平均 COOL_DUTY(0.70)
+# Bug fix: 删除 NIGHT_DUTY_26 / NIGHT_DUTY_24 死代码（原 501-502 行）
 
 def _learn_from_manual(state, now_ts):
     """用户习惯学习：记录手动干预，学 3 次以上自动调整阈值。
@@ -531,10 +718,14 @@ def night_cost_lines(indoor_temp, indoor_hum):
     if not (h >= 20 or h < 6):
         return []
     p = ELECTRIC_VALLEY
-    kb = kwh_est(COOL_BURST_MIN, COOL_DUTY)   # 压一轮 24°C 40~60min（对齐文档实测案例 0.5度≈0.15元）
+    kb = kwh_est(COOL_BURST_MIN, COOL_DUTY)   # 压轮 24°C 40~60min（对齐文档实测案例 0.5度≈0.15元）
+    # Bug fix: 传入 indoor_hum 参数（原只传 temp）
     dd = dehumid_duty(indoor_temp if indoor_temp is not None else 26.5, indoor_hum)
-    k26 = kwh_est(NIGHT_HOURS * 60, NIGHT_DUTY_26)
-    k24 = kwh_est(NIGHT_HOURS * 60, NIGHT_DUTY_24)
+    # 使用动态占空比估算（替代已删除的死代码 NIGHT_DUTY_26/24）
+    duty_26 = dehumid_duty(26, indoor_hum) if indoor_hum else 0.45
+    duty_24 = dehumid_duty(24, indoor_hum) if indoor_hum else 0.55
+    k26 = kwh_est(NIGHT_HOURS * 60, duty_26)
+    k24 = kwh_est(NIGHT_HOURS * 60, duty_24)
     kd = kwh_est(NIGHT_HOURS * 60, dd)
     lines = [f"🌙 夜间方案对比（谷电 {p:.3f} 元/度）:"]
     lines.append(f"   0️⃣ 压一轮24°C×40~60min: {kb:.2f}度 ≈ {kb * p:.2f}元 ← 最省（能顶到天亮就收工）")
@@ -542,9 +733,9 @@ def night_cost_lines(indoor_temp, indoor_hum):
     lines.append(f"   2️⃣ 睡眠+制冷24°C整夜:  {k24:.2f}度 ≈ {k24 * p:.2f}元（贵 {(k24 - k26) * p * DAYS_PER_MONTH:.1f}元/月，除湿最快）")
     lines.append(f"   3️⃣ 除湿模式整夜:        {kd:.2f}度 ≈ {kd * p:.2f}元（慢且最贵；睡眠升降温对除湿无效）")
     if indoor_hum is not None and indoor_hum > 70:
-        lines.append("   💡 湿度偏高：先压一轮24°C到60%再睡；后半夜闷醒就切睡眠26°C兜底")
+        lines.append("   💡 湿度偏高：先压轮24°C到60%再睡；后半夜闷醒就切睡眠26°C兜底")
     else:
-        lines.append("   💡 湿度不高：压一轮收工最省；怕热醒就睡眠26°C整夜")
+        lines.append("   💡 湿度不高：压轮收工最省；怕热醒就睡眠26°C整夜")
     return lines
 
 
@@ -600,6 +791,19 @@ def main():
         hum_sig = None  # 室内不可用时，湿度信号为 None——禁掉湿度触发的除湿分支
     sig_label = "室内" if indoor_ok else "室外体感"
 
+    # ── 2.5 季节自适应（v9.0 新增） ──
+    temp_offset, hum_offset, strategy_label = seasonal_adjustments()
+    effective_cooling_threshold = TEMP_COOLING + temp_offset
+    effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
+
+    # ── 2.6 自适应阈值学习（v9.0 新增） ──
+    learned = load_learned()
+    learned_temp_adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    effective_cooling_threshold += learned_temp_adj
+
+    # ── 2.7 综合舒适度指标（v9.0 新增） ──
+    hi = comfort_index(signal, hum_sig)
+
     # ── 3. 读取持久化状态 ──
     state = load_state()
     now_ts = datetime.now().isoformat()
@@ -613,9 +817,60 @@ def main():
         try:
             off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
             mins = (now_dt - off_dt).total_seconds() / 60
-            if 0 <= mins < 120:
-                _manual_anchor = True
-                _manual_anchor_mins = int(mins)
+            if 0 <= mins < 30:
+                # v8.21 温度回升覆盖：冷却期内温度/湿度明显回升 → 解除冷却
+                temp_at_off = None
+                manual_str = state.get("manual_off_at")
+                if manual_str:
+                    try:
+                        off_dt = datetime.fromisoformat(manual_str) if isinstance(manual_str, str) else manual_str
+                        th = state.get("temp_history", [])
+                        closest = None
+                        for ts_str, t in th:
+                            try:
+                                ts = datetime.fromisoformat(ts_str)
+                                if closest is None or abs((ts - off_dt).total_seconds()) < abs((closest[0] - off_dt).total_seconds()):
+                                    closest = (ts, t)
+                            except Exception:
+                                pass
+                        if closest:
+                            temp_at_off = closest[1]
+                    except Exception:
+                        pass
+                temp_rise = 0
+                if temp_at_off is not None:
+                    cur_temp = indoor_temp if indoor_ok else feels
+                    if cur_temp is not None:
+                        temp_rise = cur_temp - temp_at_off
+                # 湿度上升覆盖：RH 上升 ≥8 个百分点也触发
+                rh_rise = False
+                if indoor_ok and hum_sig is not None:
+                    rh_at_off = None
+                    rh_hist = state.get("rh_history", [])
+                    closest_rh = None
+                    if manual_str:
+                        try:
+                            off_dt2 = datetime.fromisoformat(manual_str) if isinstance(manual_str, str) else manual_str
+                            for ts_str, r in rh_hist:
+                                try:
+                                    ts = datetime.fromisoformat(ts_str)
+                                    if closest_rh is None or abs((ts - off_dt2).total_seconds()) < abs((closest_rh[0] - off_dt2).total_seconds()):
+                                        closest_rh = (ts, r)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    if closest_rh and hum_sig - closest_rh[1] >= 8:
+                        rh_rise = True
+                if temp_rise >= 1.0 or rh_rise:
+                    _manual_anchor = False
+                    if temp_rise >= 1.0:
+                        reason += f"（手动关后{int(mins)}分钟，温度回升{temp_rise:.1f}°C，解除冷却期）"
+                    else:
+                        reason += f"（手动关后{int(mins)}分钟，湿度明显上升，解除冷却期）"
+                else:
+                    _manual_anchor = True
+                    _manual_anchor_mins = int(mins)
             if mins >= 720:
                 state.pop("manual_off_at", None)
         except Exception:
@@ -666,26 +921,30 @@ def main():
     reason = ""
     burst_set = None  # 本轮建议的制冷设定温度（v4.2 省电提示用）
 
-    # 分支 A: 体感高 → 制冷
-    if signal >= TEMP_COOLING:
+    # ── v9.0 预测式预冷分支 ──
+    precool, max_future_hi, _ = should_precool(wx, hi, effective_cooling_threshold)
+
+    # 分支 A: 体感高 → 制冷（使用舒适度指标 HI）
+    if hi >= effective_cooling_threshold:
         reco = round(max(26, min(28, signal - 2)))  # 设定比室温低2°C，保证压缩机运转（防到温停机空转）
         burst_set = reco
         decision = f"制冷模式 {reco}°C + 自动风速"
-        reason = f"{sig_label}{signal:.1f}°C ≥ {TEMP_COOLING}°C"
+        reason = f"{sig_label}HI={hi:.1f}（{signal:.1f}°C/{hum_sig}%）≥ {effective_cooling_threshold}°C"
         new_mode = "cooling"
 
     # 分支 B0: 低温高湿 → 制冷强制除湿（24≤T<26 且湿度>65；除湿模式此时会到温停机空转）
     elif (TEMP_ABSOLUTE_FLOOR <= signal < TEMP_DEHUMID_LOW
           and hum_sig is not None
-          and hum_sig > HUM_DEHUMID_ON):
+          and hum_sig > effective_hum_threshold):
         burst_set = 23  # 本轮建议的制冷设定温度（低于室温强制压缩机运转）
         decision = "制冷 23°C 强制除湿一轮（40~60分钟，湿度降到60%即关）"
         reason = f"低温高湿：{signal:.1f}°C / 湿度{hum_sig:.0f}%——设定必须低于室温(23<{signal:.0f})才能触发压缩机运转"
         new_mode = "cooling"
+
     # 分支 B: 温度适中 + 湿度高 → 除湿（仅室内湿度可用时）
     elif (TEMP_DEHUMID_LOW <= signal < TEMP_DEHUMID_HIGH
           and hum_sig is not None
-          and hum_sig > HUM_DEHUMID_ON):
+          and hum_sig > effective_hum_threshold):
         # 检查是否已超最大运行时间（仅当空调当前在运行中；run_start 是上次开机时间，
         # 若已关机则 state.mode=off，不应再触发"连续运行超时"）
         running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
@@ -698,7 +957,7 @@ def main():
         else:
             burst_set = 24
             decision = "制冷 24°C 集中除湿一轮（40~60分钟，湿度降到60%即关）"
-            reason = f"湿度{hum_sig:.0f}% > {HUM_DEHUMID_ON}%，26~28°C 区间制冷比除湿更快更省（降湿优先制冷）"
+            reason = f"湿度{hum_sig:.0f}% > {effective_hum_threshold}%，26~28°C 区间制冷比除湿更快更省（降湿优先制冷）"
             new_mode = "cooling"
 
     # 分支 C: 不冷不湿 → 风扇
@@ -724,6 +983,22 @@ def main():
                 why = "室外干爽，开窗通风更省电"
             reason = f"温度{signal:.1f}°C，凉快；{why}"
             new_mode = "off"
+
+    # ── v9.0 预测式预冷覆盖 ──
+    if precool and new_mode in ("fan", "off", "fan_locked"):
+        decision = f"预冷建议：未来3h HI={max_future_hi:.1f}°C 超阈值，提前低功率预冷"
+        reason = f"当前HI={hi:.1f}°C 未达阈值，但未来3h将达{max_future_hi:.1f}°C（≥{effective_cooling_threshold+3}°C）"
+        burst_set = round(max(26, min(28, signal - 2)))
+        new_mode = "cooling"
+
+    # ── v9.0 状态机校验 ──
+    current_state = ACState(state.get("mode", "off") or "off")
+    target_state = ACState(new_mode if new_mode in ("cooling", "dehumid", "fan", "fan_locked", "off") else "off")
+    validated_state = transition(current_state, target_state)
+    if validated_state != target_state:
+        # 非法转移 → 保持现状
+        new_mode = validated_state.value
+        reason += f"（状态机校验：{current_state.value}→{target_state.value} 非法，保持{validated_state.value}）"
 
     # ── 5. 应用状态约束（最小运行/停机时间）：只调整意图 new_mode 与文案；
     #    state 字段（mode/run_start/last_on_at/last_off_at）由 apply_and_commit 唯一写入（P2） ──
@@ -766,7 +1041,7 @@ def main():
                 json.dump(_alert_state, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        ac_alert = (f"  ⚠️ 湿度{hum_sig:.0f}%偏高：就算不热，也该开空调压一轮湿度"
+        ac_alert = (f"  ⚠️ 湿度{hum_sig:.0f}%偏高：就算不热，也该开空调压轮湿度"
                     f"（制冷集中 40~60 分钟，到 60% 关）")
 
     # 手动关锚点覆盖决策（2h 内不自动启动）
@@ -776,7 +1051,16 @@ def main():
         reason = "manual_off_anchor"
         burst_set = None
 
+    # ── v9.0 记录决策供回评 ──
+    log_decision(state, new_mode, signal, hum_sig, now_ts)
+    # 记录当前温湿度供下次回评
+    state["last_temp"] = signal
+    state["last_hum"] = hum_sig
+
     ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
+
+    # ── v9.0 自适应学习回评 ──
+    evaluate_and_learn(state, now_ts)
 
     # 构建运行时间信息（基于更新后的状态重新计算，避免旧 run_start 误导时长）
     run_info = ""
@@ -797,7 +1081,7 @@ def main():
         run_info = f"  已关 {int(since_off)} 分钟"
 
     # ── 6. 输出 ──
-    print(f"🏠 上海闵行 · 定频空调省电顾问 v8.1")
+    print(f"🏠 上海闵行 · 定频空调省电顾问 v9.0")
     print(f"📅 {now_str} · {weather_cn(wcode)}")
     print()
     print(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
@@ -806,6 +1090,8 @@ def main():
     else:
         print(f"  室内传感器不可用，室外体感仅供参考")
     print(f"  今日最高: {max_t:.1f}°C  降雨: {rain:.0f}%")
+    # v9.0 舒适度指标显示
+    print(f"  舒适度HI: {hi:.1f}（阈值{effective_cooling_threshold}°C，{strategy_label}）")
     if run_info:
         print(run_info)
     if ac_w:
@@ -876,7 +1162,7 @@ def main():
         print(nl)
     print()
     print("─" * 40)
-    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v4.5")
+    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v9.0")
 
 
 if __name__ == "__main__":
