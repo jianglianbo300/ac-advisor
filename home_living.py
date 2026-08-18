@@ -351,17 +351,39 @@ def save_thermal_data(data: dict):
 
 def record_thermal_event(event_type, temp_before, temp_after=None, duration_min=None, outdoor_temp=None):
     """Record a thermal event: cooling / warming cycle start.
-    temp_after/duration_min may be None (filled when the cycle completes);
-    incomplete events are excluded from model fitting."""
+
+    An event opens with temp_after/duration_min unknown and is closed by the
+    next state change: that transition's temp_before is, by definition, the
+    previous cycle's end temperature, and the timestamp delta is its duration.
+    Without this back-fill every event stayed incomplete forever, so the file
+    only ever held unusable rows (and ac_advisor's fitter, which does not
+    filter, crashed on the None values)."""
     data = load_thermal_data()
     events = data.get("events", [])
+    now = datetime.now()
+
+    # Close the most recent open event using this transition as its end point.
+    if events and temp_before is not None:
+        prev = events[-1]
+        if prev.get("temp_after") is None and prev.get("temp_before") is not None:
+            try:
+                started = datetime.fromisoformat(prev["timestamp"])
+                dur = (now - started).total_seconds() / 60.0
+            except Exception:
+                dur = None
+            # Guard both ends: a sub-minute flap carries no rate signal, and a
+            # multi-hour gap means the process was down, not a real cycle.
+            if dur is not None and 1.0 <= dur <= 720.0:
+                prev["temp_after"] = temp_before
+                prev["duration_min"] = int(round(dur))
+
     events.append({
         "type": event_type,
         "temp_before": temp_before,
         "temp_after": temp_after,
         "duration_min": duration_min,
         "outdoor_temp": outdoor_temp,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now.isoformat(),
     })
     data["events"] = events[-100:]
     data["thermal_model"] = fit_thermal_model(data["events"])
@@ -371,10 +393,17 @@ def record_thermal_event(event_type, temp_before, temp_after=None, duration_min=
 def fit_thermal_model(events):
     """Fit thermal model from completed events (temp_after + duration known).
     Returns {"cooling_rate_per_min": x, "warmup_rate_per_min": y, "time_constant_min": z}."""
-    cooling = [e for e in events if e.get("type") == "cooling"
-               and e.get("temp_after") is not None and e.get("duration_min")]
-    warming = [e for e in events if e.get("type") == "warming"
-               and e.get("temp_after") is not None and e.get("duration_min")]
+    def _usable(e, kind):
+        if e.get("type") != kind:
+            return False
+        for k in ("temp_before", "temp_after", "duration_min"):
+            v = e.get(k)
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                return False
+        return e["duration_min"] > 0
+
+    cooling = [e for e in (events or []) if _usable(e, "cooling")]
+    warming = [e for e in (events or []) if _usable(e, "warming")]
     model = {
         "cooling_rate_per_min": 0.05,
         "warmup_rate_per_min": 0.02,
@@ -383,11 +412,17 @@ def fit_thermal_model(events):
     if cooling:
         rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1)
                  for e in cooling[-20:]]
-        model["cooling_rate_per_min"] = sum(rates) / len(rates)
+        # A cycle that never cooled gives rate <= 0; learning it would make
+        # predict_cooling_time divide by ~0 and return absurd durations.
+        rates = [r for r in rates if r > 0]
+        if rates:
+            model["cooling_rate_per_min"] = sum(rates) / len(rates)
     if warming:
         rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1)
                  for e in warming[-20:]]
-        model["warmup_rate_per_min"] = sum(rates) / len(rates)
+        rates = [r for r in rates if r > 0]
+        if rates:
+            model["warmup_rate_per_min"] = sum(rates) / len(rates)
     return model
 
 
@@ -1764,7 +1799,7 @@ def main():
 
     out_lines.append("")
     out_lines.append("─" * 40)
-    out_lines.append("数据: Open-Meteo + 小米净化器4Lite · 统一决策v11.0")
+    out_lines.append("数据: 和风天气(CMA) + Open-Meteo空气质量 + 小米净化器4Lite · 统一决策v11.0")
 
     print("\n".join(out_lines))
 

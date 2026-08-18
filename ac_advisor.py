@@ -164,7 +164,7 @@ def should_precool(wx, current_hi, threshold_hi):
 # ── 24h 最优调度（v10.0 新增） ─────────────
 def compute_optimal_schedule(wx, current_temp, current_hum, learned):
     """Compute optimal AC schedule for next 24h using:
-    - Open-Meteo hourly temperature + humidity forecast
+    - QW (CMA) hourly temperature + humidity forecast
     - Time-of-use electricity price (peak/valley)
     - Learned thermal mass (from ac_thermal.json)
     - Returns list of (hour, action, est_cost)"""
@@ -330,9 +330,29 @@ def save_thermal_data(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, THERMAL_FILE)
 
+def _thermal_event_usable(e):
+    """True when an event carries the numbers fit_thermal_model needs.
+    Sensor reads return None when unreachable, so both a missing temperature
+    and a missing duration make the event unusable for rate fitting."""
+    if not isinstance(e, dict):
+        return False
+    for k in ("temp_before", "temp_after", "duration_min"):
+        v = e.get(k)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return False
+    return e["duration_min"] > 0
+
+
 def record_thermal_event(event_type, temp_before, temp_after, duration_min, outdoor_temp):
     """Record a thermal event: cooling_cycle, warmup_cycle, or natural_drift
-    Used to learn: cooling_rate (°C/min), thermal_mass (time constant)"""
+    Used to learn: cooling_rate (°C/min), thermal_mass (time constant)
+
+    This module always passes a complete cycle, but home_living.py writes the
+    same file with temp_after/duration_min left open until the next state
+    change closes them. So keep every row here and let fit_thermal_model do the
+    filtering - dropping open rows would destroy home_living's back-fill."""
+    if temp_before is None:
+        return False
     data = load_thermal_data()
     events = data.get("events", [])
     events.append({
@@ -345,26 +365,37 @@ def record_thermal_event(event_type, temp_before, temp_after, duration_min, outd
     })
     # Keep last 100 events
     data["events"] = events[-100:]
-    # Recompute thermal model
+    # Recompute thermal model (filters unusable rows internally)
     data["thermal_model"] = fit_thermal_model(data["events"])
     save_thermal_data(data)
+    return True
 
 def fit_thermal_model(events):
     """Simple linear regression: cooling_rate = a * (temp_diff) + b * (outdoor_temp - indoor_temp)
     Returns {"cooling_rate_per_min": x, "warmup_rate_per_min": y, "time_constant_min": z}"""
-    # Group events by type
-    cooling = [e for e in events if e["type"] == "cooling"]
-    warming = [e for e in events if e["type"] == "warming"]
+    # Filter first: an existing ac_thermal.json may already hold events whose
+    # temp_after / duration_min are None (written before the guard existed).
+    # Fitting straight over those raised TypeError and took the whole run down.
+    usable = [e for e in (events or []) if _thermal_event_usable(e)]
+    cooling = [e for e in usable if e.get("type") == "cooling"]
+    warming = [e for e in usable if e.get("type") == "warming"]
 
     model = {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}
 
     if cooling:
         rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1) for e in cooling[-20:]]
-        model["cooling_rate_per_min"] = sum(rates) / len(rates)
+        # A cooling cycle that never cooled carries no usable rate; keep the
+        # default rather than learning a zero/negative rate that would make
+        # predict_cooling_time divide by ~0 and return absurd durations.
+        rates = [r for r in rates if r > 0]
+        if rates:
+            model["cooling_rate_per_min"] = sum(rates) / len(rates)
 
     if warming:
         rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in warming[-20:]]
-        model["warmup_rate_per_min"] = sum(rates) / len(rates)
+        rates = [r for r in rates if r > 0]
+        if rates:
+            model["warmup_rate_per_min"] = sum(rates) / len(rates)
 
     return model
 
@@ -1041,7 +1072,7 @@ def main():
     humid_out = (hum_out is not None
                  and hum_out >= 85
                  and (indoor_hum is None or hum_out >= indoor_hum + 10))
-    # 未来3小时湿度趋势（Open-Meteo hourly）
+    # 未来3小时湿度趋势（和风 hourly，字段名沿用 Open-Meteo 兼容格式）
     hum_trend = None
     precip_h3 = None
     hourly = wx.get("hourly") or {}
@@ -1378,7 +1409,7 @@ def main():
         print(nl)
     print()
     print("─" * 40)
-    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v10.0")
+    print("数据: 和风天气(CMA) + Open-Meteo空气质量 + 小米净化器4Lite · 状态机v10.0")
 
 
 if __name__ == "__main__":
