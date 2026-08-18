@@ -68,8 +68,8 @@ COOL_DUTY = 0.70       # fixed freq cooling duty cycle
 DEHUMID_MIN = 60       # dehumid typical minutes
 COOL_BURST_MIN = 40    # cooling burst minutes
 
-# -- Room / AC capacity factor (50 sqm, 1.5P fixed frequency) --
-AREA_SQM = 50                     # Your apartment area (sqm)
+# -- Room / AC capacity factor (65 sqm, 1.5P fixed frequency) --
+AREA_SQM = 65                     # 70平 - 5平厕所 = 65平实际制冷
 AREA_FACTOR = AREA_SQM / 35.0   # 35 sqm = 1.5P design coverage
 AC_RATED_W = 3500              # 1.5P rated cooling capacity (W)
 
