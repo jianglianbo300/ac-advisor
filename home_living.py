@@ -68,9 +68,10 @@ COOL_DUTY = 0.70       # fixed freq cooling duty cycle
 DEHUMID_MIN = 60       # dehumid typical minutes
 COOL_BURST_MIN = 40    # cooling burst minutes
 
-# -- Filter reminder --
-FILTER_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_state.json")
-FILTER_CLEAN_INTERVAL = 30  # days
+# -- Room / AC capacity factor (50 sqm, 1.5P fixed frequency) --
+AREA_SQM = 50                     # Your apartment area (sqm)
+AREA_FACTOR = AREA_SQM / 35.0   # 35 sqm = 1.5P design coverage
+AC_RATED_W = 3500              # 1.5P rated cooling capacity (W)
 
 # -- Vent reminder constants --
 LAT, LON = 31.11, 121.38  # Shanghai Minhang
