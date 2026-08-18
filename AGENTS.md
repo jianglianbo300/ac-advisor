@@ -231,3 +231,12 @@ cat ~/.hermes/cron/output/fc62a2bfd83d/$(ls -t ~/.hermes/cron/output/fc62a2bfd83
 1. **ac.py 手动控制修复**：`_commit()` 补 `ac_control_init()` + AC_CTRL 空检查——v1.1 重构后 on/off/temp 全部报 `control_unavailable`（撞 AGENTS.md 第 10 条同款坑：复用 apply_and_commit 必须先初始化句柄），手动开关空调失效。实测 `temp 24` 恢复。
 2. **夜间压湿提前**（ac_watch.py）：`NIGHT_START_AH 17→15.5`、`NIGHT_START_AH_HYST 1.0→0.5`——启动线 AH≥18 降到 ≥16（26°C/RH68% 即 AH16.3 时用户体感刺挠）。停止线 AH≤14 不变，迟滞带 14→16。
 3. 验证：py_compile + 内置 selftest ALL PASS + 边界用例（24°C 守卫拒开 / 25.5°C 正常开 / MIN_OFF 锁定）+ `--dry` 正常。审查备注：夜间迟滞带收紧后启停周期约 40-50min，在 NIGHT_MAX_STARTS_PER_H/MIN_OFF 保护内，如需更省电把 HYST 调回 0.8~1.0。
+
+## 2026-08-18 v11.1 改动记录（自学习修复：功率闸门 + 阈值钳位 + 用户习惯接线）
+
+1. **evaluate_and_learn 功率闸门**（home_living.py）：冷却/除湿复盘时若压缩机真实在转（`_prev_power` > 300W），慢降温**不算决策失败**——65sqm/1.5P 先天功率不足，30min 降不到 0.3°C 是物理限制不是策略错误。原逻辑把每次冷却都误判为失败，`temp_cooling` 无限向下漂移到 **-8**（有效制冷阈值 28-8=20°C 失真）。
+2. **阈值钳位**：`temp_cooling` 限幅 **[-2, +2]**，防误学发散。
+3. **复位**：`ac_learned.json` 的 `temp_cooling: -8 → 0`（保留 decision_log 溯源；`ac_learned.json` 与 `ac_thermal.json` 一并入 gitignore，运行时数据不入库）。
+4. **死代码修复**：`_learn_from_manual` 写入的 `user_pref.hum_threshold` 决策层从未读取 → 现接线 `effective_hum_threshold = min(HUM_DEHUMID_ON + hum_offset, user_pref.hum_threshold)`（用户 3 次在 60-65%RH 手动开空调 → 除湿启动阈值降到 60）。
+5. 验证：py_compile + 4 用例（功率闸门/真失败/下钳位/上钳位）+ `--selftest` ALL PASS + `--dry` 正常。
+

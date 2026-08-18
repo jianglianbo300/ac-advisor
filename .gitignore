@@ -43,3 +43,10 @@ ac_watchdog_state.json
 
 # 修复效果周快照（cron ce70b33967b6 追加，不入库）
 _effect_snapshots.jsonl
+
+# 热模型学习数据（ac_watch/ac_advisor 运行时生成，不入库）
+ac_thermal.json
+
+# 阈值自学习数据（evaluate_and_learn 运行时生成，不入库）
+ac_learned.json
+

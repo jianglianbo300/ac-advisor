@@ -238,11 +238,22 @@ def save_learned(learned: dict):
 
 def evaluate_and_learn(state, now_ts):
     """Post-decision review: on -> temp dropped? off -> stuffy?
-    Success -> threshold unchanged; failure -> threshold +/- 1C."""
+    Success -> threshold unchanged; failure -> threshold +/- 1C.
+
+    v11.1 (2026-08-18) fixes:
+    - Power gate: if the compressor is actually running (socket power
+      >300W), a slow temp drop is NOT a decision failure. 65sqm on 1.5P
+      is chronically underpowered; without the gate, every cooling run
+      gets misjudged as failure and temp_cooling drifts to -8.
+    - Threshold clamp: temp_cooling bounded to [-2, +2] (was unbounded).
+    """
     learned = load_learned()
     log = learned.get("decision_log", [])
     cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
     adjusted = learned.get("adjusted_thresholds", {})
+    # Power gate: is the compressor actually drawing power right now?
+    comp_power = state.get("_prev_power") or state.get("measured_w")
+    comp_running = (comp_power or 0) > 300
     for entry in log:
         if entry.get("evaluated") or entry.get("time", "") < cutoff:
             continue
@@ -258,7 +269,11 @@ def evaluate_and_learn(state, now_ts):
         if action in ("cooling", "dehumid"):
             temp_drop = pre_temp - cur_temp
             hum_drop = (pre_hum or 0) - (cur_hum or 0)
-            if temp_drop < 0.3 and hum_drop < 3:
+            # Power gate: compressor running = the decision is being
+            # executed; slow cooldown is physics, not a bad threshold.
+            if comp_running:
+                success = True
+            elif temp_drop < 0.3 and hum_drop < 3:
                 success = False
         elif action in ("off", "fan"):
             temp_rise = cur_temp - pre_temp
@@ -267,10 +282,10 @@ def evaluate_and_learn(state, now_ts):
         if not success:
             if action in ("cooling", "dehumid"):
                 cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = cur_adj - 1
+                adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
             elif action in ("off", "fan"):
                 cur_adj = adjusted.get("temp_cooling", 0)
-                adjusted["temp_cooling"] = cur_adj - 1
+                adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
         entry["evaluated"] = True
     learned["adjusted_thresholds"] = adjusted
     learned["decision_log"] = log[-50:]
@@ -1356,7 +1371,14 @@ def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
     learned = load_learned()
     learned_temp_adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
     effective_cooling_threshold = TEMP_COOLING + temp_offset + learned_temp_adj
-    effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
+    # v11.1: user habit learning output was dead code (written to
+    # user_pref.hum_threshold but never read). Wire it in: user prefers
+    # dehumid earlier -> lower the ON threshold (never below 60).
+    user_hum_pref = state.get("user_pref", {}).get("hum_threshold")
+    if isinstance(user_hum_pref, (int, float)):
+        effective_hum_threshold = min(HUM_DEHUMID_ON + hum_offset, user_hum_pref)
+    else:
+        effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
 
     # Signal selection
     cur = wx.get("current", {})
