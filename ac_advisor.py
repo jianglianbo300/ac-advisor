@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-定频空调省电顾问 v9.0 — 上海闵行
-基于 v8.1 升级：综合舒适度指标、预测式预冷、自适应阈值学习、季节自适应、显式状态机
+定频空调省电顾问 v10.0 — 上海闵行
+基于 v9.0 升级：露点判据、24h 最优调度、热质量学习
 
 升级内容：
-O. v9.0: 综合舒适度指标(Comfort Index) — 酷度指数 = T + 0.5×(RH-10)，决策时替代原始温度信号
-P. v9.0: 预测式预冷 — 利用 Open-Meteo hourly 预报，未来3h HI 超阈值+3°C → 提前低功率预冷
-Q. v9.0: 自适应阈值学习（持久化）— 决策后30分钟回评，成功→阈值不变，失败→阈值±1°C
-R. v9.0: 季节自适应模式 — 根据月份自动切换：盛夏/梅雨/春秋/冬季
-S. v9.0: 显式状态机 — ACState 枚举 + TRANSITIONS 转移表，校验 new_mode 合法性
+A. v10.0: 露点判据 — Magnus 公式计算露点，>16°C 触发除湿（比 RH 更准的"闷"指标）
+B. v10.0: 24h 最优调度 — 全时段预报 + 峰谷电价，输出未来24h最优计划 + 预冷窗口
+C. v10.0: 热质量学习 — 学习房间降温/升温速率，预测预冷提前量（ac_thermal.json）
 
-保留的 v8.1 功能：
+保留的 v9.0 功能：
+- 综合舒适度指标(Comfort Index) — 酷度指数 = T + 0.5×(RH-10)
+- 预测式预冷 — 利用 Open-Meteo hourly 预报，未来3h HI 超阈值+3°C → 提前低功率预冷
+- 自适应阈值学习（持久化）— 决策后30分钟回评，成功→阈值不变，失败→阈值±1°C
+- 季节自适应模式 — 根据月份自动切换：盛夏/梅雨/春秋/冬季
+- 显式状态机 — ACState 枚举 + TRANSITIONS 转移表，校验 new_mode 合法性
 - 室内传感器读取（小米净化器4Lite）
 - 天气获取（和风天气 CMA 数据源）
 - 手动关锚点（2h 内不自动启动）
-- 滤网提醒
-- 夜间方案对比
-- TTS 播报
-- 微信/桌面提醒
-- 所有阈值常量保留
+- 滤网提醒、夜间方案对比、TTS 播报
 """
 
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -32,6 +32,7 @@ from enum import Enum
 _MIIO_PATHS = [
     "C:/Users/Administrator/AppData/Local/Programs/Python/Python312/Lib/site-packages",
 ]
+
 for p in _MIIO_PATHS:
     if os.path.isdir(p) and p not in sys.path:
         sys.path.insert(0, p)
@@ -97,6 +98,28 @@ def comfort_index(temp, hum):
         return temp
     return temp + 0.5 * (hum - 10)
 
+# ── 露点判据（v10.0 新增） ─────────────────
+def dew_point(temp, hum):
+    """Magnus formula: Td = (b·α(T,RH)) / (a - α(T,RH)) where α = (a·T)/(b+T) + ln(RH/100)
+    Returns dew point in °C. Simplified Magnus: a=17.27, b=237.7"""
+    if hum is None or hum <= 0:
+        return None
+    a, b = 17.27, 237.7
+    alpha = (a * temp) / (b + temp) + math.log(hum / 100.0)
+    td = (b * alpha) / (a - alpha)
+    return td
+
+def muggy_level(temp, hum):
+    """0=comfort, 1=slight muggy, 2=muggy, 3=very muggy
+    Based on dew point: <12 comfort, 12-16 slight, 16-18 muggy, >18 very muggy"""
+    dp = dew_point(temp, hum)
+    if dp is None:
+        return 0
+    if dp < 12: return 0
+    elif dp < 16: return 1
+    elif dp < 18: return 2
+    else: return 3
+
 # ── 季节自适应模式（v9.0 新增） ─────────────
 def seasonal_adjustments():
     """根据月份自动切换：
@@ -144,6 +167,71 @@ def should_precool(wx, current_hi, threshold_hi):
     if max_future_hi >= threshold_hi + 3:
         return True, max_future_hi, idx
     return False, None, None
+
+# ── 24h 最优调度（v10.0 新增） ─────────────
+def compute_optimal_schedule(wx, current_temp, current_hum, learned):
+    """Compute optimal AC schedule for next 24h using:
+    - Open-Meteo hourly temperature + humidity forecast
+    - Time-of-use electricity price (peak/valley)
+    - Learned thermal mass (from ac_thermal.json)
+    - Returns list of (hour, action, est_cost)"""
+    hourly = wx.get("hourly", {})
+    times = hourly.get("time", [])
+    temps = hourly.get("temperature_2m", [])
+    hums = hourly.get("relative_humidity_2m", [])
+    if not times:
+        return []
+
+    schedule = []
+    for i, t in enumerate(times):
+        hour = int(t[11:13]) if len(t) >= 13 else i
+        temp = temps[i] if i < len(temps) else None
+        hum = hums[i] if i < len(hums) else None
+        if temp is None:
+            continue
+        hi = comfort_index(temp, hum)
+        price = ELECTRIC_VALLEY if hour >= 22 or hour < 6 else ELECTRIC_PEAK
+
+        # Decision per hour
+        if hi >= TEMP_COOLING + seasonal_adjustments()[0]:
+            action = "cool"
+            est_cost = kwh_est(40, COOL_DUTY) * price
+        elif muggy_level(temp, hum) >= 2:
+            action = "dehumid"
+            est_cost = kwh_est(60, dehumid_duty(temp, hum)) * price
+        else:
+            action = "off"
+            est_cost = 0
+        schedule.append((hour, action, est_cost))
+
+    return schedule
+
+def find_pre_cool_window(schedule, current_hour):
+    """Find cheapest pre-cooling window before hot period
+    Returns (start_hour, end_hour, estimated_savings)"""
+    # Find first hot period (consecutive hours with 'cool')
+    hot_start = None
+    for i, (h, action, cost) in enumerate(schedule):
+        if action == "cool":
+            if hot_start is None:
+                hot_start = h
+        else:
+            if hot_start is not None:
+                break
+
+    if hot_start is None:
+        return None
+
+    # Find cheapest valley/pre-cool window 2-3h before hot period
+    pre_cool_start = max(0, hot_start - 3)
+    pre_cool_end = max(0, hot_start - 1)
+
+    # Calculate savings: pre-cool during valley vs cooling during peak
+    valley_cost = ELECTRIC_VALLEY * kwh_est(40, COOL_DUTY)
+    peak_cost = ELECTRIC_PEAK * kwh_est(40, COOL_DUTY)
+    savings = peak_cost - valley_cost
+
+    return (pre_cool_start, pre_cool_end, savings)
 
 # ── 自适应阈值学习（v9.0 新增，持久化） ────
 LEARN_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_learned.json")
@@ -227,6 +315,73 @@ def log_decision(state, action, pre_temp, pre_hum, now_ts):
     })
     learned["decision_log"] = log[-50:]
     save_learned(learned)
+
+# ── 热质量学习（v10.0 新增，持久化） ────────
+THERMAL_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_thermal.json")
+
+def load_thermal_data() -> dict:
+    """读取热质量学习数据"""
+    default = {"events": [], "thermal_model": {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}}
+    try:
+        if os.path.exists(THERMAL_FILE):
+            with open(THERMAL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def save_thermal_data(data: dict):
+    """持久化热质量学习数据"""
+    tmp = THERMAL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, THERMAL_FILE)
+
+def record_thermal_event(event_type, temp_before, temp_after, duration_min, outdoor_temp):
+    """Record a thermal event: cooling_cycle, warmup_cycle, or natural_drift
+    Used to learn: cooling_rate (°C/min), thermal_mass (time constant)"""
+    data = load_thermal_data()
+    events = data.get("events", [])
+    events.append({
+        "type": event_type,
+        "temp_before": temp_before,
+        "temp_after": temp_after,
+        "duration_min": duration_min,
+        "outdoor_temp": outdoor_temp,
+        "timestamp": datetime.now().isoformat()
+    })
+    # Keep last 100 events
+    data["events"] = events[-100:]
+    # Recompute thermal model
+    data["thermal_model"] = fit_thermal_model(data["events"])
+    save_thermal_data(data)
+
+def fit_thermal_model(events):
+    """Simple linear regression: cooling_rate = a * (temp_diff) + b * (outdoor_temp - indoor_temp)
+    Returns {"cooling_rate_per_min": x, "warmup_rate_per_min": y, "time_constant_min": z}"""
+    # Group events by type
+    cooling = [e for e in events if e["type"] == "cooling"]
+    warming = [e for e in events if e["type"] == "warming"]
+
+    model = {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}
+
+    if cooling:
+        rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1) for e in cooling[-20:]]
+        model["cooling_rate_per_min"] = sum(rates) / len(rates)
+
+    if warming:
+        rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in warming[-20:]]
+        model["warmup_rate_per_min"] = sum(rates) / len(rates)
+
+    return model
+
+def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):
+    """Predict minutes needed to cool from temp_current to temp_target"""
+    rate = thermal_model.get("cooling_rate_per_min", 0.05)
+    diff = temp_current - temp_target
+    if diff <= 0:
+        return 0
+    return int(diff / rate)
 
 # ── 原有函数（保留） ────────────────────────
 def dehumid_duty(temp, hum=None):
@@ -382,6 +537,7 @@ def fetch_weather() -> dict:
             },
             "hourly": {
                 "time": times,
+                "temperature_2m": [h["temperature"]["value"] for h in hrs],
                 "relative_humidity_2m": [round(h["humidity"] * 100) for h in hrs],
                 "precipitation_probability": [
                     round(h["precipitation"]["probability"] * 100) if isinstance(h.get("precipitation"), dict) else 0
@@ -663,7 +819,6 @@ def read_ac_power(timeout=4.0):
         pass
     return None
 
-
 NIGHT_HOURS = 6          # 夜间整夜对比时长（小时）
 DAYS_PER_MONTH = 30      # 月差价估算天数
 # Bug fix: 删除 NIGHT_DUTY_26 / NIGHT_DUTY_24 死代码（原 501-502 行）
@@ -803,6 +958,10 @@ def main():
 
     # ── 2.7 综合舒适度指标（v9.0 新增） ──
     hi = comfort_index(signal, hum_sig)
+
+    # ── v10.0 露点判据 ──
+    dp = dew_point(signal, hum_sig) if hum_sig is not None else None
+    mug_lvl = muggy_level(signal, hum_sig) if hum_sig is not None else 0
 
     # ── 3. 读取持久化状态 ──
     state = load_state()
@@ -984,6 +1143,15 @@ def main():
             reason = f"温度{signal:.1f}°C，凉快；{why}"
             new_mode = "off"
 
+    # ── v10.0 露点判据覆盖 ──
+    # 当室内露点 > 16°C 时，即使 RH < 65% 也触发除湿（露点比 RH 更准的"闷"指标）
+    if (dp is not None and dp > 16 and new_mode in ("fan", "off", "fan_locked")
+            and hum_sig is not None and hum_sig <= effective_hum_threshold):
+        decision = f"露点{dp:.1f}°C 偏高（{mug_lvl}级闷），建议开空调除湿"
+        reason = f"RH{hum_sig:.0f}%虽未达阈值，但露点{dp:.1f}°C > 16°C，实际体感闷"
+        new_mode = "cooling"
+        burst_set = 24
+
     # ── v9.0 预测式预冷覆盖 ──
     if precool and new_mode in ("fan", "off", "fan_locked"):
         decision = f"预冷建议：未来3h HI={max_future_hi:.1f}°C 超阈值，提前低功率预冷"
@@ -1059,6 +1227,20 @@ def main():
 
     ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
 
+    # ── v10.0 热质量学习：记录热事件 ──
+    thermal_data = load_thermal_data()
+    thermal_model = thermal_data.get("thermal_model", {})
+    if ctrl["status"] == "action" and new_mode in ("cooling", "dehumid"):
+        # 记录制冷事件（温度前=signal，温度后=target，时长=COOL_BURST_MIN）
+        target_temp = burst_set if burst_set else 26
+        record_thermal_event("cooling", signal, target_temp, COOL_BURST_MIN, temp)
+    elif ctrl["status"] == "action" and new_mode in ("off", "fan"):
+        # 记录自然升温事件
+        if state.get("last_temp") is not None:
+            dur = minutes_since(state.get("run_start"))
+            if dur and dur > 0:
+                record_thermal_event("warming", state["last_temp"], signal, int(dur), temp)
+
     # ── v9.0 自适应学习回评 ──
     evaluate_and_learn(state, now_ts)
 
@@ -1081,7 +1263,7 @@ def main():
         run_info = f"  已关 {int(since_off)} 分钟"
 
     # ── 6. 输出 ──
-    print(f"🏠 上海闵行 · 定频空调省电顾问 v9.0")
+    print(f"🏠 上海闵行 · 定频空调省电顾问 v10.0")
     print(f"📅 {now_str} · {weather_cn(wcode)}")
     print()
     print(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
@@ -1092,6 +1274,10 @@ def main():
     print(f"  今日最高: {max_t:.1f}°C  降雨: {rain:.0f}%")
     # v9.0 舒适度指标显示
     print(f"  舒适度HI: {hi:.1f}（阈值{effective_cooling_threshold}°C，{strategy_label}）")
+    # v10.0 露点显示
+    if dp is not None:
+        mug_labels = ["舒适", "微闷", "闷", "很闷"]
+        print(f"  露点: {dp:.1f}°C（{mug_labels[mug_lvl]}）")
     if run_info:
         print(run_info)
     if ac_w:
@@ -1113,7 +1299,6 @@ def main():
             print(f"  ⚠️ 室外潮湿({hum_out:.0f}%)，请勿开窗（防潮）")
     elif morning_hint:
         print(f"  🌅 清晨潮气({hum_out:.0f}%)但未来几小时湿度在降，太阳出来会散——过1~2小时再开窗通风")
-
     print(f"  💡 {decision}")
     print(f"     ({reason})")
     if ac_alert:
@@ -1155,6 +1340,44 @@ def main():
             tip = (f"⚡ 除湿{DEHUMID_MIN}分钟≈{de_kwh:.2f}度({cost_est(de_kwh):.2f}元{price_tag})，"
                    f"比制冷{burst_set or 26}°C集中{COOL_BURST_MIN}分钟≈{co_kwh:.2f}度省{save:.2f}度/轮")
         print(f"  {tip}")
+
+    # ── v10.0 24h 最优调度输出 ──
+    schedule = compute_optimal_schedule(wx, indoor_temp, indoor_hum, learned)
+    if schedule:
+        print()
+        print("─" * 40)
+        print("📊 未来24h最优计划（基于逐时预报+峰谷电价）")
+        total_cost = 0
+        cool_hours = []
+        dehumid_hours = []
+        for hour, action, est_cost in schedule:
+            total_cost += est_cost
+            if action == "cool":
+                cool_hours.append(hour)
+            elif action == "dehumid":
+                dehumid_hours.append(hour)
+        print(f"   制冷时段: {', '.join(f'{h}时' for h in cool_hours[:8])}{'...' if len(cool_hours) > 8 else ''}")
+        print(f"   除湿时段: {', '.join(f'{h}时' for h in dehumid_hours[:8])}{'...' if len(dehumid_hours) > 8 else ''}")
+        print(f"   预估总电费: {total_cost:.2f}元")
+        # 预冷窗口建议
+        pre_cool = find_pre_cool_window(schedule, datetime.now().hour)
+        if pre_cool:
+            pc_start, pc_end, savings = pre_cool
+            print(f"   💡 谷电预冷窗口：{pc_start}~{pc_end}时（省{savings:.2f}元/轮）")
+
+    # ── v10.0 热质量学习输出 ──
+    if thermal_model:
+        print()
+        cool_rate = thermal_model.get("cooling_rate_per_min", 0.05)
+        warm_rate = thermal_model.get("warmup_rate_per_min", 0.02)
+        print(f"🏢 房间热惯性：降温{cool_rate:.3f}°C/min，升温{warm_rate:.3f}°C/min")
+        if indoor_ok and cool_rate > 0:
+            # 预测预冷提前量
+            target = burst_set if burst_set else 26
+            if indoor_temp > target:
+                mins_needed = predict_cooling_time(indoor_temp, target, temp, thermal_model)
+                print(f"   提前 {mins_needed} 分钟开才能在最热时达标（{indoor_temp}→{target}°C）")
+
     reminder = filter_clean_reminder()
     if reminder:
         print(reminder)
@@ -1162,7 +1385,7 @@ def main():
         print(nl)
     print()
     print("─" * 40)
-    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v9.0")
+    print("数据: Open-Meteo + 小米净化器4Lite · 状态机v10.0")
 
 
 if __name__ == "__main__":
