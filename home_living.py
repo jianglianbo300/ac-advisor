@@ -90,6 +90,15 @@ WIND_MAX_MS = 10.8    # sustained wind >= 6级 (10.8 m/s)
 GUST_MAX_MS = 15.0    # gust >= 15 m/s
 AC_BLOCK_MODES = ("cooling", "dehumid", "dehumid_alert")
 
+# -- Quiet hours (2026-08-13 audit leftover) --
+# The vent cron runs every 5 min all day and build_rows keeps all 24 hours, so a
+# dry 03:00 window used to push WeChat + toast AND auto-stop the AC mid-sleep.
+# Inside quiet hours we neither start a cycle nor touch the AC. An already
+# running cycle still gets its close reminder / bad-weather warning: leaving the
+# windows open all night is worse than one late notification.
+VENT_QUIET_START = 22   # inclusive, 22:00 -> quiet
+VENT_QUIET_END = 7      # exclusive, 07:00 -> active again
+
 # -- Shared state files --
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "home_state.json")
@@ -1189,6 +1198,16 @@ def _vent_off_ac(state, now_ts):
         return f"（⚠️ 停空调异常: {e}，请手动关）"
 
 
+def in_quiet_hours(now=None):
+    """True inside the no-disturb window (default 22:00-07:00, wraps midnight)."""
+    if now is None:
+        now = datetime.now()
+    hr = now.hour
+    if VENT_QUIET_START <= VENT_QUIET_END:
+        return VENT_QUIET_START <= hr < VENT_QUIET_END
+    return hr >= VENT_QUIET_START or hr < VENT_QUIET_END
+
+
 def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
     """Full auto vent cycle.
     Idle   -> pick best upcoming window; one heads-up per window; at window start
@@ -1242,13 +1261,24 @@ def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
                     "   请关窗。关窗后如需可再开空调；要我帮你恢复就说一声。")
         return ""
 
+    # -- Quiet hours: no new cycle, no AC action, no notification --
+    # Placed after the in-progress branch on purpose: a running cycle must still
+    # be able to tell you to close the windows even past 22:00.
+    if in_quiet_hours(now):
+        return ""
+
     h = data.get("hourly", {}) or {}
     if not h or not h.get("time"):
         return ""
     rows = build_rows(h, today)
     if not rows:
         return ""
-    upcoming = [r for r in rows if now_min <= r["hr"] * 60 <= now_min + 90]
+    # Candidate windows must be actionable: drop hours that fall inside quiet
+    # hours, otherwise 21:30 would announce a 22:00 window the quiet-hours gate
+    # then refuses to start.
+    upcoming = [r for r in rows
+                if now_min <= r["hr"] * 60 <= now_min + 90
+                and not in_quiet_hours(now.replace(hour=r["hr"], minute=0))]
     if not upcoming:
         return ""
     ac_mode = read_ac_state()
