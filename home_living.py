@@ -1129,51 +1129,146 @@ def daily_report():
     return "\n".join(lines)
 
 
+# ============================================================
+# Auto vent cycle: stop AC -> remind open -> timed close
+# ============================================================
+VENT_CYCLE_FILE = os.path.join(SCRIPT_DIR, "vent_cycle_state.json")
+
+
+def load_vent_cycle() -> dict:
+    try:
+        if os.path.exists(VENT_CYCLE_FILE):
+            with open(VENT_CYCLE_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def save_vent_cycle(d: dict):
+    try:
+        with open(VENT_CYCLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _vent_off_ac(state, now_ts):
+    """Stop AC (cooling/dehumid) before window opens. Returns a note str."""
+    if "--vent-dry-run" in sys.argv:
+        return "（DRY-RUN：本应自动停空调）"
+    try:
+        ac_control_init()
+        if AC_CTRL is None:
+            return "（⚠️ 空调控制不可用，请手动关空调）"
+        ctrl = apply_and_commit("off", None, state, now_ts, meta={"_vent_off_at": now_ts})
+        if ctrl["status"] == "failed":
+            return f"（⚠️ 停空调失败: {ctrl.get('reason', '')}，请手动关）"
+        if ctrl.get("action"):
+            return f"（已自动关空调: {ctrl['action']}）"
+        return "（空调已是关闭状态）"
+    except Exception as e:
+        return f"（⚠️ 停空调异常: {e}，请手动关）"
+
+
+def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
+    """Full auto vent cycle.
+    Idle   -> pick best upcoming window; one heads-up per window; at window start
+              stop AC + remind to open windows with planned end time.
+    Venting-> silent until planned end, then remind to close windows.
+    Returns alert text or '' (silent)."""
+    if now is None:
+        now = datetime.now()
+    today = now.date().isoformat()
+    st = load_vent_cycle()
+    now_min = now.hour * 60 + now.minute
+
+    # -- Venting in progress -> end reminder --
+    if st.get("notified_start") and not st.get("notified_end"):
+        try:
+            end_ts = datetime.fromisoformat(st["end_ts"])
+        except Exception:
+            save_vent_cycle({})
+            return ""
+        if now >= end_ts:
+            st["notified_end"] = True
+            save_vent_cycle(st)
+            return (f"⏰ 换气结束（{st.get('dur_min', '?')} 分钟到，{end_ts.strftime('%H:%M')}）\n"
+                    "   请关窗。关窗后如需可再开空调。")
+        return ""
+
+    h = data.get("hourly", {}) or {}
+    if not h or not h.get("time"):
+        return ""
+    rows = build_rows(h, today)
+    if not rows:
+        return ""
+    upcoming = [r for r in rows if now_min <= r["hr"] * 60 <= now_min + 90]
+    if not upcoming:
+        return ""
+    ac_mode = read_ac_state()
+    aqi = fetch_aqi(1)
+    best, _ = pick_best(upcoming, indoor_temp, indoor_hum, ac_mode, aqi)
+    if best is None:
+        return ""
+    # Same-day window already completed -> skip until next window
+    if (st.get("date") == today and st.get("window_hr") == best["hr"]
+            and st.get("notified_end")):
+        return ""
+    start_min = best["hr"] * 60
+    dt_delta = (best["temp"] - indoor_temp) if indoor_temp is not None else 0
+    dur = t95(best["wind_kmh"], dt_delta)
+    dur = max(10, min(90, int(round(dur))))
+    tag = f"{today}|{best['hr']}"
+
+    if now_min < start_min:
+        # Not yet window start -> one heads-up per window (dedup)
+        if st.get("last_pre") == tag:
+            return ""
+        st["last_pre"] = tag
+        save_vent_cycle(st)
+        vv, emoji = verdict(best["rh"])
+        rain = "☔降雨" if best["pp"] >= 40 else ("🌦" if best["pp"] >= 20 else "☀")
+        _wd = wind_dir_cn(best.get("wind_dir"))
+        wd_s = f"  🧭 {_wd}" if _wd else ""
+        return (f"⏰ 换气提醒: {best['hr']:02d}:00 是好窗口，到点自动停空调并提醒你开窗\n"
+                f"   RH{best['rh']}% {rain}{best['pp']}% 温度{best['temp']}°C "
+                f"风{best['wind_kmh']:.0f}km/h → {emoji}{vv}{wd_s}\n"
+                f"   ⏱ 预计换气 {dur} 分钟，到点开始计时")
+
+    if now_min > start_min + 30:
+        return ""  # window passed, wait for next
+
+    # -- Window began -> start cycle: stop AC + remind open --
+    state = load_state()
+    now_ts = now.isoformat(timespec="seconds")
+    ac_note = _vent_off_ac(state, now_ts)
+    end_dt = now + timedelta(minutes=dur)
+    save_vent_cycle({
+        "date": today,
+        "window_hr": best["hr"],
+        "started_ts": now_ts,
+        "dur_min": dur,
+        "end_ts": end_dt.isoformat(timespec="seconds"),
+        "notified_start": True,
+        "notified_end": False,
+    })
+    return (f"🪟 通风时间到（{best['hr']:02d}:00 窗口）！{ac_note}\n"
+            f"   请开窗换气约 {dur} 分钟，到 {end_dt.strftime('%H:%M')} 提醒你关窗")
+
+
 def alert_check():
-    """Alert mode: only alert if window passes gate in next 90 min, else silent."""
+    """Alert mode: full auto vent cycle (heads-up -> stop AC + open -> timed close)."""
     now = datetime.now()
     if now.hour == 8 and now.minute < 30:
         return ""
     data = fetch_weather()
     if "error" in data:
         return ""
-    h = data.get("hourly", {})
-    if not h or not h.get("time"):
-        return ""
-    today = date.today().isoformat()
-    rows = build_rows(h, today)
-    if not rows:
-        return ""
-    now_min = now.hour * 60 + now.minute
-    upcoming = [r for r in rows if now_min <= r["hr"] * 60 <= now_min + 90]
-    if not upcoming:
-        return ""
     indoor_temp, indoor_hum = read_indoor()
-    ac_mode = read_ac_state()
-    aqi = fetch_aqi(1)
-    best, _ = pick_best(upcoming, indoor_temp, indoor_hum, ac_mode, aqi)
-    if best is None:
-        return ""
-    vv, emoji = verdict(best["rh"])
-    dt = (best["temp"] - indoor_temp) if indoor_temp is not None else 0
-    dur = t95(best["wind_kmh"], dt)
-    dur_s = f"约 {dur:.0f} 分钟" if dur <= 90 else "风小，配风扇 ~10-15 分钟"
-    rain = "☔降雨" if best["pp"] >= 40 else "🌦" if best["pp"] >= 20 else "☀"
-    pm25 = aqi.get(f"{today}T{best['hr']:02d}:00") if aqi else None
-    lines = []
-    lines.append(f"⏰ 换气提醒: {now.strftime('%H:%M')}后, {best['hr']:02d}:00 是好窗口")
-    lines.append(f"   RH{best['rh']}% {rain}{best['pp']}%  温度{best['temp']}°C 风{best['wind_kmh']:.0f}km/h → {emoji}{vv}")
-    _wd = wind_dir_cn(best.get("wind_dir"))
-    if _wd:
-        lines.append(f"   🧭 {_wd} → 迎风开1-2扇+背风2扇")
-    if pm25 is not None and pm25 >= 35:
-        lines.append(f"   🍃 PM2.5 {pm25:.0f}µg/m³")
-    lines.append(f"   ⏱ 4窗全开换 {dur_s}, 到点关")
-    if indoor_temp is not None:
-        lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
-    for x in vent_advice(indoor_hum, best["rh"], indoor_temp, best["temp"]):
-        lines.append(f"   {x}")
-    return "\n".join(lines)
+    return vent_cycle_step(data, indoor_temp, indoor_hum, now)
 
 
 def notify_error_once(key, detail):
