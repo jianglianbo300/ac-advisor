@@ -173,6 +173,16 @@ OUTDOOR_HOT_T = 30            # 室外≥30°C 视为炎热晴天
 HOT_DAY_TEMP_DROP = 3         # 炎热日目标偏移：室温-3（常规 -2）→ 27°C 时目标 24，死区 3°C
 HOT_DAY_TARGET_FLOOR = 24     # 炎热日目标地板（防过冷；常规 25）
 
+# ── v8.23 持续判据（2026-08-19 用户："其实刚才也不太热"）──
+# 用户在 27.0°C 先说"热了不给我开"、降到 26.0°C 后又说"刚才也不太热"。
+# 两句不矛盾：27 = 有点热但能忍，26 = 不热。真正该改的不是启动线（回到 28 就变回
+# "基本不自动开"，覆盖率仅 0.7%，那是他最初的抱怨），而是**加时间维度**——
+# 碰一下 27 不算热，持续 27 才算。
+# 历史 2384 采样：≥27°C 共 54 段，13 段短于 10min（开门/走动/日照的短暂触碰），
+# 真热中位持续 18min、最长 182min → 10min 门槛滤噪声且不漏真热。
+SUSTAIN_MIN = 10             # 室温须持续 >= 该分钟数不低于启动线才开机
+SUSTAIN_URGENT_T = 29.0      # 但室温 >= 该值属明确过热，不等持续时长直接开
+
 # fallback：传感器不可达时的保守动作
 SENSOR_FALLBACK_OFF_ALLOWED = True  # 读不到 → 允许关（安全动作）
 SENSOR_FALLBACK_ON_ALLOWED = False  # 读不到 → 禁止开（危险动作）
@@ -316,6 +326,44 @@ def update_temp_history(state, now_ts, temp):
     if len(hist) > 12:
         hist = hist[-12:]
     state["temp_history"] = hist
+
+
+def sustained_above(state, line, need_min, now_ts=None):
+    """室温是否已持续 >= need_min 分钟不低于 line。数据不足时返回 None（调用方决定）。
+
+    v8.23：用户反馈「27°C 那会儿其实也不太热」——碰一下 27 不算热，持续 27 才算。
+    历史 2384 采样里 ≥27°C 共 54 段，其中 13 段短于 10 分钟（开门/走动/日照造成的
+    短暂触碰）；真热的中位持续 18 分钟、最长 182 分钟，所以 10 分钟门槛滤掉噪声
+    而不会漏掉真热。
+    """
+    hist = state.get("temp_history") or []
+    if len(hist) < 2:
+        return None
+    try:
+        now = (datetime.fromisoformat(now_ts) if isinstance(now_ts, str)
+               else (now_ts or datetime.now()))
+    except Exception:
+        now = datetime.now()
+    cutoff = now - timedelta(minutes=need_min)
+    in_window = []
+    for ts_str, t in hist:
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except Exception:
+            continue
+        if ts >= cutoff and t is not None:
+            in_window.append(t)
+    # 窗口内至少要有 2 个采样才算"持续"，否则视为数据不足
+    if len(in_window) < 2:
+        return None
+    # 窗口跨度也要够：只有最近 2 分钟的两条采样不能证明持续了 10 分钟
+    try:
+        span = (now - datetime.fromisoformat(hist[0][0])).total_seconds() / 60
+    except Exception:
+        span = 0
+    if span < need_min:
+        return None
+    return all(t >= line for t in in_window)
 
 
 def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
@@ -479,7 +527,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
            night_comp_starts=None, fake_run_count=None, evening=False,
-           outdoor_temp=None, outdoor_rain=None):
+           outdoor_temp=None, outdoor_rain=None, sustained=None):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
@@ -666,6 +714,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # 分支 A 夜间对齐：目标永远低于室温 2C（保证定频压缩机启动），clamp 24~26
         night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
         if temp >= NIGHT_START_T:
+            # v8.23 持续判据：碰一下 27 不算热，要持续 SUSTAIN_MIN 分钟。
+            # sustained=None 表示历史数据不足 → 放行（fail-open，不因缺数据不制冷）。
+            # 室温 >= SUSTAIN_URGENT_T 属明确过热，不等持续时长。
+            if temp < SUSTAIN_URGENT_T and sustained is False:
+                return (None, None, None)
             return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
         # v8.13 夜间 AH 启动守卫（glm-5.2 交叉审查）：室温已低于目标（如 24°C/24°C）时
         # 定频机压缩机不会启动 → 只吹风陷入假运行。要求目标严格低于室温 1°C 以上才开。
@@ -686,6 +739,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     # 1°C 分辨率下提前一档会把死区压到 1°C，重新引发抖振。
     hot_day = outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T
     if temp >= A.TEMP_COOLING:
+        # v8.23 持续判据（同夜间）：短暂触碰启动线不算热。高湿闷热走下方除湿分支，
+        # 那条不受持续时长约束——闷是即时体感，不需要等。
+        if (temp < SUSTAIN_URGENT_T and sustained is False
+                and hum < A.HUM_DEHUMID_ON):
+            return (None, None, None)
         # v8.11: 高湿时优先除湿，降目标温度到24°C，避免26°C早停→湿度反弹→逃生门关机的死循环
         if hum >= A.HUM_DEHUMID_ON:
             return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度先除湿")
@@ -984,7 +1042,11 @@ def main():
                               fake_run_count=fake_run_count,
                               evening=evening,
                               outdoor_temp=_outdoor_t,
-                              outdoor_rain=_outdoor_rain)
+                              outdoor_rain=_outdoor_rain,
+                              sustained=sustained_above(
+                                  state,
+                                  NIGHT_START_T if is_night else A.TEMP_COOLING,
+                                  SUSTAIN_MIN, now_ts))
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
