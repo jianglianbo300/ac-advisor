@@ -1111,6 +1111,7 @@ def daily_report():
         lines.append(f"   🍃 PM2.5 {pm25:.0f}µg/m³ {'✅' if pm25 < 35 else ('🟡' if pm25 < 75 else '❌')}")
     lines.append(f"   ⏱ 建议时长: {dur_s}")
     lines.append(f"   操作: 4窗全开+房门全开, 到点关")
+    lines.append(f"   🤖 到点 {best['hr']:02d}:00 系统自动停空调并提醒你开窗，计时到点再提醒你关窗")
     if indoor_temp is not None:
         lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
     for x in vent_advice(indoor_hum, best["rh"], indoor_temp, best["temp"]):
@@ -1185,18 +1186,45 @@ def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
     st = load_vent_cycle()
     now_min = now.hour * 60 + now.minute
 
-    # -- Venting in progress -> end reminder --
+    # -- Venting in progress -> end reminder / early-weather warning --
     if st.get("notified_start") and not st.get("notified_end"):
         try:
             end_ts = datetime.fromisoformat(st["end_ts"])
         except Exception:
             save_vent_cycle({})
             return ""
+        # Real-time weather check: if this vent hour turns bad, warn to close early (once)
+        if now < end_ts and not st.get("warned_bad"):
+            _h = (data.get("hourly", {}) or {})
+            if _h.get("time"):
+                for _r in build_rows(_h, today):
+                    if _r["hr"] == now.hour:
+                        _bad = ((_r["pp"] is not None and _r["pp"] >= RAIN_PP_MAX)
+                                or (_r["rain_mm"] is not None and _r["rain_mm"] > RAIN_MM_MAX))
+                        if _bad:
+                            st["warned_bad"] = True
+                            save_vent_cycle(st)
+                            return (f"🌧 换气中天气转差（{now.hour:02d}:00 降雨概率{_r['pp']}%/"
+                                    f"降水{_r['rain_mm']:.1f}mm）→ 建议提前关窗，防雨水湿气飘入")
+                        break
         if now >= end_ts:
             st["notified_end"] = True
+            st["ended_ts"] = now.isoformat(timespec="seconds")
             save_vent_cycle(st)
-            return (f"⏰ 换气结束（{st.get('dur_min', '?')} 分钟到，{end_ts.strftime('%H:%M')}）\n"
-                    "   请关窗。关窗后如需可再开空调。")
+            _sh = st.get("start_hum")
+            _hum_note = ""
+            if _sh is not None and indoor_hum is not None:
+                _d = _sh - indoor_hum
+                if _d >= 5:
+                    _hum_note = f"（室内湿度 {_sh:.0f}%→{indoor_hum:.0f}%，降 {_d:.0f}pp ✅）"
+                elif indoor_hum <= 60:
+                    _hum_note = f"（室内湿度 {_sh:.0f}%→{indoor_hum:.0f}%，已到舒适区 ✅）"
+                elif _d < 0:
+                    _hum_note = f"（⚠️ 湿度反升 {_sh:.0f}%→{indoor_hum:.0f}%，室外湿气可能灌入，尽快关）"
+                else:
+                    _hum_note = f"（室内湿度 {_sh:.0f}%→{indoor_hum:.0f}%）"
+            return (f"⏰ 换气结束（{st.get('dur_min', '?')} 分钟到，{end_ts.strftime('%H:%M')}）{_hum_note}\n"
+                    "   请关窗。关窗后如需可再开空调；要我帮你恢复就说一声。")
         return ""
 
     h = data.get("hourly", {}) or {}
@@ -1254,6 +1282,7 @@ def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
         "end_ts": end_dt.isoformat(timespec="seconds"),
         "notified_start": True,
         "notified_end": False,
+        "start_hum": indoor_hum,
     })
     return (f"🪟 通风时间到（{best['hr']:02d}:00 窗口）！{ac_note}\n"
             f"   请开窗换气约 {dur} 分钟，到 {end_dt.strftime('%H:%M')} 提醒你关窗")
