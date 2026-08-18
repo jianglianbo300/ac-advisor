@@ -126,7 +126,7 @@ TRANSITIONS = {
     ACState.COOLING_MAINTAIN: {ACState.OFF, ACState.COOLING},
     ACState.DEHUMID: {ACState.OFF, ACState.FAN},
     ACState.FAN: {ACState.OFF, ACState.COOLING, ACState.DEHUMID},
-    ACState.FAN_LOCKED: {ACState.OFF, ACState.FAN},
+    ACState.FAN_LOCKED: {ACState.OFF, ACState.FAN, ACState.COOLING},
 }
 
 
@@ -1128,7 +1128,15 @@ def notify_windows(title, text):
 # ============================================================
 def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
     """Unified AC + window + fan decision.
-    Returns dict with ac_mode, vent_open, reason, and details."""
+    Room-aware: AREA_FACTOR scales MIN_RUN/MIN_OFF/MAX_RUN for
+    underpowered 1.5P AC on 65 sqm.
+    """
+    # -- Room size adaptation (65 sqm, 1.5P = underpowered) --
+    eff_min_run = int(MIN_RUN * AREA_FACTOR)   # 40 * 1.86 = 74 min
+    eff_min_off = int(MIN_OFF * AREA_FACTOR)   # 30 * 1.86 = 56 min
+    eff_max_run = int(MAX_RUN * AREA_FACTOR)   # 180 * 1.86 = 335 min
+    pre_offset = 2 if AREA_FACTOR <= 1.2 else int(2 * (AREA_FACTOR / 1.2))
+
     # Seasonal + learned offsets
     temp_offset, hum_offset, strategy_label = seasonal_adjustments()
     learned = load_learned()
@@ -1197,7 +1205,7 @@ def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
           and hum_sig is not None and hum_sig > effective_hum_threshold):
         running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
         since_on = minutes_since(state.get("run_start"))
-        over_max = running and since_on is not None and since_on >= MAX_RUN
+        over_max = running and since_on is not None and since_on >= eff_max_run
         if over_max:
             decision = "建议切换制冷或关"
             reason = f"除湿已连续运行≥{MAX_RUN}分钟"
@@ -1222,8 +1230,8 @@ def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
             new_mode = "off"
 
     if precool and new_mode in ("fan", "off", "fan_locked"):
-        decision = f"预冷建议：未来3h HI={max_future_hi:.1f}°C"
-        reason = f"当前HI={hi:.1f}°C，未来3h将达{max_future_hi:.1f}°C"
+        decision = f"预冷建议：未来{pre_offset}h HI={max_future_hi:.1f}°C"
+        reason = f"当前HI={hi:.1f}°C，未来{pre_offset}h将达{max_future_hi:.1f}°C"
         burst_set = round(max(26, min(28, signal - 2)))
         new_mode = "cooling"
 
@@ -1235,17 +1243,17 @@ def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
         new_mode = validated_state.value
         reason += f"（状态机校验：{current_state.value}→{target_state.value} 非法，保持{validated_state.value}）"
 
-    # Min run/off constraints
+    # Min run/off constraints (scaled by area factor)
     since_off = minutes_since(state.get("last_off_at"))
     since_on = minutes_since(state.get("run_start"))
     if new_mode in ("cooling", "dehumid", "dehumid_alert"):
-        if since_off is not None and since_off < MIN_OFF:
-            decision = f"风扇（关后{MIN_OFF}分钟内不重开）"
+        if since_off is not None and since_off < eff_min_off:
+            decision = f"风扇（关后{eff_min_off}分钟内不重开）"
             reason += f"；关后仅{int(since_off)}分钟"
             new_mode = "fan_locked"
     elif new_mode in ("fan", "fan_locked", "off"):
-        if since_on is not None and since_on < MIN_RUN:
-            decision = f"继续开着（开够{MIN_RUN}分钟再关）"
+        if since_on is not None and since_on < eff_min_run:
+            decision = f"继续开着（开够{eff_min_run}分钟再关）"
             reason += f"；开仅{int(since_on)}分钟"
             new_mode = state.get("mode", "unknown")
 
