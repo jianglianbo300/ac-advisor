@@ -1035,7 +1035,15 @@ def pick_best(rows, indoor_temp, indoor_rh, ac_mode, aqi):
     Sort key: outdoor dewpoint ascending (drier is better), then rain prob ascending."""
     cand = []
     blocked = None
+    ac_blocking = ac_mode in AC_BLOCK_MODES
+    now_hr = datetime.now().hour
     for r in rows:
+        # AC linkage: skip current/past windows while the advisor is actively
+        # cooling/dehumidifying (opening now would undermine the run).
+        if ac_blocking and r["hr"] <= now_hr:
+            if blocked is None:
+                blocked = "空调制冷/除湿运行中，先不开窗"
+            continue
         dp_out = dew_point(r["temp"], r["rh"])
         pm25 = aqi.get(f"{date.today().isoformat()}T{r['hr']:02d}:00") if aqi else None
         ok, reason = gate_check(r["rh"], r["pp"], r["rain_mm"], r["temp"],
@@ -1404,6 +1412,29 @@ def format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_
 # ============================================================
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    # -- 0. Mode dispatch ---------------------------------------------------
+    # Alert mode: lightweight "good window ahead" reminder, silent if none.
+    if "--alert" in sys.argv:
+        _alert_text = alert_check()
+        print(_alert_text)   # empty -> silent (no WeChat/Windows delivery)
+        if _alert_text:
+            notify_windows("🌬 换气提醒", _alert_text)
+            try:
+                from ac_tts import speak
+                speak(_alert_text[:60])
+            except Exception:
+                pass
+        return
+
+    # Daily vent-report mode: dedicated ventilation morning brief.
+    if "--daily" in sys.argv or "--report" in sys.argv:
+        _report = daily_report()
+        print(_report)
+        _toast = "\n".join(_report.splitlines()[:3])
+        notify_windows("🌬 今日换气", _toast)
+        return
+
     # -- 1. Fetch weather --
     wx = fetch_weather()
     if "error" in wx:
@@ -1562,6 +1593,9 @@ def main():
             speak(ac_alert, force=True)
     except Exception:
         pass
+
+    # Windows toast (parallel to WeChat delivery)
+    notify_windows("🏠 家居生活顾问", result["decision"])
 
 
 if __name__ == "__main__":
