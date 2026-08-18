@@ -1540,12 +1540,20 @@ def main():
     # Format + print
     out_lines = format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert)
 
-    # Ventilation advice
+    # Ventilation advice: today's single best window (hourly scan) + instant advice
+    try:
+        _daily_vent = daily_report()
+        if _daily_vent:
+            for _vl in _daily_vent.splitlines():
+                out_lines.append(f"  {_vl}")
+            out_lines.append("")
+    except Exception:
+        pass
     hum_out = wx.get("current", {}).get("relative_humidity_2m")
     vent_lines = vent_advice(indoor_hum, hum_out, indoor_temp,
                              wx.get("current", {}).get("temperature_2m"))
     if vent_lines:
-        out_lines.append("  🌬 通风建议:")
+        out_lines.append("  🌬 即时通风建议:")
         for vl in vent_lines:
             out_lines.append(f"     {vl}")
     out_lines.append("")
