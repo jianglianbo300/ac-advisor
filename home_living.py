@@ -51,6 +51,7 @@ TEMP_DEHUMID_LOW = 26   # dehumid temp lower bound
 TEMP_DEHUMID_HIGH = 28  # dehumid temp upper bound
 HUM_DEHUMID_ON = 65     # dehumid ON threshold
 HUM_DEHUMID_OFF = 55    # dehumid OFF threshold (10% hysteresis)
+WETBULB_DEHUMID_ON = 20.5  # dehumid when wet-bulb >= 20.5C (~26C/65%RH, 24C/72%RH)
 TEMP_ABSOLUTE_FLOOR = 24# dehumid absolute floor (OR escape hatch)
 MIN_RUN = 40            # min run time once on
 MIN_OFF = 30            # min off time at night before restart
@@ -140,29 +141,24 @@ def transition(current: ACState, target: ACState) -> ACState:
 
 # ============================================================
 # Comfort index + wet-bulb temperature
-# ============================================================
 def comfort_index(temp, hum):
-    """Comfort index = T + 0.02 * (RH - 10).
-    26C/80% -> HI=26.2 vs 26C/50% -> HI=25.2."""
+    """Comfort index = T + 0.02 * (RH - 10)."""
     if hum is None:
         return temp
     return temp + 0.02 * (hum - 10)
 
-
 def wet_bulb_temp(temp_c, rh):
-    """Wet-bulb temperature (Stull 2011 empirical formula).
-    Returns wet-bulb temperature in Celsius, or None if inputs invalid.
-    Accuracy: +/- 0.3C for RH 5-99% and T -20 to 50C."""
-    if temp_c is None or rh is None or rh <= 0 or rh > 100:
-        return None
+    """Wet-bulb temperature (Stull 2011 empirical formula)."""
+    if rh is None:
+        return temp_c
+    rh = rh / 100.0
     t = temp_c
-    h = rh
-    tw = (t * math.atan(0.151977 * (h + 8.313659) ** 0.5)
-          + math.atan(t + h)
-          - math.atan(h - 1.676331)
-          + 0.00391838 * h ** 1.5 * math.atan(0.023101 * h)
-          - 4.686035)
-    return tw
+    wb = t * math.atan(0.151977 * (rh + 8.313659) ** 0.5) \
+         + math.atan(t + rh) - math.atan(rh - 1.67633) \
+         + 0.00391838 * rh ** 1.5 * math.atan(0.023101 * rh) \
+         - 4.686035
+    return wb
+
 
 
 # ============================================================
@@ -294,6 +290,90 @@ def log_decision(state, action, pre_temp, pre_hum, now_ts):
     })
     learned["decision_log"] = log[-50:]
     save_learned(learned)
+
+
+# ============================================================
+# Thermal event learning (persistent, ac_thermal.json)
+# ============================================================
+THERMAL_FILE = os.path.join(SCRIPT_DIR, "ac_thermal.json")
+
+
+def load_thermal_data() -> dict:
+    """Load thermal learning data (events + fitted model)."""
+    default = {
+        "events": [],
+        "thermal_model": {
+            "cooling_rate_per_min": 0.05,
+            "warmup_rate_per_min": 0.02,
+            "time_constant_min": 120,
+        },
+    }
+    try:
+        if os.path.exists(THERMAL_FILE):
+            with open(THERMAL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
+def save_thermal_data(data: dict):
+    """Persist thermal learning data (atomic write)."""
+    tmp = THERMAL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, THERMAL_FILE)
+
+
+def record_thermal_event(event_type, temp_before, temp_after=None, duration_min=None, outdoor_temp=None):
+    """Record a thermal event: cooling / warming cycle start.
+    temp_after/duration_min may be None (filled when the cycle completes);
+    incomplete events are excluded from model fitting."""
+    data = load_thermal_data()
+    events = data.get("events", [])
+    events.append({
+        "type": event_type,
+        "temp_before": temp_before,
+        "temp_after": temp_after,
+        "duration_min": duration_min,
+        "outdoor_temp": outdoor_temp,
+        "timestamp": datetime.now().isoformat(),
+    })
+    data["events"] = events[-100:]
+    data["thermal_model"] = fit_thermal_model(data["events"])
+    save_thermal_data(data)
+
+
+def fit_thermal_model(events):
+    """Fit thermal model from completed events (temp_after + duration known).
+    Returns {"cooling_rate_per_min": x, "warmup_rate_per_min": y, "time_constant_min": z}."""
+    cooling = [e for e in events if e.get("type") == "cooling"
+               and e.get("temp_after") is not None and e.get("duration_min")]
+    warming = [e for e in events if e.get("type") == "warming"
+               and e.get("temp_after") is not None and e.get("duration_min")]
+    model = {
+        "cooling_rate_per_min": 0.05,
+        "warmup_rate_per_min": 0.02,
+        "time_constant_min": 120,
+    }
+    if cooling:
+        rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1)
+                 for e in cooling[-20:]]
+        model["cooling_rate_per_min"] = sum(rates) / len(rates)
+    if warming:
+        rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1)
+                 for e in warming[-20:]]
+        model["warmup_rate_per_min"] = sum(rates) / len(rates)
+    return model
+
+
+def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):
+    """Predict minutes to cool from temp_current to temp_target."""
+    rate = thermal_model.get("cooling_rate_per_min", 0.05)
+    diff = temp_current - temp_target
+    if diff <= 0:
+        return 0
+    return int(diff / rate)
 
 
 # ============================================================
@@ -1153,6 +1233,12 @@ def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
 
     hi = comfort_index(signal, hum_sig)
 
+    # Humidity trigger: wet-bulb (T+RH combined) replaces raw RH
+    # for dehumid decisions; falls back to raw RH when wet-bulb is unavailable.
+    tw = wet_bulb_temp(signal, hum_sig)
+    humid_high = tw >= WETBULB_DEHUMID_ON if tw is not None else (
+        hum_sig is not None and hum_sig > effective_hum_threshold)
+
     # Ventilation check
     hourly = wx.get("hourly", {})
     h_time = hourly.get("time", [])
@@ -1368,6 +1454,12 @@ def main():
 
     # -- 5. Log + apply --
     log_decision(state, new_mode, indoor_temp, indoor_hum, now_ts)
+    # Record thermal event for learning
+    if new_mode in ("cooling", "dehumid"):
+        record_thermal_event("cooling", indoor_temp, None, None, wx.get("current", {}).get("temperature_2m"))
+    elif new_mode in ("off", "fan") and state.get("mode") in ("cooling", "dehumid"):
+        record_thermal_event("warming", indoor_temp, None, None, wx.get("current", {}).get("temperature_2m"))
+
     state["last_temp"] = indoor_temp
     state["last_hum"] = indoor_hum
     ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
