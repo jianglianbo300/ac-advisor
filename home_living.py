@@ -1100,6 +1100,8 @@ def daily_report():
     pm25 = aqi.get(f"{today}T{best['hr']:02d}:00") if aqi else None
     dur_s = f"约 {dur:.0f} 分钟" if dur <= 90 else "风小，配风扇 ~10-15 分钟"
     rain = "☔有雨" if best["pp"] >= 40 else ("🌦有雨概率" if best["pp"] >= 20 else "☀无雨")
+    if indoor_temp is None:
+        lines.append("   ⚠️ 室内无实时读数，露点/湿度防潮未校验——此窗口仅供参考，开窗前请先确认室外不潮，仅短促换气")
     lines.append(f"🏆 最佳窗口: {best['hr']:02d}:00  RH{best['rh']}% {rain}{best['pp']}%")
     lines.append(f"   温度{best['temp']}°C 风{best['wind_kmh']:.0f}km/h → {emoji}{vv}")
     _wd = wind_dir_cn(best.get("wind_dir"))
