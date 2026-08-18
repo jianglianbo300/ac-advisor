@@ -109,16 +109,21 @@ R_.check("逃生门理由正确", "逃生门" in str(reason) or "过冷" in str(
 # ── 4. 湿度启动分支的 AH 迟滞 ──
 print("\n[4] 湿度启动分支 AH 迟滞带")
 hyst_line = W.DAY_STOP_AH + W.DAY_STOP_AH_HYST  # 14.5 + 2.0 = 16.5
+# 温度必须落在 [TEMP_DEHUMID_LOW, TEMP_COOLING) 区间才隔离出湿度分支：
+# 高于 TEMP_COOLING 会走温度分支（那条不受湿度迟滞管），验不出迟滞效果。
+# 2026-08-19 启动线 28→27 后，原用例的 27.0 已越界，改用 26.5。
+probe_t = (A.TEMP_DEHUMID_LOW + A.TEMP_COOLING) / 2  # 26.5
+assert A.TEMP_DEHUMID_LOW <= probe_t < A.TEMP_COOLING, "probe_t 必须只触发湿度分支"
 # AH 未回升过迟滞线 → 湿度分支不得开机
 mode, _, reason = W.decide(
-    temp=27.0, hum=66, running=False, since_on=None, since_off=60, is_night=False,
+    temp=probe_t, hum=66, running=False, since_on=None, since_off=60, is_night=False,
     compressor=None, current_target=26, ah=hyst_line - 0.5, compressor_run_min=None,
 )
 R_.check(f"AH={hyst_line-0.5} < 迟滞线{hyst_line} → 湿度分支不开",
          mode is None, f"got mode={mode} reason={reason}")
 # AH 回升过线 → 允许开
 mode, _, reason = W.decide(
-    temp=27.0, hum=66, running=False, since_on=None, since_off=60, is_night=False,
+    temp=probe_t, hum=66, running=False, since_on=None, since_off=60, is_night=False,
     compressor=None, current_target=26, ah=hyst_line + 0.5, compressor_run_min=None,
 )
 R_.check(f"AH={hyst_line+0.5} >= 迟滞线 → 湿度分支放行",

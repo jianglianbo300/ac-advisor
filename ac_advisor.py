@@ -29,7 +29,7 @@ for p in _MIIO_PATHS:
         sys.path.insert(0, p)
 
 # ── 阈值常量（统一头部，可配置） ─────────────
-TEMP_COOLING = 28       # 体感≥28 → 制冷
+TEMP_COOLING = 27       # 体感≥27 → 制冷（2026-08-19：28→27，用户在 27.0°C 反馈热；公用一套阈值不分屋）
 TEMP_DEHUMID_LOW = 26   # 除湿温度下限（对齐"不算热"）
 TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
 HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值（68% 就闷了，65% 更合理）
@@ -731,12 +731,18 @@ def ac_apply(new_mode, target_temp=None):
 
 def reconcile_state(state, now_ts):
     """以插座实测为权威对账持久化状态（P2）。
-    插座可达时真实设备状态优先：state 说运行但插座关 → 记 manual_off_at 并回正；
+    插座可达时真实设备状态优先：state 说运行但插座关 → 回正为 off；
     state 说关但插座开 → 记 manual_on_at 并标记运行（模式未知按 cooling 计）。
     插座不可达（AC_SOCKET=None）时跳过，回退持久化状态。
 
-    系统自己关的（_system_off_at 标记）不视为手动干预，
-    避免 ac_watch 的 decide() 被 reconcile_state 篡改 state 后无法正确执行过冷保护等关机逻辑。"""
+    只有"曾被实测确认在运行、之后被关掉"才算用户手动关（写 manual_off_at）。
+    两类情况明确排除，否则会造出假的用户意图并压制自动启动 30 分钟：
+      1. 系统自己关的（_system_off_at 标记，180s 内）
+      2. **系统下过开机指令但从未生效**（run_start 为空 = 没有任何一次实测确认过
+         运行）。2026-08-19 实测：换屋后空调没接在该伴侣这一路，伴侣恒报 off，
+         于是每轮对账都写一次假 manual_off_at → 日志刷"手动关后N分钟，跳过自动
+         启动（尊重用户意图）"，而用户根本没碰过空调，且当时室内 27°C 正热。
+    """
     if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
         # 排除系统自己关的 → 不设 manual_off_at，只回正
         sys_off = state.get("_system_off_at")
@@ -749,7 +755,10 @@ def reconcile_state(state, now_ts):
                     is_system_off = True
             except Exception:
                 pass
-        if not is_system_off:
+        # 排除"开机指令从未生效"：run_start 为空说明这个 cooling 只是系统意图，
+        # 压缩机/插座从来没被确认过在运行，谈不上"用户把它关了"。
+        never_ran = not state.get("run_start")
+        if not is_system_off and not never_ran:
             state["manual_off_at"] = now_ts
         state["mode"] = "off"
         state["last_off_at"] = now_ts

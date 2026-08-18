@@ -118,7 +118,8 @@ WATCH_MAX_RUN = 90      # 硬上限，防死锁
 # ── v8.5 夜间模式：控制继续，只静音 TTS ──
 QUIET_TTS = (23, 7)         # TTS 静音时段
 NIGHT = (23, 7)             # 夜间节能模式时段
-NIGHT_START_T = 28.0        # 夜间启动温度阈值
+NIGHT_START_T = 27.0        # 夜间启动温度阈值（2026-08-19：28→27，用户在 27.0°C 实测反馈"热了"
+                            # 却因 27<28 不触发，且关机后仍不会自动重开。旧值 28 是按女儿屋调的）
 NIGHT_START_AH = 15.5       # 夜间启动绝对湿度阈值 (g/m3)（2026-08-16：17→15.5，用户 26°C/AH16.3 体感刺挠，压湿提前；迟滞带 14→16）
 NIGHT_STOP_AH = 14.0        # 夜间停止绝对湿度阈值
 NIGHT_START_AH_HYST = 0.5   # 夜间启动迟滞（停 AH≤14，升到 AH≥16(NIGHT_START_AH+HYST) 才重开）
@@ -163,8 +164,8 @@ DAY_STARTS_OVERRIDE_T = 29.0 # 启停上限的安全阀：室温 >= 该值说明
                              # 抖振的特征是 26-27°C 反复触发，29°C 是真实热负荷。
 
 # ── v8.19 天气感知：晴天/室外高温提前制冷（用户反馈：阴天调参后晴天觉得热）──
-OUTDOOR_HOT_T = 30           # 室外≥30°C 视为炎热晴天
-TEMP_COOLING_HOT_DAY = 27    # 炎热天白天制冷启动阈值（原 TEMP_COOLING=28 → 提前到27）
+TEMP_COOLING_HOT_DAY = 26.5  # 炎热天白天制冷启动阈值（2026-08-19：TEMP_COOLING 降到 27 后
+                             # 原值 27 已无提前效果，同步降到 26.5 保持"室外炎热就早开"的语义）
 
 # fallback：传感器不可达时的保守动作
 SENSOR_FALLBACK_OFF_ALLOWED = True  # 读不到 → 允许关（安全动作）
@@ -543,13 +544,30 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
         # 夜间停止条件（v8.11 修复：从 T≤26 改为湿度达标优先，避免60%就停）
         # 注意：安全类关机（过冷/AH达标）先于守卫，防止低温不停机
+        #
+        # v8.22 补温度达标前置（2026-08-19 用户实测："咋给我关了？"）：
+        # 原先只看 AH —— 用户 27°C 正热，但 AH=13.4 ≤ 14.0 就被判"湿度已达标"关机，
+        # 且该分支位于 MIN_RUN 守卫之前（当安全类处理），NIGHT_MIN_COMP_ON=20 也拦不住，
+        # 于是开机 20 秒即被关。这与 v8.21 修的白天病同源：**用湿度判据关一台因为热
+        # 而开的空调**。屋里干≠屋里不热。
+        # 故要求室温已降到 target + DAY_TEMP_REACHED_SLACK 才允许按湿度收手；
+        # 拿不到 current_target 时退化旧行为（宁可早停也不要整夜空转）。
         if is_night:
             if ah is not None and ah <= NIGHT_STOP_AH:
-                return ("off", None, f"夜间室内湿度已达标（AH={ah:.1f}），关机省电")
+                temp_reached = (current_target is None
+                                or temp <= current_target + DAY_TEMP_REACHED_SLACK)
+                if temp_reached:
+                    return ("off", None, f"夜间室内湿度已达标（AH={ah:.1f}），关机省电")
+                # 温度未达标 → 不因湿度收手，继续制冷把室温压到目标
             # v8.11: 夜间停止不再以 T≤26°C 为条件（太激进，导致 60%RH 就停），改为湿度驱动
             # 只有湿度真正降到 55% 以下才停，或者温度降到 24°C 逃生门
-            if hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= NIGHT_MIN_COMP_ON:
-                return ("off", None, f"夜间湿度已降到{hum:.0f}%，压缩机工作完成关机")
+            # v8.22: 与上面 AH 分支同样补温度前置——同一个病（拿湿度判据关一台因为热而
+            # 开的空调）。这条本身有 NIGHT_MIN_COMP_ON=20min 地板兜着，不像 AH 那条会
+            # 开机即关，但判据错配一样要修，否则 25.1°C 仍会被 RH=48% 关掉。
+            if (hum <= DEHUMID_EXIT_RH and comp_min is not None
+                    and comp_min >= NIGHT_MIN_COMP_ON):
+                if current_target is None or temp <= current_target + DAY_TEMP_REACHED_SLACK:
+                    return ("off", None, f"夜间湿度已降到{hum:.0f}%，压缩机工作完成关机")
             if temp <= A.TEMP_ABSOLUTE_FLOOR:
                 return ("off", None, f"夜间室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门关机")
             # 舒适类守卫：跑不够 20 分钟不停，启动次数超限不新开
@@ -666,7 +684,13 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # v8.11: 高湿时优先除湿，降目标温度到24°C，避免26°C早停→湿度反弹→逃生门关机的死循环
         if hum >= A.HUM_DEHUMID_ON:
             return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度先除湿")
-        t = round(max(26, min(28, temp - 2)))
+        # v8.22 目标下限 26→25：原下限是按启动线 28 设计的（28-2=26，死区 2°C）。
+        # 启动线降到 27 后 27-2=25 会被 max(26,..) 抬回 26，死区只剩 1°C，回温 20min
+        # 就再次触发 → v8.21 的"周期变长"效果被削掉大半（闭环实测均周期 19.2→12.0min）。
+        # 下限改 25 恢复 2°C 死区（实测启停 10→7、均周期 12.0→17.6min）。
+        # 25 也与手动开机路径一致（那里本就是 max(24, min(26, temp-2))），
+        # 且定频机目标须显著低于室温才能持续制冷，26 对 27°C 室温太近容易到温停机。
+        t = round(max(25, min(28, temp - 2)))
         wx_note = "（室外炎热提前制冷）" if eff_cool != A.TEMP_COOLING else ""
         return ("cooling", t, f"室内{temp:.0f}度偏热，自动开制冷{t}度{wx_note}")
     # v8.14 E 方案（谷电积极版）：22-6 谷电半价 → 除湿启动阈值 65→62 更早压湿；
