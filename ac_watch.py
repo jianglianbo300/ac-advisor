@@ -254,6 +254,8 @@ SENSOR_PLAUSIBLE_RH_MAX = 98       # 传感器合理湿度上限
 SENSOR_TIMEOUT_ESCALATE = 20       # 传感器断连超过此分钟数 → 升级动作
 FAKE_RUN_MAX_CYCLES = 3            # 假运行连续重试上限次数
 MANUAL_ANCHOR_TTL = 720            # 手动锚点有效时间(min) = 12h
+ACTION_TTS_COOLDOWN = 10           # TTS 播报最短间隔(min)，防每2分钟喊一次
+
 
 
 def log(msg):
@@ -1191,11 +1193,14 @@ def main():
                 except Exception:
                     pass
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
-        if not is_night:
+        _last_action_tts = state.get("_last_action_tts_at")
+        _can_tts = _last_action_tts is None or (now_dt - datetime.fromisoformat(_last_action_tts)).total_seconds() >= ACTION_TTS_COOLDOWN * 60
+        if not is_night and _can_tts:
             try:
                 import xiaomi_tts
                 tts_msg = f"空调已自动{ctrl['action']}，{reason}。" if reason else f"空调已自动{ctrl['action']}。"
                 xiaomi_tts.speak(tts_msg)
+                state["_last_action_tts_at"] = now_ts
             except Exception as e:
                 log(f"TTS 播报失败（不影响控制）: {e}")
     elif ctrl["status"] == "no_action":
