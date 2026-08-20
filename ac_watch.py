@@ -170,11 +170,7 @@ STEADY_STATE_MIN_MIN = 15       # 温度稳定在 target+1 内持续多久进入
 THERMAL_FAIL_WINDOW = 3          # 连续几个周期未达标触发热负荷自适应
 THERMAL_FAIL_RISE = 1            # 热负荷自适应：目标温度上调(°C)
 
-# ── v8.24 稳态运行 + 热负荷自适应（2026-08-20 审计：91.7% 周期<20min）──
-STEADY_STATE_MIN_MIN = 15       # 温度稳定在 target+1 内持续多久进入稳态运行(min)
-THERMAL_FAIL_WINDOW = 3          # 连续几个周期未达标触发热负荷自适应
-THERMAL_FAIL_RISE = 1            # 热负荷自适应：目标温度上调(°C)
-DAY_MAX_STARTS_PER_H = 2     # 白天每小时启动上限（夜间为 4；白天热负荷高但不该抖振）
+
 DAY_STARTS_OVERRIDE_T = 29.0 # 启停上限的安全阀：室温 >= 该值说明真的热（不是抖振），
                              # 无条件放行开机。抖振要压，但不能因为"压次数"把人热着——
                              # 抖振的特征是 26-27°C 反复触发，29°C 是真实热负荷。
@@ -845,6 +841,9 @@ def main():
             temp = hum = None
 
     state = A.load_state()
+    # v8.24 P0: 写入当前温湿度供 evaluate_and_learn 回评（None时保留旧值）
+    state["last_temp"] = temp if temp is not None else state.get("last_temp")
+    state["last_hum"] = hum if hum is not None else state.get("last_hum")
     # v8.15 fail-safe：状态文件损坏 → 本次 tick 不执行任何开/关
     if state.get("_state_load_failed"):
         log("[ERROR] 状态文件损坏，本次 tick fail-safe 跳过（不执行开/关）")
@@ -864,8 +863,8 @@ def main():
             log(f"[WARN] 天气兜底获取失败：{type(e).__name__}: {e}")
         if _wx_fallback and _wx_fallback.get("t") is not None:
             temp = _wx_fallback["t"]
-            # 室外湿度不能代表室内，缺省 50（中等）让决策只走温度分支，不误触除湿
-            hum = _wx_fallback.get("rh") if _wx_fallback.get("rh") is not None else 50
+            # 室外湿度不能代表室内，回退时 hum=None 让决策只走温度分支
+            hum = None
             wx_fallback_used = True
             # v8.24 F4：标记回退数据来源
             state["_temp_src"] = "outdoor_fallback"

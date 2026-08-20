@@ -84,7 +84,7 @@ SAFETY = 1.2     # duration safety factor
 # Hard gate thresholds
 RAIN_PP_MAX = 45      # rain prob >= 45% -> no open
 RAIN_MM_MAX = 1.0     # rain intensity > 1mm/h -> no open
-DEW_DELTA_MAX = 1.5   # outdoor dewpoint - indoor >= 1.5C -> moisture ingress
+DEW_DELTA_MAX = 3.0   # outdoor dewpoint - indoor >= 1.5C -> moisture ingress
 PM25_MAX = 75         # PM2.5 >= 75 ug/m3
 WIND_MAX_MS = 10.8    # sustained wind >= 6级 (10.8 m/s)
 GUST_MAX_MS = 15.0    # gust >= 15 m/s
@@ -1181,17 +1181,34 @@ def daily_report():
     lines.append(f"🌬️ 今日换气提醒 ({today} {WD[date.today().weekday()]})")
     lines.append("─" * 18)
     if best is None:
-        lines.append("🚫 今日无推荐开窗窗口")
-        lines.append(f"   原因: {blocked}")
+        # 每日最低换气保障：CO2 每天都得降一次
+        best2 = None
+        for r in rows:
+            if r["pp"] >= 70 or r["rain_mm"] > 2.0:
+                continue
+            if r["wind_kmh"] / 3.6 >= 12:
+                continue
+            if r["rh"] >= 95:
+                continue
+            best2 = r
+            break
+        if best2 is None:
+            lines.append("🚫 今日极端天气，无法换气")
+            lines.append(f"   原因: {blocked}")
+            if indoor_temp is not None:
+                lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
+            lines.append("─" * 18)
+            lines.append("🌧 今天天气极端，关窗靠空调/除湿机")
+            return "\n".join(lines)
+        dt = (best2["temp"] - indoor_temp) if indoor_temp is not None else 0
+        dur = min(15.0, t95(best2["wind_kmh"], dt))
+        lines.append("⚡ 每日最低换气（天气一般，短促换气）")
+        lines.append(f"   ⏱ {dur:.0f} 分钟（{min(15, int(dur))}分钟后关窗）")
+        lines.append(f"   📍 {best2['hr']:02d}:00  风{best2['wind_kmh']:.0f}km/h RH{best2['rh']}%")
         if indoor_temp is not None:
             lines.append(f"   📍 室内实测: {indoor_temp}°C / {indoor_hum:.0f}%")
-        for x in vent_advice(indoor_hum, None, indoor_temp, None):
-            lines.append(f"   {x}")
         lines.append("─" * 18)
-        if blocked and ("降雨" in blocked or "降水" in blocked):
-            lines.append("🌧 今天天气不配合，关窗靠空调/除湿机")
-        else:
-            lines.append("🔒 今天不宜开窗，关窗保环境")
+        lines.append("💡 关窗后开空调除湿，短促换气不浪费")
         return "\n".join(lines)
 
     vv, emoji = verdict(best["rh"])
@@ -1844,17 +1861,22 @@ def main():
 
     print("\n".join(out_lines))
 
-    # TTS broadcast
-    try:
-        _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
-        if _tts_dir not in sys.path:
-            sys.path.insert(0, _tts_dir)
-        from ac_tts import speak
-        speak(result["decision"][:50])
-        if ac_alert:
-            speak(ac_alert, force=True)
-    except Exception:
-        pass
+    # TTS broadcast (v8.23c: 夜间静音 + 仅模式变化 + 10min冷却)
+    _now_h = datetime.now().hour
+    _is_night_hl = _now_h >= 23 or _now_h < 7
+    _last_tts_hl = result.get("_last_tts_at") if isinstance(result, dict) else None
+    _can_tts_hl = _last_tts_hl is None or (datetime.now() - datetime.fromisoformat(_last_tts_hl)).total_seconds() >= 600
+    if not _is_night_hl and _can_tts_hl:
+        try:
+            _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
+            if _tts_dir not in sys.path:
+                sys.path.insert(0, _tts_dir)
+            from ac_tts import speak
+            speak(result["decision"][:50])
+            if ac_alert:
+                speak(ac_alert, force=True)
+        except Exception:
+            pass
 
     # Windows toast (parallel to WeChat delivery)
     notify_windows("🏠 家居生活顾问", result["decision"])
