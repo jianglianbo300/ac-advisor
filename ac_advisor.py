@@ -1468,4 +1468,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    print("⚠️ ac_advisor.py 已被合并为纯模块，不再独立运行。")
+    print("   空调控制 → ac_watch.py（每2分钟自动闭环）")
+    print("   家庭生活 → home_living.py（换气/通风/提醒）")
+    print("   本文件仅作为 ac_watch.py 的共享函数库被导入。")
+    sys.exit(0)
