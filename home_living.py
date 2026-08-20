@@ -1691,11 +1691,7 @@ def main():
         print(_alert_text)   # empty -> silent (no WeChat/Windows delivery)
         if _alert_text:
             notify_windows("🌬 换气提醒", _alert_text)
-            try:
-                from ac_tts import speak
-                speak(_alert_text[:60])
-            except Exception:
-                pass
+            # v8.24: TTS disabled - ac_watch.py handles announcements
         return
 
     # Daily vent-report mode: dedicated ventilation morning brief.
@@ -1861,24 +1857,9 @@ def main():
 
     print("\n".join(out_lines))
 
-    # TTS broadcast (v8.23c: 夜间静音 + 仅模式变化 + 10min冷却)
-    _now_h = datetime.now().hour
-    _is_night_hl = _now_h >= 23 or _now_h < 7
-    _last_tts_hl = result.get("_last_tts_at") if isinstance(result, dict) else None
-    _can_tts_hl = _last_tts_hl is None or (datetime.now() - datetime.fromisoformat(_last_tts_hl)).total_seconds() >= 600
-    if not _is_night_hl and _can_tts_hl:
-        try:
-            _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
-            if _tts_dir not in sys.path:
-                sys.path.insert(0, _tts_dir)
-            from ac_tts import speak
-            speak(result["decision"][:50])
-            if ac_alert:
-                speak(ac_alert, force=True)
-        except Exception:
-            pass
-
     # Windows toast (parallel to WeChat delivery)
+    # v8.24: TTS disabled - ac_watch.py is the primary source, avoids duplicate announcements
+    # keep notify_windows as fallback
     notify_windows("🏠 家居生活顾问", result["decision"])
 
 
