@@ -58,8 +58,6 @@ from ac_advisor import evaluate_and_learn as evaluate
 from ac_advisor import log_decision as log_decision
 import os
 
-from ac_advisor import evaluate_and_learn as evaluate
-from ac_advisor import log_decision as log_decision
 
 
 # ── 并发锁（v8.10 Windows 兼容版 + atexit 清理） ──
@@ -122,7 +120,6 @@ WATCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_watch.l
 WATCH_MAX_RUN = 90      # 硬上限，防死锁
 
 # ── v8.5 夜间模式：控制继续，只静音 TTS ──
-QUIET_TTS = (23, 7)         # TTS 静音时段
 NIGHT = (23, 7)             # 夜间节能模式时段
 NIGHT_START_T = 27.0        # 夜间启动温度阈值（2026-08-19：28→27，用户在 27.0°C 实测反馈"热了"
                             # 却因 27<28 不触发，且关机后仍不会自动重开。旧值 28 是按女儿屋调的）
@@ -138,6 +135,7 @@ DAY_EXIT_RH_MAX = 62       # 双轴停止 RH 门（须 RH≤62 且 AH 达标；�
 DUAL_STOP_MIN_COMP = 10    # 双轴停止压缩机地板(min)：低于 MIN_RUN 因"目标完成≈安全类"允许早停
 NIGHT_MIN_COMP_ON = 20      # 夜间最小压缩机累计运行(min)
 NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
+DAY_MAX_STARTS_PER_H = 2       # 白天每小时启动次数上限（夜间 4）
 
 # ── v8.21 白天短循环根治（2026-08-19，cycle_log 51 周期实测诊断）──
 # 病象：08-18 下午 10 个「12min 开 / 16min 停」周期，一天 15 次启停。
@@ -219,7 +217,6 @@ VENT_GATE_DP_DIFF = 1.5   # 室外露点 ≤ 室内-1.5°C = 🟢 开窗可顺�
 VENT_GATE_MAX_RH = 69     # RH≥70（紧急闷）自动放行，门控自限
 VENT_GATE_HOURS = (8, 22) # 夜间关窗睡觉不适用
 VENT_WX_TTL_MIN = 30      # 天气缓存（仅门控触发时才拉，防 2min tick 打爆 API）
-VENT_TTS_COOLDOWN = 30    # TTS 提示最短间隔(min)；门控决策本身不受此限
 
 # ── v8.18 晚间恒温巡航（2026-08-16 实测定档）──
 # 依据：晚间锯齿（0.37kWh/h 实测）与持续26°C（0.32-0.54 估算）电耗打平，但温度 24-27 摆动
@@ -255,7 +252,6 @@ SENSOR_PLAUSIBLE_RH_MAX = 98       # 传感器合理湿度上限
 SENSOR_TIMEOUT_ESCALATE = 20       # 传感器断连超过此分钟数 → 升级动作
 FAKE_RUN_MAX_CYCLES = 3            # 假运行连续重试上限次数
 MANUAL_ANCHOR_TTL = 720            # 手动锚点有效时间(min) = 12h
-ACTION_TTS_COOLDOWN = 10           # TTS 播报最短间隔(min)，防每2分钟喊一次
 
 
 
@@ -265,12 +261,6 @@ def log(msg):
             f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
-
-
-def tts_mute(now=None):
-    """23-7 TTS 静音（通知层静默，不影响控制层）。"""
-    h = (now or datetime.now()).hour
-    return h >= QUIET_TTS[0] or h < QUIET_TTS[1]
 
 
 def night_hours(now=None):

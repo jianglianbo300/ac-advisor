@@ -66,7 +66,7 @@ def patch(vent_state, ac_off_calls):
         "read_ac_state": H.read_ac_state,
         "fetch_aqi": H.fetch_aqi,
         "load_state": H.load_state,
-        "_vent_off_ac": H._vent_off_ac,
+        "_vent_off_ac": None,  # removed: home_living 不控空调
     }
     box = dict(vent_state)
     # load_vent_cycle 必须返回副本：真实实现每次读文件得到新 dict，

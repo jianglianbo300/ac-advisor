@@ -2,28 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 Home Living Unified Advisor v11.0 - Shanghai Minhang
-Merges ac_advisor v10.1 + vent_reminder v2.2 into a single decision engine.
+Merges vent_reminder v2.2 + home_living into a single ventilation/weather/reminder module.
 
-v11.0 changes:
-- Unified AC + window + fan decision engine
-- Wet-bulb temperature (Stull 2011) for heat stress assessment
-- Comfort index humidity weight updated to 0.02
+v11.1 changes:
+- Stripped all AC control (delegated to ac_watch.py via ac_advisor.py)
 - Ventilation ACH model: wind pressure + stack effect, mix efficiency 0.7
-- Unified gate_check() shared by daily report + alert modes
-- Dew-point delta sorting for window selection
-- PM2.5 / AQI data source (Open-Meteo Air Quality)
-- Windows toast notification fallback
-- ASCII-safe docstrings throughout
 
-Retained from v9.0:
-- Indoor sensor reading (Miio Purifier 4 Lite)
-- Weather fetch (QW CMA data source)
-- Manual off anchor (2h no-auto-start)
-- Filter reminder
-- Night cost comparison
-- TTS broadcast
-- WeChat/desktop notification
-- All threshold constants
 """
 
 import gzip
@@ -32,10 +16,11 @@ import math
 import os
 import subprocess
 import sys
-import time
 import urllib.request
 from datetime import datetime, date, timezone, timedelta
 from enum import Enum
+import ac_advisor
+from ac_advisor import load_learned, save_learned, evaluate_and_learn, log_decision
 
 # -- Ensure miio is findable (cron may use python3.11, miio installed in 3.12) --
 _MIIO_PATHS = [
@@ -46,33 +31,8 @@ for _p in _MIIO_PATHS:
         sys.path.insert(0, _p)
 
 # -- Threshold constants (unified header, configurable) --
-TEMP_COOLING = 28       # HI >= 28 -> cooling
-TEMP_DEHUMID_LOW = 26   # dehumid temp lower bound
-TEMP_DEHUMID_HIGH = 28  # dehumid temp upper bound
-HUM_DEHUMID_ON = 65     # dehumid ON threshold
-HUM_DEHUMID_OFF = 55    # dehumid OFF threshold (10% hysteresis)
-WETBULB_DEHUMID_ON = 20.5  # dehumid when wet-bulb >= 20.5C (~26C/65%RH, 24C/72%RH)
-TEMP_ABSOLUTE_FLOOR = 24# dehumid absolute floor (OR escape hatch)
-MIN_RUN = 40            # min run time once on
-MIN_OFF = 30            # min off time at night before restart
-DAY_MIN_OFF = 15        # min off time daytime before restart
-MAX_RUN = 180           # max continuous run before switch/off
-
-# -- AC power (Chuan KFRd-35GW fixed freq 1.5P) --
-AC_INPUT_W = 1076     # input power W
-AC_COP = 3.25          # COP
-ELECTRIC_PEAK = 0.617   # Shanghai peak price (6:00-22:00)
-ELECTRIC_VALLEY = 0.307 # Shanghai valley price (22:00-6:00)
-ELECTRIC_PRICE = ELECTRIC_PEAK
-DEHUMID_DUTY = 0.60    # fixed freq dehumid duty cycle
-COOL_DUTY = 0.70       # fixed freq cooling duty cycle
-DEHUMID_MIN = 60       # dehumid typical minutes
-COOL_BURST_MIN = 40    # cooling burst minutes
-
-# -- Room / AC capacity factor (65 sqm, 1.5P fixed frequency) --
-AREA_SQM = 65                     # 70平 - 5平厕所 = 65平实际制冷
-AREA_FACTOR = AREA_SQM / 35.0   # 35 sqm = 1.5P design coverage
-AC_RATED_W = 3500              # 1.5P rated cooling capacity (W)
+# Note: AC control thresholds are now in ac_advisor.py, used by ac_watch.py.
+# home_living.py only keeps ventilation-related thresholds.
 
 # -- Vent reminder constants --
 LAT, LON = 31.11, 121.38  # Shanghai Minhang
@@ -176,7 +136,7 @@ def comfort_index(temp, hum):
     """Comfort index = T + 0.02 * (RH - 10)."""
     if hum is None:
         return temp
-    return temp + 0.02 * (hum - 10)
+    return temp + 0.05 * (hum - 10)
 
 def wet_bulb_temp(temp_c, rh):
     """Wet-bulb temperature (Stull 2011 empirical formula)."""
@@ -247,116 +207,6 @@ def should_precool(wx, current_hi, threshold_hi):
 # ============================================================
 # Adaptive threshold learning (persistent)
 # ============================================================
-def load_learned() -> dict:
-    """Load learned results: adjusted_thresholds + decision_log."""
-    default = {"adjusted_thresholds": {}, "decision_log": []}
-    try:
-        if os.path.exists(LEARN_FILE):
-            with open(LEARN_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
-
-
-def save_learned(learned: dict):
-    """Persist learned results (atomic write)."""
-    tmp = LEARN_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(learned, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, LEARN_FILE)
-
-
-def evaluate_and_learn(state, now_ts):
-    """Post-decision review: on -> temp dropped? off -> stuffy?
-    Success -> threshold unchanged; failure -> threshold +/- 1C.
-
-    v11.1 (2026-08-18) fixes:
-    - Power gate: if the compressor is actually running (socket power
-      >300W), a slow temp drop is NOT a decision failure. 65sqm on 1.5P
-      is chronically underpowered; without the gate, every cooling run
-      gets misjudged as failure and temp_cooling drifts to -8.
-    - Threshold clamp: temp_cooling bounded to [-2, +2] (was unbounded).
-    """
-    learned = load_learned()
-    log = learned.get("decision_log", [])
-    # v8.23 修反向条件：原 `time < cutoff → continue` 实际是"丢弃超过 30 分钟的"，
-    # 于是刚做完的决策立刻被回评，温度还没变化必然判失败、阈值 -1 —— 这是偏移
-    # 一路撞到 -2 下限的根因。正确语义：已满观察期才有资格回评。
-    cutoff = (datetime.now() - timedelta(minutes=EVAL_DELAY_MIN)).isoformat()
-    stale = (datetime.now() - timedelta(minutes=EVAL_STALE_MIN)).isoformat()
-    adjusted = learned.get("adjusted_thresholds", {})
-    # Power gate: is the compressor actually drawing power right now?
-    comp_power = state.get("_prev_power") or state.get("measured_w")
-    comp_running = (comp_power or 0) > 300
-    for entry in log:
-        ts = entry.get("time", "")
-        if entry.get("evaluated"):
-            continue
-        if ts > cutoff:
-            continue                     # 还没到观察期
-        if ts < stale:
-            entry["evaluated"] = True    # 太久远，消费但不学习
-            continue
-        pre_temp = entry.get("pre_temp")
-        pre_hum = entry.get("pre_hum")
-        action = entry.get("action")
-        cur_temp = state.get("last_temp")
-        cur_hum = state.get("last_hum")
-        if pre_temp is None or cur_temp is None:
-            entry["evaluated"] = True
-            continue
-        success = True
-        if action in ("cooling", "dehumid"):
-            temp_drop = pre_temp - cur_temp
-            hum_drop = (pre_hum or 0) - (cur_hum or 0)
-            # Power gate: compressor running = the decision is being
-            # executed; slow cooldown is physics, not a bad threshold.
-            if comp_running:
-                success = True
-            elif temp_drop < 0.3 and hum_drop < 3:
-                success = False
-        elif action in ("off", "fan"):
-            temp_rise = cur_temp - pre_temp
-            if temp_rise > 2.0 or (cur_hum is not None and cur_hum > 80):
-                success = False
-        # v8.23 修单向棘轮：原实现两个分支都只 -1、成功时不做任何事，于是阈值只降
-        # 不升，必然漂到下限（实测 ac_learned.json 已撞 -2 并停住）。v11.1 的钳位
-        # 只是止损，没修方向性。成功时向 0 收敛一步，让偏移能回到中性。
-        cur_adj = adjusted.get("temp_cooling", 0)
-        if not success:
-            adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
-        elif cur_adj < 0:
-            adjusted["temp_cooling"] = cur_adj + 1
-        elif cur_adj > 0:
-            adjusted["temp_cooling"] = cur_adj - 1
-        entry["evaluated"] = True
-    learned["adjusted_thresholds"] = adjusted
-    learned["decision_log"] = log[-50:]
-    save_learned(learned)
-
-
-def log_decision(state, action, pre_temp, pre_hum, now_ts):
-    """Record a decision for later review."""
-    learned = load_learned()
-    log = learned.get("decision_log", [])
-    log.append({
-        "time": now_ts,
-        "action": action,
-        "pre_temp": pre_temp,
-        "pre_hum": pre_hum,
-        "evaluated": False,
-    })
-    learned["decision_log"] = log[-50:]
-    save_learned(learned)
-
-
-# ============================================================
-# Thermal event learning (persistent, ac_thermal.json)
-# ============================================================
-THERMAL_FILE = os.path.join(SCRIPT_DIR, "ac_thermal.json")
-
-
 def load_thermal_data() -> dict:
     """Load thermal learning data (events + fitted model)."""
     default = {
@@ -703,252 +553,6 @@ def _read_indoor_once(ip, token, timeout):
 
 # ============================================================
 # AC control
-# ============================================================
-def ac_control_init():
-    """Init AC control handle. miio_config.json ac_control=False disables."""
-    global AC_CTRL
-    AC_CTRL = None
-    try:
-        with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-        ap = cfg.get("ac_partner") or {}
-        if ap.get("ip") and ap.get("token") and cfg.get("ac_control", True):
-            from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
-            AC_CTRL = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
-    except Exception:
-        AC_CTRL = None
-
-
-def ac_apply(new_mode, target_temp=None):
-    """Execute decision to AC socket via IR.
-    Returns {"status": "action"|"no_action"|"failed", "action": str, "reason": str}."""
-    if new_mode == "dehumid_alert":
-        return {"status": "no_action", "action": "", "reason": "alert_only"}
-    if AC_CTRL is None:
-        return {"status": "failed", "action": "", "reason": "control_unavailable"}
-    try:
-        st = AC_CTRL.status()
-        on = st.is_on
-    except Exception as e:
-        return {"status": "failed", "action": "", "reason": f"status_read_failed: {e}"}
-    act = []
-    if new_mode in ("cooling", "dehumid"):
-        want_mode = "cool" if new_mode == "cooling" else "dry"
-        if not on:
-            try:
-                AC_CTRL.send_command("set_power", ["on"])
-                act.append("开机")
-                on = True
-            except Exception as e:
-                return {"status": "failed", "action": "开机", "reason": f"power_on_failed: {e}"}
-        try:
-            if st.mode is not None and st.mode.value != want_mode:
-                AC_CTRL.send_command("set_mode", [want_mode])
-                act.append(f"模式{want_mode}")
-        except Exception:
-            pass
-        if want_mode == "dry":
-            pass
-        else:
-            try:
-                if target_temp and st.target_temperature != target_temp:
-                    AC_CTRL.send_command("set_tar_temp", [target_temp])
-                    act.append(f"设定{target_temp}°C")
-            except Exception:
-                pass
-    elif new_mode == "fan_locked":
-        pass
-    elif new_mode in ("fan", "off"):
-        if on:
-            try:
-                AC_CTRL.send_command("set_power", ["off"])
-                act.append("关机")
-            except Exception as e:
-                return {"status": "failed", "action": "关机", "reason": f"power_off_failed: {e}"}
-    return {"status": "action" if act else "no_action", "action": "，".join(act), "reason": ""}
-
-
-def reconcile_state(state, now_ts):
-    """Reconcile persistent state with socket reality (P2).
-    Socket reachable: real device state wins.
-    System-initiated off (marked _system_off_at) not treated as manual."""
-    if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
-        sys_off = state.get("_system_off_at")
-        is_system_off = False
-        if sys_off:
-            try:
-                sys_off_dt = datetime.fromisoformat(sys_off) if isinstance(sys_off, str) else sys_off
-                now_dt = datetime.fromisoformat(now_ts) if isinstance(now_ts, str) else now_ts
-                if (now_dt - sys_off_dt).total_seconds() < 180:
-                    is_system_off = True
-            except Exception:
-                pass
-        if not is_system_off:
-            state["manual_off_at"] = now_ts
-        state["mode"] = "off"
-        state["last_off_at"] = now_ts
-        state["run_start"] = None
-        state.pop("_system_off_at", None)
-        return
-
-    if state.get("_system_off_at"):
-        state.pop("_system_off_at", None)
-    if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
-        state["manual_on_at"] = now_ts
-        state["mode"] = "cooling"
-        state["run_start"] = now_ts
-        state["_fake_run_count"] = 0
-        _learn_from_manual(state, now_ts)
-
-
-def verify_socket():
-    """Post-command verify: read real socket state. Returns "on"|"off"|None."""
-    if AC_CTRL is None:
-        return None
-    try:
-        s = AC_CTRL.status()
-        return "on" if s.is_on else "off"
-    except Exception:
-        return None
-
-
-def apply_state_from_verify(state, new_mode, real, now_ts):
-    """Update run/stop anchors from socket reality. Returns None=consistent, True=contradict."""
-    was_on = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
-    if real == "on":
-        if new_mode in ("cooling", "dehumid", "dehumid_alert"):
-            if not was_on:
-                state["run_start"] = now_ts
-                state["last_on_at"] = now_ts
-            state["mode"] = new_mode
-            return None
-        state["mode"] = "cooling"
-        state.pop("last_off_at", None)
-        return True
-    # real == "off"
-    if new_mode in ("fan", "fan_locked", "off"):
-        if was_on:
-            state["last_off_at"] = now_ts
-            state["_system_off_at"] = now_ts
-        state["mode"] = new_mode
-        state["run_start"] = None
-        return None
-    state["mode"] = "off"
-    state["run_start"] = None
-    return True
-
-
-def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None):
-    """Single execution interface (P2 ownership): ac_apply -> verify -> update state -> commit."""
-    if now_ts is None:
-        now_ts = datetime.now().isoformat(timespec="seconds")
-    ctrl = ac_apply(new_mode, target_temp)
-    if ctrl["status"] == "failed":
-        save_state(state)
-        return ctrl
-    real = verify_socket()
-    if real is None:
-        ctrl = {"status": "failed", "action": ctrl.get("action", ""), "reason": "verify_unreachable"}
-        save_state(state)
-        return ctrl
-    contradict = apply_state_from_verify(state, new_mode, real, now_ts)
-    if contradict:
-        ctrl = {"status": "failed", "action": ctrl.get("action", ""),
-                "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on"}
-    if meta and not contradict:
-        for k, v in meta.items():
-            state[k] = v
-    if not contradict and target_temp is not None:
-        state["target_temp"] = target_temp
-    save_state(state)
-    return ctrl
-
-
-def read_ac_power(timeout=4.0):
-    """Read AC socket measured power (W) and on/off state.
-    Returns measured watts (on + readable), else None."""
-    global AC_MEASURED_W, AC_SOCKET
-    AC_SOCKET = None
-    try:
-        with open(CONFIG_FILE) as f:
-            cfg = json.load(f)
-        ap = cfg.get("ac_partner") or {}
-        if not ap.get("ip") or not ap.get("token"):
-            return None
-        from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
-        d = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
-        st = d.status()
-        AC_SOCKET = "on" if st.is_on else "off"
-        AC_MEASURED_W = None
-        if st.is_on and st.load_power and st.load_power > 0:
-            AC_MEASURED_W = round(st.load_power)
-            return AC_MEASURED_W
-    except Exception:
-        pass
-    return None
-
-
-# ============================================================
-# User habit learning
-# ============================================================
-NIGHT_HOURS = 6
-DAYS_PER_MONTH = 30
-
-
-def _learn_from_manual(state, now_ts):
-    """Learn user habits: 3+ manual interventions -> auto-adjust threshold."""
-    try:
-        rh_hist = state.get("rh_history", [])
-        if not rh_hist:
-            return
-        last_rh = rh_hist[-1][1] if rh_hist else None
-        if last_rh is None:
-            return
-        pref = state.get("user_pref", {})
-        manual_log = pref.get("manual_on_log", [])
-        manual_log.append({
-            "ts": now_ts,
-            "rh": last_rh,
-            "mode": state.get("mode"),
-        })
-        if len(manual_log) > 20:
-            manual_log = manual_log[-20:]
-        pref["manual_on_log"] = manual_log
-        low_rh_manual = [m for m in manual_log if 60 <= m.get("rh", 0) < 65]
-        if len(low_rh_manual) >= 3:
-            pref["hum_threshold"] = 60
-        else:
-            pref.pop("hum_threshold", None)
-        state["user_pref"] = pref
-    except Exception:
-        pass
-
-
-def night_cost_lines(indoor_temp, indoor_hum):
-    """Night cost comparison (20:00-06:00 valley window)."""
-    h = datetime.now().hour
-    if not (h >= 20 or h < 6):
-        return []
-    p = ELECTRIC_VALLEY
-    kb = kwh_est(COOL_BURST_MIN, COOL_DUTY)
-    dd = dehumid_duty(indoor_temp if indoor_temp is not None else 26.5, indoor_hum)
-    duty_26 = dehumid_duty(26, indoor_hum) if indoor_hum else 0.45
-    duty_24 = dehumid_duty(24, indoor_hum) if indoor_hum else 0.55
-    k26 = kwh_est(NIGHT_HOURS * 60, duty_26)
-    k24 = kwh_est(NIGHT_HOURS * 60, duty_24)
-    kd = kwh_est(NIGHT_HOURS * 60, dd)
-    lines = [f"🌙 夜间方案对比（谷电 {p:.3f} 元/度）:"]
-    lines.append(f"   0️⃣ 压一轮24°C×40~60min: {kb:.2f}度 ≈ {kb * p:.2f}元 ← 最省")
-    lines.append(f"   1️⃣ 睡眠+制冷26°C整夜:  {k26:.2f}度 ≈ {k26 * p:.2f}元")
-    lines.append(f"   2️⃣ 睡眠+制冷24°C整夜:  {k24:.2f}度 ≈ {k24 * p:.2f}元（贵 {(k24 - k26) * p * DAYS_PER_MONTH:.1f}元/月）")
-    lines.append(f"   3️⃣ 除湿模式整夜:        {kd:.2f}度 ≈ {kd * p:.2f}元")
-    if indoor_hum is not None and indoor_hum > 70:
-        lines.append("   💡 湿度偏高：先压轮24°C到60%再睡")
-    else:
-        lines.append("   💡 湿度不高：压轮收工最省")
-    return lines
-
-
 def filter_clean_reminder():
     """Filter cleaning reminder: dirty filter = less airflow = slower dehumid = waste."""
     try:
@@ -963,9 +567,6 @@ def filter_clean_reminder():
     except Exception:
         return None
 
-
-# ============================================================
-# Ventilation functions (from vent_reminder v2.2)
 # ============================================================
 def read_ac_state():
     """Read AC state from home_state.json: returns mode or None."""
@@ -1273,20 +874,6 @@ def save_vent_cycle(d: dict):
         pass
 
 
-def _vent_off_ac(state, now_ts):
-    """Stop AC (cooling/dehumid) before window opens. Returns a note str."""
-    if "--vent-dry-run" in sys.argv:
-        return "（DRY-RUN：本应自动停空调）"
-    try:
-        ac_control_init()
-        if AC_CTRL is None:
-            return "（⚠️ 空调控制不可用，请手动关空调）"
-        ctrl = apply_and_commit("off", None, state, now_ts, meta={"_vent_off_at": now_ts})
-        if ctrl["status"] == "failed":
-            return f"（⚠️ 停空调失败: {ctrl.get('reason', '')}，请手动关）"
-        if ctrl.get("action"):
-            return f"（已自动关空调: {ctrl['action']}）"
-        return "（空调已是关闭状态）"
     except Exception as e:
         return f"（⚠️ 停空调异常: {e}，请手动关）"
 
@@ -1410,7 +997,7 @@ def vent_cycle_step(data, indoor_temp, indoor_hum, now=None):
     # -- Window began -> start cycle: stop AC + remind open --
     state = load_state()
     now_ts = now.isoformat(timespec="seconds")
-    ac_note = _vent_off_ac(state, now_ts)
+    ac_note = "（请先关空调再开窗）"  # home_living 不控空调，仅提示
     end_dt = now + timedelta(minutes=dur)
     save_vent_cycle({
         "date": today,
@@ -1478,168 +1065,41 @@ def notify_windows(title, text):
 # ============================================================
 # Unified decision engine (v11.0 new)
 # ============================================================
-def unified_decision(wx, indoor_temp, indoor_hum, state, now_ts):
-    """Unified AC + window + fan decision.
-    Room-aware: AREA_FACTOR scales MIN_RUN/MIN_OFF/MAX_RUN for
-    underpowered 1.5P AC on 65 sqm.
-    """
-    # -- Room size adaptation (65 sqm, 1.5P = underpowered) --
-    eff_min_run = int(MIN_RUN * AREA_FACTOR)   # 40 * 1.86 = 74 min
-    eff_min_off = int(MIN_OFF * AREA_FACTOR)   # 30 * 1.86 = 56 min
-    eff_max_run = int(MAX_RUN * AREA_FACTOR)   # 180 * 1.86 = 335 min
-    pre_offset = 2 if AREA_FACTOR <= 1.2 else int(2 * (AREA_FACTOR / 1.2))
-
-    # Seasonal + learned offsets
-    temp_offset, hum_offset, strategy_label = seasonal_adjustments()
-    learned = load_learned()
-    learned_temp_adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
-    effective_cooling_threshold = TEMP_COOLING + temp_offset + learned_temp_adj
-    # v11.1: user habit learning output was dead code (written to
-    # user_pref.hum_threshold but never read). Wire it in: user prefers
-    # dehumid earlier -> lower the ON threshold (never below 60).
-    user_hum_pref = state.get("user_pref", {}).get("hum_threshold")
-    if isinstance(user_hum_pref, (int, float)):
-        effective_hum_threshold = min(HUM_DEHUMID_ON + hum_offset, user_hum_pref)
-    else:
-        effective_hum_threshold = HUM_DEHUMID_ON + hum_offset
-
-    # Signal selection
-    cur = wx.get("current", {})
-    temp = cur.get("apparent_temperature", cur.get("temperature_2m", 0))
-    hum_out = cur.get("relative_humidity_2m")
-    signal = indoor_temp if indoor_temp is not None else temp
-    hum_sig = indoor_hum if indoor_hum is not None else None
-
-    hi = comfort_index(signal, hum_sig)
-
-    # Humidity trigger: wet-bulb (T+RH combined) replaces raw RH
-    # for dehumid decisions; falls back to raw RH when wet-bulb is unavailable.
-    tw = wet_bulb_temp(signal, hum_sig)
-    humid_high = tw >= WETBULB_DEHUMID_ON if tw is not None else (
-        hum_sig is not None and hum_sig > effective_hum_threshold)
-
-    # Ventilation check
-    hourly = wx.get("hourly", {})
-    h_time = hourly.get("time", [])
-    h_hum = hourly.get("relative_humidity_2m", [])
-    h_precip = hourly.get("precipitation_probability", [])
-    h_ws = hourly.get("wind_speed_10m", [])
-    h_wd = hourly.get("wind_direction_10m", [])
-    h_gust = hourly.get("wind_gusts_10m", [])
-    h_temp = hourly.get("temperature_2m", [])
-
-    vent_ok = False
-    vent_reason = None
-    best_window = None
-    today = date.today().isoformat()
-    rows = build_rows(hourly, today) if hourly else []
-    aqi = fetch_aqi(1)
-    ac_mode_state = state.get("mode")
-    best_win, blocked = pick_best(rows, indoor_temp, indoor_hum, ac_mode_state, aqi) if rows else (None, None)
-
-    if best_win is not None:
-        pm25 = aqi.get(f"{today}T{best_win['hr']:02d}:00") if aqi else None
-        ok, reason = gate_check(best_win["rh"], best_win["pp"], best_win["rain_mm"],
-                                best_win["temp"], best_win["wind_kmh"] / 3.6,
-                                best_win["gust_ms"], pm25,
-                                indoor_temp, indoor_hum)
-        vent_ok = ok
-        vent_reason = reason
-
-    # AC decision (same tree as v9.0 main)
-    decision = None
-    reason = ""
-    new_mode = None
-    burst_set = None
-
-    precool, max_future_hi, _ = should_precool(wx, hi, effective_cooling_threshold)
-
-    if hi >= effective_cooling_threshold:
-        reco = round(max(26, min(28, signal - 2)))
-        burst_set = reco
-        decision = f"制冷模式 {reco}°C + 自动风速"
-        reason = f"HI={hi:.1f}（{signal:.1f}°C/{hum_sig}%）≥ {effective_cooling_threshold}°C"
-        new_mode = "cooling"
-    elif (TEMP_ABSOLUTE_FLOOR <= signal < TEMP_DEHUMID_LOW
-          and hum_sig is not None and hum_sig > effective_hum_threshold):
-        burst_set = 23
-        decision = "制冷 23°C 强制除湿一轮"
-        reason = f"低温高湿：{signal:.1f}°C / 湿度{hum_sig:.0f}%"
-        new_mode = "cooling"
-    elif (TEMP_DEHUMID_LOW <= signal < TEMP_DEHUMID_HIGH
-          and hum_sig is not None and hum_sig > effective_hum_threshold):
-        running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
-        since_on = minutes_since(state.get("run_start"))
-        over_max = running and since_on is not None and since_on >= eff_max_run
-        if over_max:
-            decision = "建议切换制冷或关"
-            reason = f"除湿已连续运行≥{MAX_RUN}分钟"
-            new_mode = "dehumid_alert"
-        else:
-            burst_set = 24
-            decision = "制冷 24°C 集中除湿一轮"
-            reason = f"湿度{hum_sig:.0f}% > {effective_hum_threshold}%"
-            new_mode = "cooling"
-    elif signal >= TEMP_DEHUMID_LOW:
-        decision = "风扇够用，不用开空调"
-        reason = f"{signal:.1f}°C，不算热"
-        new_mode = "fan"
-    else:
-        if signal < TEMP_ABSOLUTE_FLOOR:
-            decision = "关掉除湿！已经过冷"
-            reason = f"温度{signal:.1f}°C < {TEMP_ABSOLUTE_FLOOR}°C"
-            new_mode = "off"
-        else:
-            decision = "不用开空调，开窗通风+风扇"
-            reason = f"温度{signal:.1f}°C，凉快"
-            new_mode = "off"
-
-    if precool and new_mode in ("fan", "off", "fan_locked"):
-        decision = f"预冷建议：未来{pre_offset}h HI={max_future_hi:.1f}°C"
-        reason = f"当前HI={hi:.1f}°C，未来{pre_offset}h将达{max_future_hi:.1f}°C"
-        burst_set = round(max(26, min(28, signal - 2)))
-        new_mode = "cooling"
-
-    # State machine validation
-    current_state = ACState(state.get("mode", "off") or "off")
-    target_state = ACState(new_mode if new_mode in ("cooling", "dehumid", "fan", "fan_locked", "off") else "off")
-    validated_state = transition(current_state, target_state)
-    if validated_state != target_state:
-        new_mode = validated_state.value
-        reason += f"（状态机校验：{current_state.value}→{target_state.value} 非法，保持{validated_state.value}）"
-
-    # Min run/off constraints (scaled by area factor)
-    since_off = minutes_since(state.get("last_off_at"))
-    since_on = minutes_since(state.get("run_start"))
-    if new_mode in ("cooling", "dehumid", "dehumid_alert"):
-        if since_off is not None and since_off < eff_min_off:
-            decision = f"风扇（关后{eff_min_off}分钟内不重开）"
-            reason += f"；关后仅{int(since_off)}分钟"
-            new_mode = "fan_locked"
-    elif new_mode in ("fan", "fan_locked", "off"):
-        if since_on is not None and since_on < eff_min_run:
-            decision = f"继续开着（开够{eff_min_run}分钟再关）"
-            reason += f"；开仅{int(since_on)}分钟"
-            new_mode = state.get("mode", "unknown")
-
-    return {
-        "ac_mode": new_mode,
-        "decision": decision,
-        "reason": reason,
-        "burst_set": burst_set,
-        "vent_ok": vent_ok,
-        "vent_reason": vent_reason,
-        "best_window": best_window,
-        "strategy_label": strategy_label,
-        "effective_cooling_threshold": effective_cooling_threshold,
-        "hi": hi,
-    }
 
 
-def format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert):
-    """Format unified output string."""
-    lines = []
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+# ============================================================
+# Main
+# ============================================================
+def main():
+    """Home living main: ventilation/weather/reminder only (no AC control)."""
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    # -- 0. Mode dispatch ---------------------------------------------------
+    if "--alert" in sys.argv:
+        _alert_text = alert_check()
+        print(_alert_text)
+        if _alert_text:
+            notify_windows("🌬 换气提醒", _alert_text)
+        return
+
+    if "--daily" in sys.argv or "--report" in sys.argv:
+        _report = daily_report()
+        print(_report)
+        _toast = "\n".join(_report.splitlines()[:3])
+        notify_windows("🌬 今日换气", _toast)
+        return
+
+    # -- 1. Fetch weather, read indoor --
+    wx = fetch_weather()
+    if "error" in wx:
+        print(f"⚠️ 天气API失败: {wx['error']}")
+        print("🏠 上海闵行 · 家居生活顾问")
+        print("  数据不可用，请稍后再查")
+        return
+
+    indoor_temp, indoor_hum = read_indoor()
+
+    # -- 2. Build output --
     cur = wx.get("current", {})
     dai = wx.get("daily", {})
     temp = cur.get("temperature_2m", 0)
@@ -1648,219 +1108,57 @@ def format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_
     wcode = cur.get("weather_code", 0)
     max_t = dai.get("temperature_2m_max", [0])[0]
     rain = dai.get("precipitation_probability_max", [0])[0]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    lines.append(f"🏠 上海闵行 · 家居生活统一顾问 v11.0")
+    lines = []
+    lines.append(f"🏠 上海闵行 · 家居生活顾问 v11.1")
     lines.append(f"📅 {now_str} · {weather_cn(wcode)}")
     lines.append("")
     lines.append(f"  室外: {temp:.1f}°C  体感: {feels:.1f}°C  湿度: {hum_out:.0f}%")
     if indoor_temp is not None:
         lines.append(f"  室内: {indoor_temp:.1f}°C  湿度: {indoor_hum:.0f}%")
     else:
-        lines.append(f"  室内传感器不可用")
+        lines.append("  室内传感器不可用")
     lines.append(f"  今日最高: {max_t:.1f}°C  降雨: {rain:.0f}%")
-    lines.append(f"  舒适度HI: {result['hi']:.1f}（阈值{result['effective_cooling_threshold']:.0f}°C，{result['strategy_label']}）")
-    if run_info:
-        lines.append(run_info)
-    if ac_w:
-        lines.append(f"  🔌 空调实测功率: {ac_w}W")
-    if ctrl and ctrl.get("status") == "action":
-        lines.append(f"  🎛️ 已自动执行: {ctrl['action']}")
-    elif ctrl and ctrl.get("status") == "no_action":
-        lines.append("  🎛️ 已处目标状态，无需动作")
-    elif ctrl:
-        lines.append(f"  ⚠️ 自动控制失败（{ctrl.get('reason', '')}）")
     lines.append("")
-    lines.append(f"  💡 {result['decision']}")
-    lines.append(f"     ({result['reason']})")
-    if ac_alert:
-        lines.append(ac_alert)
-    lines.append("")
-    return lines
 
-
-# ============================================================
-# Main
-# ============================================================
-def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
-    # -- 0. Mode dispatch ---------------------------------------------------
-    # Alert mode: lightweight "good window ahead" reminder, silent if none.
-    if "--alert" in sys.argv:
-        _alert_text = alert_check()
-        print(_alert_text)   # empty -> silent (no WeChat/Windows delivery)
-        if _alert_text:
-            notify_windows("🌬 换气提醒", _alert_text)
-            # v8.24: TTS disabled - ac_watch.py handles announcements
-        return
-
-    # Daily vent-report mode: dedicated ventilation morning brief.
-    if "--daily" in sys.argv or "--report" in sys.argv:
-        _report = daily_report()
-        print(_report)
-        _toast = "\n".join(_report.splitlines()[:3])
-        notify_windows("🌬 今日换气", _toast)
-        return
-
-    # -- 1. Fetch weather --
-    wx = fetch_weather()
-    if "error" in wx:
-        print(f"⚠️ 天气API失败: {wx['error']}")
-        print("🏠 上海闵行 · 家居生活统一顾问 v11.0")
-        print("  数据不可用，请稍后再查")
-        return
-
-    # -- 2. Read indoor + AC --
-    indoor_temp, indoor_hum = read_indoor()
-    indoor_ok = indoor_temp is not None and indoor_hum is not None
-    ac_w = read_ac_power()
-    ac_control_init()
-
-    # -- 3. Load state --
-    state = load_state()
-    now_ts = datetime.now().isoformat()
-    now_dt = datetime.now()
-    reconcile_state(state, now_ts)
-
-    # Manual off anchor
-    _manual_anchor = False
-    _manual_anchor_mins = None
-    manual_off = state.get("manual_off_at")
-    if manual_off and state.get("mode") in (None, "off"):
-        try:
-            off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
-            mins = (now_dt - off_dt).total_seconds() / 60
-            if 0 <= mins < 30:
-                _manual_anchor = True
-                _manual_anchor_mins = int(mins)
-            if mins >= 720:
-                state.pop("manual_off_at", None)
-        except Exception:
-            pass
-
-    # -- 4. Unified decision --
-    result = unified_decision(wx, indoor_temp, indoor_hum, state, now_ts)
-    new_mode = result["ac_mode"]
-    burst_set = result["burst_set"]
-
-    # Manual anchor override
-    if _manual_anchor and new_mode in ("cooling", "dehumid", "dehumid_alert"):
-        new_mode = "off"
-        result["decision"] = "保持现状（手动关后" + str(_manual_anchor_mins) + "分钟内不自动启动）"
-        result["reason"] = "manual_off_anchor"
-        burst_set = None
-    # -- 5. Log + apply --
-    # v8.24 F2: 不再记录决策/学习，避免与 ac_watch.py 冲突
-    # ac_watch.py 是唯一控制入口，负责唯一的自学习
-    # log_decision(state, new_mode, indoor_temp, indoor_hum, now_ts)
-    # Record thermal event for learning
-    if new_mode in ("cooling", "dehumid"):
-        record_thermal_event("cooling", indoor_temp, None, None, wx.get("current", {}).get("temperature_2m"))
-    elif new_mode in ("off", "fan") and state.get("mode") in ("cooling", "dehumid"):
-        record_thermal_event("warming", indoor_temp, None, None, wx.get("current", {}).get("temperature_2m"))
-
-    state["last_temp"] = indoor_temp
-    state["last_hum"] = indoor_hum
-    # v8.24: advice-only mode, no actual AC control
-    ctrl = {"status": "no_action", "action": "", "reason": ""}
-    # evaluate_and_learn(state, now_ts)
-
-
-    # -- 6. Build output --
-    run_info = ""
-    # v8.24: home_living 不再控制空调，仅提供建议（实际控制 = ac_watch.py）
-    _cur_mode = state.get("mode")
-    if _cur_mode in ("cooling", "dehumid", "dehumid_alert"):
-        run_info = "  🔌 空调运行中（ac_watch 控制）"
-    elif _cur_mode in ("off", "fan", "fan_locked"):
-        run_info = "  🔌 空调已关（ac_watch 控制）"
-    elif new_mode in ("cooling", "dehumid", "dehumid_alert"):
-        run_info = "  建议开启（ac_watch 实际控制）"
-
-    # Humidity alert
-    ac_alert = ""
-    _alert_state = {}
-    _alert_file = os.path.join(SCRIPT_DIR, "ac_alert_state.json")
-    try:
-        if os.path.exists(_alert_file):
-            with open(_alert_file, "r", encoding="utf-8") as f:
-                _alert_state = json.load(f)
-    except Exception:
-        pass
-    _today = datetime.now().strftime("%Y-%m-%d")
-    if (new_mode in ("fan", "fan_locked", "off")
-            and indoor_hum is not None and indoor_hum > 78
-            and indoor_temp is not None and indoor_temp >= TEMP_ABSOLUTE_FLOOR
-            and _alert_state.get("last_alert_day") != _today):
-        _alert_state["last_alert_day"] = _today
-        _alert_state["updated_at"] = datetime.now().isoformat()
-        try:
-            with open(_alert_file, "w", encoding="utf-8") as f:
-                json.dump(_alert_state, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        ac_alert = (f"  ⚠️ 湿度{indoor_hum:.0f}%偏高：就算不热，也该开空调压轮湿度"
-                    f"（制冷集中 40~60 分钟，到 60% 关）")
-
-    # v8.24: advice-only mode, no actual AC control
-    ctrl = {"status": "no_action", "action": "", "reason": ""}
-
-    # Format + print
-    out_lines = format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert)
-
+    # -- 3. Ventilation report --
     try:
         _daily_vent = daily_report()
         if _daily_vent:
             for _vl in _daily_vent.splitlines():
-                out_lines.append(f"  {_vl}")
-            out_lines.append("")
+                lines.append(f"  {_vl}")
+            lines.append("")
     except Exception:
         pass
-    hum_out = wx.get("current", {}).get("relative_humidity_2m")
+
+    # -- 4. Vent advice --
     vent_lines = vent_advice(indoor_hum, hum_out, indoor_temp,
                              wx.get("current", {}).get("temperature_2m"))
     if vent_lines:
-        out_lines.append("  🌬 即时通风建议:")
+        lines.append("  🌬 即时通风建议:")
         for vl in vent_lines:
-            out_lines.append(f"     {vl}")
-    out_lines.append("")
+            lines.append(f"     {vl}")
+    lines.append("")
 
-    # Window close reminder
-    dai = wx.get("daily", {})
-    rain = dai.get("precipitation_probability_max", [0])[0]
+    # -- 5. Window close reminder --
     if rain >= 45:
-        out_lines.append("  ⚠️ 今日有雨，请勿开窗（防潮）")
+        lines.append("  ⚠️ 今日有雨，请勿开窗（防潮）")
     elif hum_out is not None and hum_out >= 85:
-        out_lines.append(f"  ⚠️ 室外潮湿({hum_out:.0f}%)，请勿开窗（防潮）")
+        lines.append(f"  ⚠️ 室外潮湿({hum_out:.0f}%)，请勿开窗（防潮）")
 
-    # AC tips
-    if new_mode in ("cooling", "dehumid"):
-        out_lines.append(f"  ⏱ 开够 {MIN_RUN} 分钟再关，关后等 {MIN_OFF} 分钟再开")
-        if new_mode == "dehumid":
-            out_lines.append(f"  ⏱ 温度<{TEMP_ABSOLUTE_FLOOR}°C 或 湿度<{HUM_DEHUMID_OFF}% 可关")
-        else:
-            out_lines.append(f"  💡 湿度<60%且温度≤27 / 湿度60-70%且≤26 → 可关")
-            out_lines.append(f"  🔁 省电：制冷设 {burst_set or TEMP_DEHUMID_LOW}°C 集中 40~60 分钟 → 湿度到60%即关")
-
-    # Filter reminder
+    # -- 6. Filter reminder --
     reminder = filter_clean_reminder()
     if reminder:
-        out_lines.append(reminder)
+        lines.append(reminder)
+    lines.append("")
+    lines.append("─" * 40)
+    lines.append("数据: 和风天气(CMA) + Open-Meteo空气质量 + 小米净化器4Lite")
 
-    # Night cost comparison
-    for nl in night_cost_lines(indoor_temp, indoor_hum):
-        out_lines.append(nl)
+    print("\n".join(lines))
 
-    out_lines.append("")
-    out_lines.append("─" * 40)
-    out_lines.append("数据: 和风天气(CMA) + Open-Meteo空气质量 + 小米净化器4Lite · 统一决策v11.0")
-
-    print("\n".join(out_lines))
-
-    # Windows toast (parallel to WeChat delivery)
-    # v8.24: TTS disabled - ac_watch.py is the primary source, avoids duplicate announcements
-    # keep notify_windows as fallback
-    notify_windows("🏠 家居生活顾问", result["decision"])
+    # Windows toast notification
+    notify_windows("🏠 家居生活顾问", "通风/换气提醒生成")
 
 
 if __name__ == "__main__":
