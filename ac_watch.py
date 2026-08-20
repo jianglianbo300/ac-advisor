@@ -53,8 +53,13 @@ import math
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import ac_advisor as A
+from ac_advisor import evaluate_and_learn as evaluate
+from ac_advisor import log_decision as log_decision
+
+from ac_advisor import evaluate_and_learn as evaluate
+from ac_advisor import log_decision as log_decision
+
 
 # ── 并发锁（v8.10 Windows 兼容版 + atexit 清理） ──
 # v8.21：改为惰性获取。原先在 module import 阶段就抢锁，并在抢不到时直接
@@ -150,14 +155,25 @@ NIGHT_MAX_STARTS_PER_H = 4  # 每小时启动次数上限
 #       白天补 AH 迟滞带与夜间对称；并给白天启停次数加显式上限。
 DAY_STOP_AH_HYST = 2.0       # 白天 AH 迟滞带（对齐夜间 2.0）：AH 达标停机后，
                              # 需回升到 DAY_STOP_AH + 该值才允许湿度分支再开
-DAY_TEMP_REACHED_SLACK = 0.0 # 温度驱动周期的收手条件：室温须真正降到 target 才允许
-                             # 用湿度判据收手。取 0 而非正容差的理由：
-                             #   slack=+1.0 → target=26 时 26.9 就算"达标"，回温 4min
-                             #     即再触发（闭环实测 6h 8 次启停，平均周期仅 16min）
-                             #   slack=+0.5 → 停在 26.5，等于没兑现 26°C 的设定值
-                             #   slack=0.0  → 兑现设定值，理论 ~13 次/12h（+0.5 是 ~17 次）
-                             # 这不是"过冷"：目标本身就是用户/策略选定的舒适温度，
-                             # 降到它才叫达标。再往负走才是拿舒适换启停次数，不做。
+DAY_TEMP_REACHED_SLACK = 1.0 # 温度驱动周期的收手条件：室温须降到 target+1 才允许
+                             # 用湿度判据收手。SLACK=1.0 而非 0.0 的理由：
+                             #   定频机热负荷=制冷量时，室温永远降不到 target（如 27°C 稳定，
+                             #   target=25）。SLACK=0.0 时湿度判据每 2 分钟达标一次 → 停机 →
+                             #   16min 后又触发 → 短周期抖振（实测 91.7% 周期<20min）。
+                             #   SLACK=1.0 创建 1°C 死区（传感器分辨率 1°C），
+                             #   室温≤target+1 才收手，让空调真正把室温压到目标附近。
+                             #   这不是"拿舒适换启停"：target 本就是选定的舒适温度，
+                             #   降到 target+1 是履约，再往负才是过度追求。
+
+# ── v8.24 稳态运行 + 热负荷自适应（2026-08-20 审计：91.7% 周期<20min）──
+STEADY_STATE_MIN_MIN = 15       # 温度稳定在 target+1 内持续多久进入稳态运行(min)
+THERMAL_FAIL_WINDOW = 3          # 连续几个周期未达标触发热负荷自适应
+THERMAL_FAIL_RISE = 1            # 热负荷自适应：目标温度上调(°C)
+
+# ── v8.24 稳态运行 + 热负荷自适应（2026-08-20 审计：91.7% 周期<20min）──
+STEADY_STATE_MIN_MIN = 15       # 温度稳定在 target+1 内持续多久进入稳态运行(min)
+THERMAL_FAIL_WINDOW = 3          # 连续几个周期未达标触发热负荷自适应
+THERMAL_FAIL_RISE = 1            # 热负荷自适应：目标温度上调(°C)
 DAY_MAX_STARTS_PER_H = 2     # 白天每小时启动上限（夜间为 4；白天热负荷高但不该抖振）
 DAY_STARTS_OVERRIDE_T = 29.0 # 启停上限的安全阀：室温 >= 该值说明真的热（不是抖振），
                              # 无条件放行开机。抖振要压，但不能因为"压次数"把人热着——
@@ -326,6 +342,30 @@ def update_temp_history(state, now_ts, temp):
     if len(hist) > 12:
         hist = hist[-12:]
     state["temp_history"] = hist
+
+
+def is_temp_stable(state, target, slack, window_min):
+    """v8.24：温度是否已在 target±slack 范围内稳定持续 window_min 分钟。
+    用于稳态运行判定——定频机热负荷=制冷量时，室温永远降不到 target，
+    但不代表空调没干活（它在维持温度不上升）。"""
+    th = state.get("temp_history") or []
+    if not th or len(th) < 2:
+        return False
+    try:
+        now_ts = datetime.fromisoformat(th[-1][0])
+    except Exception:
+        return False
+    cutoff = now_ts - timedelta(minutes=window_min)
+    in_window = []
+    for ts_str, t in th:
+        try:
+            if datetime.fromisoformat(ts_str) >= cutoff:
+                in_window.append(t)
+        except Exception:
+            pass
+    if len(in_window) < 2:
+        return False
+    return all(abs(t - target) <= slack for t in in_window)
 
 
 def sustained_above(state, line, need_min, now_ts=None):
@@ -527,7 +567,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
            night_comp_starts=None, fake_run_count=None, evening=False,
-           outdoor_temp=None, outdoor_rain=None, sustained=None):
+           outdoor_temp=None, outdoor_rain=None, sustained=None,
+           is_steady_state=False):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
@@ -662,6 +703,14 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
         # 最短运行时间保护：跑不够 A.MIN_RUN 不关非安全类关机（防短循环）
         if comp_min is not None and comp_min < A.MIN_RUN:
+            return (None, None, None)
+
+        # v8.24 稳态运行：温度已稳定在 target+DAY_TEMP_REACHED_SLACK 内持续
+        # >STEADY_STATE_MIN_MIN 分钟，且压缩机在转 → 不再主动停机，让空调
+        # 自身温控器占空比调制。定频机热负荷=制冷量时，室温永远降不到 target
+        # 但空调在维持温度不上升 = 有效工作。只挡湿度判据关机，不挡温度。
+        if (not is_night and not evening and is_steady_state
+                and comp_min is not None and comp_min >= A.MIN_RUN):
             return (None, None, None)
 
         # 湿度达标
@@ -818,6 +867,9 @@ def main():
             # 室外湿度不能代表室内，缺省 50（中等）让决策只走温度分支，不误触除湿
             hum = _wx_fallback.get("rh") if _wx_fallback.get("rh") is not None else 50
             wx_fallback_used = True
+            # v8.24 F4：标记回退数据来源
+            state["_temp_src"] = "outdoor_fallback"
+            state["_hum_src"] = "outdoor_fallback"
             log(f"传感器离线，回退到天气预报 T={temp}°C RH={hum}%")
 
     # v8.20 传感器断连超时升级（仅当连天气兜底都拿不到时才跳过）
@@ -1062,12 +1114,21 @@ def main():
         log(f"无动作 {cl} {meta} 已开={since_on} 已关={since_off} mode={state.get('mode')}")
         print(f"ac_watch: 无需动作 · {cl} · {meta}")
         A.save_state(state)
+        # v8.24 自学习回评
+        evaluate(state, now_ts)
         return
+
+    # v8.24 记录决策供回评
+    log_decision(state, new_mode, temp, hum, now_ts)
 
     if dry:
         print(f"ac_watch [dry]: 将执行 {new_mode} target={target} · {meta}")
         log(f"[dry] 将执行 {new_mode} target={target} · {meta}")
+        evaluate(state, now_ts)
         return
+
+    # v8.24 自学习回评
+    evaluate(state, now_ts)
 
     # ── v8.17 室外免费干燥门控：干爽天让开窗干活，不花电除湿 ──
     # 只拦"从关到开"的启动决策；RH 爬过 70 或天气失效自动放行（fail-open，自限）。
