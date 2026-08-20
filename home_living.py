@@ -1760,24 +1760,21 @@ def main():
 
     state["last_temp"] = indoor_temp
     state["last_hum"] = indoor_hum
-    ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
+    # v8.24: 不再控制空调，避免与 ac_watch.py 冲突
+    # 只输出建议，实际控制在 ac_watch.py（每2分钟闭环）
+    # ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
     evaluate_and_learn(state, now_ts)
 
     # -- 6. Build output --
     run_info = ""
-    if AC_SOCKET == "on":
-        run_info = "  🔌 空调运行中（插座实测）"
-    elif AC_SOCKET == "off":
-        run_info = "  🔌 空调已关（插座实测）"
+    # v8.24: home_living 不再控制空调，仅提供建议（实际控制 = ac_watch.py）
+    _cur_mode = state.get("mode")
+    if _cur_mode in ("cooling", "dehumid", "dehumid_alert"):
+        run_info = "  🔌 空调运行中（ac_watch 控制）"
+    elif _cur_mode in ("off", "fan", "fan_locked"):
+        run_info = "  🔌 空调已关（ac_watch 控制）"
     elif new_mode in ("cooling", "dehumid", "dehumid_alert"):
-        run_now = minutes_since(state.get("run_start"))
-        if run_now is not None:
-            if run_now < 1:
-                run_info = "  本轮刚建议开启"
-            else:
-                run_info = f"  已运行: {int(run_now)} 分钟"
-                if run_now >= MAX_RUN:
-                    run_info += f" ⚠️ 超 {MAX_RUN} 分钟"
+        run_info = "  建议开启（ac_watch 实际控制）"
 
     # Humidity alert
     ac_alert = ""
@@ -1804,10 +1801,12 @@ def main():
         ac_alert = (f"  ⚠️ 湿度{indoor_hum:.0f}%偏高：就算不热，也该开空调压轮湿度"
                     f"（制冷集中 40~60 分钟，到 60% 关）")
 
+    # v8.24: advice-only mode, no actual AC control
+    ctrl = {"status": "no_action", "action": "", "reason": ""}
+
     # Format + print
     out_lines = format_output(result, indoor_temp, indoor_hum, wx, ac_w, ctrl, run_info, ac_alert)
 
-    # Ventilation advice: today's single best window (hourly scan) + instant advice
     try:
         _daily_vent = daily_report()
         if _daily_vent:
