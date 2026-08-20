@@ -1383,18 +1383,18 @@ def main():
     if ac_alert:
         print(ac_alert)
     # 音箱播报结论（与微信/桌面提醒并行；失败静默）
-    try:
-        # TTS 脚本路径：优先 Hermes 默认 scripts 目录，fallback 旧路径
-        _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
-        if _tts_dir not in sys.path:
-            sys.path.insert(0, _tts_dir)
-        from ac_tts import speak
-        speak(decision[:50])
-        if ac_alert:
-            speak(ac_alert, force=True)
-    except Exception as e:
-        print(f"  ⚠️ TTS 播报失败（{e}）——微信/桌面提醒仍正常")
-    print(f"  ℹ️ 空调模式为顾问建议值，非遥控器实测（定频空调无智能接口）")
+    # v8.24: TTS disabled - user complained about spam
+    # try:
+    #     _tts_dir = os.path.join(os.path.expanduser("~"), ".hermes", "scripts")
+    #     if _tts_dir not in sys.path:
+    #         sys.path.insert(0, _tts_dir)
+    #     from ac_tts import speak
+    #     speak(decision[:50])
+    #     if ac_alert:
+    #         speak(ac_alert, force=True)
+    # except Exception as e:
+    #     print(f"  ⚠️ TTS 播报失败（{e}）——微信/桌面提醒仍正常")
+
     print()
 
     if close_windows:

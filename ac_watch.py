@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ac_advisor as A
 from ac_advisor import evaluate_and_learn as evaluate
 from ac_advisor import log_decision as log_decision
+import os
 
 from ac_advisor import evaluate_and_learn as evaluate
 from ac_advisor import log_decision as log_decision
@@ -1148,14 +1149,7 @@ def main():
                     tts_ok = (now_dt - datetime.fromisoformat(last_tts)).total_seconds() >= VENT_TTS_COOLDOWN * 60
                 except Exception:
                     tts_ok = True
-            if tts_ok and not is_night:
-                state["_vent_tts_at"] = now_ts
-                A.save_state(state)
-                try:
-                    import xiaomi_tts
-                    xiaomi_tts.speak("室外空气干爽，开窗通风就能除湿，空调先不开，省电。")
-                except Exception:
-                    pass
+            # v8.24: TTS removed - user complained about spam
             print("ac_watch: 室外干爽，建议开窗免费除湿，本次不开机")
             return
 
@@ -1183,14 +1177,7 @@ def main():
         # v8.24 TTS 冷却：先判断+播报，再 save_state 持久化时间戳
         _last_action_tts_at = state.get("_last_action_tts_at")
         _can_tts = _last_action_tts_at is None or (now_dt - datetime.fromisoformat(_last_action_tts_at)).total_seconds() >= ACTION_TTS_COOLDOWN * 60
-        if not is_night and _can_tts:
-            try:
-                import xiaomi_tts
-                tts_msg = f"空调已自动{ctrl['action']}，{reason}。" if reason else f"空调已自动{ctrl['action']}。"
-                xiaomi_tts.speak(tts_msg)
-                state["_last_action_tts_at"] = now_ts
-            except Exception as e:
-                log(f"TTS 播报失败（不影响控制）: {e}")
+        pass  # v8.24: TTS removed - user complained about spam
         A.save_state(state)
         # 换气提醒
         if new_mode == "off" and mode_before == "cooling":
