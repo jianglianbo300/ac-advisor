@@ -288,14 +288,14 @@ def evaluate_and_learn(state, now_ts):
         if action in ("cooling", "dehumid"):
             temp_drop = pre_temp - cur_temp
             hum_drop = (pre_hum or 0) - (cur_hum or 0)
-            # v11.1 功率闸门（本文件 2026-08-19 补齐，此前只做在 home_living.py）：
-            # 1.5 匹带 65 平米先天功率不足，压缩机真在转时降温慢是物理限制而非阈值问题。
-            # 少了这道闸门会把"慢降温"误判为失败，把阈值一路往下推。
-            comp_running = (AC_MEASURED_W or 0) > 300
+            # v8.24 F1: 使用决策时的压缩机功率（而非当前功率）判断
+            # 避免"30分钟前开机、当前已到温停机"的误判
+            comp_running = (entry.get("power_at_decision") or 0) > 300
             if comp_running:
                 success = True
             elif temp_drop < 0.3 and hum_drop < 3:
                 success = False
+
         elif action in ("off", "fan"):
             temp_rise = cur_temp - pre_temp
             if temp_rise > 2.0 or (cur_hum is not None and cur_hum > 80):
@@ -317,18 +317,23 @@ def evaluate_and_learn(state, now_ts):
     save_learned(learned)
 
 def log_decision(state, action, pre_temp, pre_hum, now_ts):
-    """记录一次决策，供后续回评"""
+    """记录一次决策，供后续回评。同时记录决策时的压缩机功率。"""
     learned = load_learned()
     log = learned.get("decision_log", [])
+    # v8.24 F1: 记录决策时的压缩机功率，供 evaluate_and_learn 使用
+    # 避免用当前功率评估3分钟前的决策（时序错配导致误判）
+    power_at_decision = state.get("_prev_power") or state.get("measured_w")
     log.append({
         "time": now_ts,
         "action": action,
         "pre_temp": pre_temp,
         "pre_hum": pre_hum,
         "evaluated": False,
+        "power_at_decision": power_at_decision,
     })
     learned["decision_log"] = log[-50:]
     save_learned(learned)
+
 
 # ── 热质量学习（v10.0 新增，持久化） ────────
 THERMAL_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_thermal.json")

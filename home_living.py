@@ -1749,9 +1749,10 @@ def main():
         result["decision"] = "保持现状（手动关后" + str(_manual_anchor_mins) + "分钟内不自动启动）"
         result["reason"] = "manual_off_anchor"
         burst_set = None
-
     # -- 5. Log + apply --
-    log_decision(state, new_mode, indoor_temp, indoor_hum, now_ts)
+    # v8.24 F2: 不再记录决策/学习，避免与 ac_watch.py 冲突
+    # ac_watch.py 是唯一控制入口，负责唯一的自学习
+    # log_decision(state, new_mode, indoor_temp, indoor_hum, now_ts)
     # Record thermal event for learning
     if new_mode in ("cooling", "dehumid"):
         record_thermal_event("cooling", indoor_temp, None, None, wx.get("current", {}).get("temperature_2m"))
@@ -1760,10 +1761,10 @@ def main():
 
     state["last_temp"] = indoor_temp
     state["last_hum"] = indoor_hum
-    # v8.24: 不再控制空调，避免与 ac_watch.py 冲突
-    # 只输出建议，实际控制在 ac_watch.py（每2分钟闭环）
-    # ctrl = apply_and_commit(new_mode, burst_set, state, now_ts)
-    evaluate_and_learn(state, now_ts)
+    # v8.24: advice-only mode, no actual AC control
+    ctrl = {"status": "no_action", "action": "", "reason": ""}
+    # evaluate_and_learn(state, now_ts)
+
 
     # -- 6. Build output --
     run_info = ""
