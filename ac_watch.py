@@ -873,7 +873,9 @@ def main():
             if _schedule:
                 _hour_action = _schedule[0][1]
                 _hour_temp = _schedule[0][3]
-                if _hour_action == "cool":
+                is_valley = _h >= 22 or _h < 6
+                is_extreme = outdoor_temp is not None and outdoor_temp >= 35
+                if _hour_action == "cool" and (is_valley or is_extreme):
                     _schedule_override = True
                     _schedule_target = max(24, round(_hour_temp - 2))
                     _schedule_reason = (
