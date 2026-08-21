@@ -143,9 +143,10 @@ def gate_check(rh, pp, rain_mm, temp, wind_ms, gust_ms, pm25,
         return False, f"阵风 {gust_ms}m/s"
     if pm25 is not None and pm25 >= PM25_MAX:
         return False, f"PM2.5 {pm25}ug/m³"
-    if indoor_temp is not None and indoor_rh is not None and out_temp is not None:
+    # Use 'temp' parameter (outdoor temp), not 'out_temp'
+    if indoor_temp is not None and indoor_rh is not None and temp is not None:
         dp_in = dew_point(indoor_temp, indoor_rh)
-        dp_out = dew_point(out_temp, rh) if rh is not None else None
+        dp_out = dew_point(temp, rh) if rh is not None else None
         if dp_in is not None and dp_out is not None:
             if dp_out - dp_in >= DEW_DELTA_MAX:
                 return False, f"室外露点比室内高 {dp_out - dp_in:.1f}°C，开窗湿气灌入"
@@ -215,7 +216,7 @@ def pick_best(rows, indoor_temp, indoor_rh, ac_mode, aqi):
     cand = []
     for r in rows:
         ok, reason = gate_check(r["rh"], r["pp"], r["rain_mm"], r["temp"],
-                                r["wind_ms"], r.get("wind_gust", 0),
+                                r["wind_ms"], 0,
                                 aqi.get(f"{r['hr']:02d}:00") if aqi else None,
                                 indoor_temp, indoor_rh)
         if not ok:
