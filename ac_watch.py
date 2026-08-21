@@ -817,6 +817,13 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if temp >= A.TEMP_DEHUMID_LOW and hum >= (VALLEY_START_RH if A.current_price() < A.ELECTRIC_PEAK else A.HUM_DEHUMID_ON):
         if ah is not None and ah < DAY_STOP_AH + DAY_STOP_AH_HYST:
             return (None, None, None)
+    # v8.26 天气预冷：谷电时段读未来 3h 预报，超阈值提前开
+    if not running and A.current_price() < A.ELECTRIC_PEAK:
+        if _outdoor_t is not None and _outdoor_t >= A.OUTDOOR_HOT_T + 2:
+            _pre_cool_target = max(24, round(_outdoor_t - 2))
+            log(f"天气预冷：谷电时段室外 {_outdoor_t}°C，提前开制冷 {_pre_cool_target}°C 蓄冷")
+            return ("cooling", _pre_cool_target, f"天气预冷：谷电蓄冷，室外{_outdoor_t}°C 未来更热")
+
         return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度强力除湿")
     # v8.18 晚间恒温巡航：温度优先（闷热除湿分支在上方先判，RH≥65/62 仍走深除）
     if evening and temp >= EVENING_START_T:
@@ -1090,7 +1097,23 @@ def main():
     # 热模型：预测剩余降温时间
     _thermal_data = A.load_thermal_data()
     _model = _thermal_data.get("thermal_model", {})
-    _predicted_cool_min = None
+    # v8.26 天气预冷：谷电时段读未来 3h 预报，超阈值提前开
+    _pre_cool = False
+    if not running and not is_night:
+        _h = now_dt.hour
+        if _h >= 22 or _h < 6:
+    # v8.26 天气预冷执行
+    if _pre_cool and new_mode is None:
+        new_mode, target, reason = "cooling", _pre_cool_target, f"天气预冷：谷电蓄冷"
+        log(f"执行预冷：target={target}°C（室外{_outdoor_t}°C 未来更热）")
+
+                _temps = _wx["hourly"].get("temperature_2m", [])
+                _future_max = max(_temps[:3]) if len(_temps) >= 3 else None
+                if _future_max is not None and _future_max >= A.OUTDOOR_HOT_T + 2:
+                    _pre_cool_target = max(24, round(_future_max - 2))
+                    _pre_cool = True
+                    log(f"天气预冷：谷电 {_h} 点，未来 3h 最高 {_future_max}°C，提前开制冷 {_pre_cool_target}°C 蓄冷")
+
     if running:
         _predicted_cool_min = A.predict_cooling_time(temp, current_target, _outdoor_t, _model)
 
