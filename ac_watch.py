@@ -558,23 +558,18 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
            night_comp_starts=None, fake_run_count=None, evening=False,
            outdoor_temp=None, outdoor_rain=None, sustained=None,
-           is_steady_state=False):
+           is_steady_state=False, predicted_cool_min=None):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
     不用 since_on（壁钟时间）——定频机到温停压缩机，since_on 包含大量风扇空吹时间。
+    v8.7：增加 reason 文本——供 TTS 播报"为什么开关"，让用户听到决策逻辑。
+    v8.10：增加 fake_run_count 参数，连续 3 次假运行后停机告警。
+    """
     # 自适应阈值：读取学习偏移，修正全局阈值
     learned = A.load_learned()
     adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
     temp_cooling = A.TEMP_COOLING + adj
-
-    v8.10：增加 fake_run_count 参数，连续 3 次假运行后停机告警。
-    """
-    # 自适应阈值：读取学习偏移
-    learned = A.load_learned()
-    adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
-    temp_cooling = A.TEMP_COOLING + adj
-
     if running is None:
         # 传感器不可达：放弃本次决策，不动作
         return (None, None, None)
@@ -715,10 +710,15 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         if not evening and hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= A.MIN_RUN:
             return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
+        # 热模型预测：剩余降温时间很短 → 可提前关（绕过 MIN_RUN）
+        if not evening and hum <= DEHUMID_EXIT_RH and predicted_cool_min is not None and predicted_cool_min <= 5:
+            return ("off", None, f"湿度达标{hum:.0f}%，热模型预测再跑{predicted_cool_min}分钟即可到位，提前关省电")
+
+
         # 虚拟变频（v8.8）：湿度接近达标（≤58）且已跑够 MIN_RUN → 升温降负载缓除
         # 定频机满功率狂除容易过冷，升温 1°C 让压缩机慢除，曲线平滑、防过冷
         if (hum <= VIRTUAL_INV_APPROACH_RH
-                and comp_min is not None and comp_min >= A.MIN_RUN
+
                 and current_target is not None and current_target < VIRTUAL_INV_MAX_TARGET
                 and minutes_since_last_adjust is not None
                 and minutes_since_last_adjust >= DEHUMID_ADJUST_COOLDOWN):
@@ -1081,10 +1081,18 @@ def main():
     except Exception:
         _wx = None
     _outdoor_t = _wx["t"] if (_wx and "t" in _wx) else None
-    # 自适应阈值
+    _outdoor_rain = _wx.get("rain") if _wx else None
+
     _learned = A.load_learned()
     _adj = _learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
     _temp_cooling_adj = A.TEMP_COOLING + _adj
+
+    # 热模型：预测剩余降温时间
+    _thermal_data = A.load_thermal_data()
+    _model = _thermal_data.get("thermal_model", {})
+    _predicted_cool_min = None
+    if running:
+        _predicted_cool_min = A.predict_cooling_time(temp, current_target, _outdoor_t, _model)
 
     new_mode, target, reason = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
@@ -1098,14 +1106,16 @@ def main():
                               compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0),
                               night_comp_starts=state.get("_night_comp_starts"),
                               fake_run_count=fake_run_count,
+                              predicted_cool_min=_predicted_cool_min,
                               sustained=sustained_above(
                                   state,
                                   NIGHT_START_T if is_night else _temp_cooling_adj,
                                   SUSTAIN_MIN, now_ts))
 
-
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
+
+
     cl = COMP_LABEL.get(comp, comp)
     kwh_str = f"kWh={state.get('estimated_kwh', 0):.3f}"
     delta_str = f"dRH20={delta_rh_20}% dRH60={delta_rh_60}%"
