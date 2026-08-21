@@ -750,10 +750,6 @@ def main():
     state_comp_before = state.get("compressor_state")
     fake_run_count = state.get("_fake_run_count", 0) or 0
 
-    starts = state.get("_night_comp_starts", [])
-    cutoff = (now_dt - timedelta(hours=1)).isoformat(timespec="seconds")
-    state["_night_comp_starts"] = [s for s in starts if s >= cutoff]
-
     if comp == "compressor" and state_comp_before != "compressor":
         state["compressor_restart_cooldown_until"] = (
             now_dt + timedelta(minutes=COMPRESSOR_RESTART_COOLDOWN)
@@ -767,8 +763,9 @@ def main():
         state["_fake_run_count"] = fake_run_count
     elif comp == "fan_only" and state_comp_before != "compressor" and stale_stop_ts(
             state.get("last_compressor_stop_at"), state.get("run_start")):
-        state["last_compressor_stop_at"] = now_ts
-        last_comp_stop = now_ts
+        # Bug fix: clear instead of updating to now_ts
+        state.pop("last_compressor_stop_at", None)
+        last_comp_stop = None
     state["compressor_state"] = comp
 
     comp_on_min = 0
@@ -984,6 +981,7 @@ def main():
             state["cycle_comp_total"] = 0
             state["compressor_on_min"] = 0
             state.pop("compressor_on_since", None)
+            state.pop("last_compressor_stop_at", None)
         handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, running_target,
                                   comp_min_at_apply, abort_reason=reason,
                                   temp=temp, outdoor_temp=_outdoor_t)
