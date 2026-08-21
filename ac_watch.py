@@ -680,7 +680,7 @@ def main():
         try:
             off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
             mins = (now_dt - off_dt).total_seconds() / 60
-            if 0 <= mins < 30 and mins < MANUAL_ANCHOR_TTL:
+            if 0 <= mins < MANUAL_ANCHOR_TTL:
                 temp_at_off = None
                 off_dt_str = state.get("manual_off_at")
                 if off_dt_str:
@@ -704,6 +704,7 @@ def main():
                     temp_rise = temp - temp_at_off
                 if temp_rise >= 1.0:
                     log(f"手动关后{int(mins)}分钟，温度回升{temp_rise:.1f}°C，解除冷却期恢复自动")
+                    state.pop("manual_off_at", None)
                 else:
                     log(f"手动关后{int(mins)}分钟，跳过自动启动（尊重用户意图）")
                     print(f"ac_watch: 手动关后{int(mins)}分钟，跳过自动启动")
@@ -874,7 +875,7 @@ def main():
                 _hour_action = _schedule[0][1]
                 _hour_temp = _schedule[0][3]
                 is_valley = _h >= 22 or _h < 6
-                is_extreme = outdoor_temp is not None and outdoor_temp >= 35
+                is_extreme = _outdoor_t is not None and _outdoor_t >= 35
                 if _hour_action == "cool" and (is_valley or is_extreme):
                     _schedule_override = True
                     _schedule_target = max(24, round(_hour_temp - 2))
