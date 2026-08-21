@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-08-21T13:24:13.960141",
+  "actual": {
+    "date": "2026-08-21",
+    "total_cost": 0.8600872,
+    "total_kwh": 1.8316000000000003,
+    "cooling_kwh": 1.8316000000000003,
+    "off_kwh": 0.0,
+    "cooling_hours": 2.2333333333333334,
+    "off_hours": 0.6183333333333334,
+    "avg_price": 0.4695824415811312
+  },
+  "optimal": {
+    "date": "2026-08-21",
+    "optimal_cost": 2.642656,
+    "avg_outdoor": 27.675,
+    "max_outdoor": 30.16,
+    "min_outdoor": 26.86
+  },
+  "gap": -1.7825688,
+  "gap_percent": -207.25442722551853
+}
