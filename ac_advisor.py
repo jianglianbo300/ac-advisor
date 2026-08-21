@@ -259,44 +259,49 @@ def compute_optimal_schedule(wx, current_temp, current_hum, learned,
     return schedule
 
 
-def find_pre_cool_window(schedule, current_hour):
-    """Find cheapest pre-cooling window before hot period.
-    Returns (start_hour, end_hour, estimated_savings) or None.
+def predict_dehumidify_need(wx, current_hum, current_temp):
+    """Predict if valley-hour dehumidification is needed based on forecast.
+    Returns (should_dehumidify, target_rh, reason) or (False, None, None).
     
-    Strategy: find first peak-hour (6-21) cool period, pre-cool during
-    valley hours (22-6) before it to shift load from peak to valley."""
-    # Find first peak-hour cool period (hours 6-21)
-    hot_start = None
-    for i, (h, action, cost) in enumerate(schedule):
-        if action == "cool" and 6 <= h <= 21:
-            hot_start = h
-            break
-    if hot_start is None:
-        return None
-    # Pre-cool during valley hours before the hot period
-    # Valley hours: 22, 23, 0, 1, 2, 3, 4, 5
-    # If hot period is after 6am, ALL valley hours before it are pre-cool candidates
-    all_valley = [22, 23, 0, 1, 2, 3, 4, 5]
-    hours_to_hot = []
-    for v in all_valley:
-        # Check if this valley hour is before hot_start (wrapping midnight)
-        if v >= 22:  # 22, 23
-            # hot_start could be later today (unlikely for 22-23) or tomorrow
-            hours_ago = hot_start + 24 - v
-        else:  # 0-5
-            hours_ago = hot_start - v
-        if 1 <= hours_ago <= 16:  # Within 16h before hot period (full valley window)
-            hours_to_hot.append(v)
-    if not hours_to_hot:
-        return None
-    pc_start = hours_to_hot[0]
-    pc_end = hours_to_hot[-1]
-    # Calculate savings: pre-cool during valley vs cooling during peak
-    n_hours = len(hours_to_hot)
-    valley_cost = ELECTRIC_VALLEY * kwh_est(40, COOL_DUTY) * n_hours
-    peak_cost = ELECTRIC_PEAK * kwh_est(40, COOL_DUTY) * n_hours
-    savings = peak_cost - valley_cost
-    return (pc_start, pc_end, savings)
+    Strategy: if next day's forecast RH > 65%, pre-dehumidify during
+    valley hours (22-6) to reduce next-day load."""
+    hourly = wx.get("hourly", {})
+    times = hourly.get("time", [])
+    hums = hourly.get("relative_humidity_2m", [])
+    if not times or not hums:
+        return False, None, None
+    
+    now_h = datetime.now().hour
+    # Find next day's forecast (next 24h from now)
+    future_rh = []
+    for i, t in enumerate(times):
+        try:
+            t_dt = datetime.fromisoformat(t)
+            hours_ahead = (t_dt - datetime.now()).total_seconds() / 3600
+            if 6 <= hours_ahead <= 30:  # Next 6-30 hours
+                future_rh.append(hums[i] if i < len(hums) else None)
+        except Exception:
+            continue
+    
+    if not future_rh:
+        return False, None, None
+    
+    max_future_rh = max(r for r in future_rh if r is not None)
+    avg_future_rh = sum(r for r in future_rh if r is not None) / len([r for r in future_rh if r is not None])
+    
+    # If next day will be humid, pre-dehumidify
+    if max_future_rh > 70 or avg_future_rh > 65:
+        # Only if current humidity is not already low
+        if current_hum and current_hum > 55:
+            target_rh = 55  # Dry to comfortable level
+            return True, target_rh, (
+                f"谷电预除湿：明日最高RH{max_future_rh:.0f}%，"
+                f"当前{current_hum:.0f}%，预除湿至{target_rh:.0f}%")
+    
+    return False, None, None
+
+
+
 
 
 
@@ -379,6 +384,51 @@ def evaluate_and_learn(state, now_ts):
         adjusted["temp_cooling"] = min(2, adjusted.get("temp_cooling", 0) + 0.5)
     elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > -2:
         adjusted["temp_cooling"] = max(-2, adjusted.get("temp_cooling", 0) - 0.5)
+    
+    # v8.29 每日用电预算预测（基于天气预报+RC模型）
+    _budget_pred = state.get("_budget_prediction", {})
+    _today = datetime.now().strftime("%Y-%m-%d")
+    if not _budget_pred.get("date") == _today:
+        try:
+            wx_data = fetch_weather()
+            if "error" not in wx_data:
+                hourly = wx_data.get("hourly", {})
+                temps = hourly.get("temperature_2m", [])
+                if temps:
+                    _total_kwh = 0
+                    _thermal_data = load_thermal_data()
+                    _model = _thermal_data.get("thermal_model", {})
+                    _a = _model.get("thermal_conductance", 0.003)
+                    _c = _model.get("baseline_cooling", -0.035)
+                    for i, t_out in enumerate(temps[:24]):
+                        _h = int(hourly["time"][i][11:13]) if i < len(hourly.get("time", [])) else i
+                        _price = ELECTRIC_VALLEY if _h >= 22 or _h < 6 else ELECTRIC_PEAK
+                        if t_out > 26:
+                            _hours_cooling = min(1, (t_out - 26) / 6)
+                            _kwh = kwh_est(60 * _hours_cooling, COOL_DUTY)
+                            _total_kwh += _kwh
+                    _budget_pred = {
+                        "date": _today,
+                        "predicted_kwh": round(_total_kwh, 2),
+                        "predicted_cost": round(_total_kwh * 0.5, 2),
+                        "max_temp": max(temps) if temps else None,
+                    }
+                    state["_budget_prediction"] = _budget_pred
+        except Exception:
+            pass
+    
+    # v8.29 压缩机健康监控（启停周期趋势）
+    _cycle_log = state.get("_cycle_log", [])
+    if len(_cycle_log) >= 5:
+        _recent_durations = [c.get("duration_min", 0) for c in _cycle_log[-5:]]
+        _avg_duration = sum(_recent_durations) / len(_recent_durations)
+        if _avg_duration < 15:
+            state["_compressor_health"] = "short_cycling"
+        elif _avg_duration > 40:
+            state["_compressor_health"] = "long_running"
+        else:
+            state["_compressor_health"] = "normal"
+    
     learned["adjusted_thresholds"] = adjusted
     learned["decision_log"] = log[-50:]
     save_learned(learned)
@@ -438,8 +488,8 @@ def _thermal_event_usable(e):
 
 def record_thermal_event(event_type, temp_before, temp_after, duration_min, outdoor_temp):
     """Record a thermal event: cooling_cycle, warmup_cycle, or natural_drift
-    Used to learn: cooling_rate (°C/min), thermal_mass (time constant)
-
+    Used to learn: cooling_rate (°C/min), thermal mass (time constant)
+    
     This module always passes a complete cycle, but home_living.py writes the
     same file with temp_after/duration_min left open until the next state
     change closes them. So keep every row here and let fit_thermal_model do the
@@ -458,8 +508,26 @@ def record_thermal_event(event_type, temp_before, temp_after, duration_min, outd
     })
     # Keep last 100 events
     data["events"] = events[-100:]
-    # Recompute thermal model (filters unusable rows internally)
-    data["thermal_model"] = fit_thermal_model(data["events"])
+    # 优化：每 5 个新事件或 24 小时重拟合一次
+    _last_fit = data.get("_last_fit_ts")
+    _new_count = data.get("_new_event_count", 0) + 1
+    data["_new_event_count"] = _new_count
+    _should_fit = False
+    if _new_count >= 5:
+        _should_fit = True
+    elif _last_fit:
+        try:
+            _age = (datetime.now() - datetime.fromisoformat(_last_fit)).total_seconds()
+            if _age > 86400:  # 24小时
+                _should_fit = True
+        except Exception:
+            _should_fit = True
+    else:
+        _should_fit = True
+    if _should_fit:
+        data["thermal_model"] = fit_thermal_model(data["events"])
+        data["_last_fit_ts"] = datetime.now().isoformat()
+        data["_new_event_count"] = 0
     save_thermal_data(data)
     return True
 
@@ -1003,7 +1071,11 @@ DAYS_PER_MONTH = 30      # 月差价估算天数
 
 def _learn_from_manual(state, now_ts):
     """用户习惯学习：记录手动干预，学 3 次以上自动调整阈值。
-    存储在 ac_state.json 的 user_pref 字段中。"""
+    存储在 ac_state.json 的 user_pref 字段中。
+    
+    自适应逻辑：
+    - 用户多次手动开（自动没开）→ comfort_weight 减小（更舒适）
+    - 用户多次手动关（自动没关）→ comfort_weight 增大（更省电）"""
     try:
         # 读取当前室内条件（从 rh_history 获取最近一条）
         rh_hist = state.get("rh_history", [])
@@ -1012,31 +1084,66 @@ def _learn_from_manual(state, now_ts):
         last_rh = rh_hist[-1][1] if rh_hist else None
         if last_rh is None:
             return
-
+        
         # 初始化 user_pref
         pref = state.get("user_pref", {})
         manual_log = pref.get("manual_on_log", [])
-
+        
         # 记录本次手动干预
         manual_log.append({
             "ts": now_ts,
             "rh": last_rh,
             "mode": state.get("mode"),
         })
-
+        
         # 只保留最近 20 条
         if len(manual_log) > 20:
             manual_log = manual_log[-20:]
-
+        
         pref["manual_on_log"] = manual_log
-
+        
         # 分析：如果 3+ 次手动开在 RH 60-65 之间，降低阈值
         low_rh_manual = [m for m in manual_log if 60 <= m.get("rh", 0) < 65]
         if len(low_rh_manual) >= 3:
             pref["hum_threshold"] = 60  # 学到用户偏好更低湿度
         else:
             pref.pop("hum_threshold", None)  # 恢复默认 65
-
+        
+        # 自适应 comfort_weight
+        # 分析最近 10 次手动干预
+        recent = manual_log[-10:]
+        manual_on_count = sum(1 for m in recent if m.get("mode") == "cooling")
+        manual_off_count = sum(1 for m in recent if m.get("mode") == "off")
+        
+        # 获取当前 comfort_weight
+        try:
+            with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "r") as f:
+                user_pref = json.load(f)
+            current_cw = user_pref.get("comfort_weight", 0.5)
+        except Exception:
+            current_cw = 0.5
+        
+        # 用户多次手动开（自动决策不够凉）→ 减小 weight（更舒适）
+        if manual_on_count >= 3 and current_cw > 0.1:
+            new_cw = max(0.1, current_cw - 0.1)
+            user_pref["comfort_weight"] = round(new_cw, 1)
+            save_learned({"adjusted_thresholds": {}, "decision_log": []})  # 触发保存
+            # 直接更新 ac_user_pref.json
+            try:
+                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "w") as f:
+                    json.dump(user_pref, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        # 用户多次手动关（自动决策太凉）→ 增大 weight（更省电）
+        elif manual_off_count >= 3 and current_cw < 1.0:
+            new_cw = min(1.0, current_cw + 0.1)
+            user_pref["comfort_weight"] = round(new_cw, 1)
+            try:
+                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "w") as f:
+                    json.dump(user_pref, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        
         state["user_pref"] = pref
     except Exception:
         pass  # 学习失败不影响主逻辑

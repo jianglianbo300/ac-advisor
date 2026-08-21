@@ -845,14 +845,24 @@ def main():
     if running:
         _predicted_cool_min = A.predict_cooling_time(temp, current_target, _outdoor_t, _model)
 
-    # v8.28 最优调度：DP 直接给出当前小时决策
+    # v8.28 最优调度：每小时算一次 DP，缓存结果
     _schedule_override = False
     _schedule_target = None
     _schedule_reason = None
     if not running and not is_night:
         _h = now_dt.hour
-        if _wx and "hourly" in _wx and _wx["hourly"].get("temperature_2m"):
-            # Load user preferences
+        # 检查缓存：同一小时内不重算
+        _dp_cache = state.get("_dp_schedule_cache", {})
+        if _dp_cache.get("hour") == _h and _dp_cache.get("ts"):
+            try:
+                _cache_age = (now_dt - datetime.fromisoformat(_dp_cache["ts"])).total_seconds()
+                if _cache_age < 3600:
+                    _schedule_override = _dp_cache.get("override", False)
+                    _schedule_target = _dp_cache.get("target")
+                    _schedule_reason = _dp_cache.get("reason")
+            except Exception:
+                pass
+        if not _schedule_override and _wx and "hourly" in _wx and _wx["hourly"].get("temperature_2m"):
             try:
                 with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "r") as f:
                     _pref = json.load(f)
@@ -864,8 +874,8 @@ def main():
                                                      comfort_weight=_cw,
                                                      comfort_target=_ct)
             if _schedule:
-                _hour_action = _schedule[0][1]  # First hour action
-                _hour_temp = _schedule[0][3]  # Predicted indoor temp
+                _hour_action = _schedule[0][1]
+                _hour_temp = _schedule[0][3]
                 if _hour_action == "cool":
                     _schedule_override = True
                     _schedule_target = max(24, round(_hour_temp - 2))
@@ -873,21 +883,13 @@ def main():
                         f"DP最优调度：谷电{_h}点，室内{_hour_temp:.1f}°C，"
                         f"蓄冷至{_schedule_target}°C")
                     log(_schedule_reason)
-
-    # v8.26 简单预冷（兜底）
-    _pre_cool = False
-    _pre_cool_target = 24
-    if not _schedule_override and not running and not is_night:
-        _h = now_dt.hour
-        if _h >= 22 or _h < 6:
-            if _wx and "hourly" in _wx:
-                _temps = _wx["hourly"].get("temperature_2m", [])
-                _future_max = max(_temps[:3]) if len(_temps) >= 3 else None
-                if _future_max is not None and _future_max >= A.OUTDOOR_HOT_T + 2:
-                    _pre_cool_target = max(24, round(_future_max - 2))
-                    _pre_cool = True
-                    log(f"天气预冷：谷电 {_h} 点，未来 3h 最高 {_future_max}°C，提前开制冷 {_pre_cool_target}°C 蓄冷")
-
+                state["_dp_schedule_cache"] = {
+                    "hour": _h,
+                    "ts": now_dt.isoformat(timespec="seconds"),
+                    "override": _schedule_override,
+                    "target": _schedule_target,
+                    "reason": _schedule_reason,
+                }
     new_mode, target, reason = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
                               compressor_stop_duration_min=stop_duration,
@@ -910,10 +912,21 @@ def main():
                               is_steady_state=False,
                               predicted_cool_min=_predicted_cool_min)
 
-    # v8.26 简单预冷执行
-    if _pre_cool and new_mode is None:
-        new_mode, target, reason = "cooling", _pre_cool_target, "天气预冷：谷电蓄冷"
-        log(f"执行预冷：target={target}°C（室外{_outdoor_t}°C 未来更热）")
+    # v8.29 谷电预除湿：用预报湿度判断是否需要预除湿
+    _dehumidify = False
+    _dehumidify_target = None
+    _dehumidify_reason = None
+    if not running and not is_night:
+        _h = now_dt.hour
+        if _h >= 22 or _h < 6:
+            if _wx and "hourly" in _wx and _wx["hourly"].get("relative_humidity_2m"):
+                _dehumidify, _dehumidify_target, _dehumidify_reason = A.predict_dehumidify_need(_wx, hum, temp)
+                if _dehumidify:
+                    log(_dehumidify_reason)
+    if not _schedule_override and _dehumidify:
+        _schedule_override = True
+        _schedule_target = _dehumidify_target
+        _schedule_reason = _dehumidify_reason
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
