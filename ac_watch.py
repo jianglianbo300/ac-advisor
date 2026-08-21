@@ -298,6 +298,8 @@ def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
 
 
 def cached_outdoor(state, now_dt):
+    """Cache outdoor weather including hourly forecast.
+    Returns dict with current {t, rh, rain} and hourly {time, temperature_2m, relative_humidity_2m}."""
     c = state.get("_vent_wx_cache")
     if c:
         try:
@@ -307,22 +309,28 @@ def cached_outdoor(state, now_dt):
         except Exception:
             pass
     try:
-        wx = A.fetch_weather()
-        if "error" not in wx:
-            cur = wx.get("current", {})
-            state["_vent_wx_cache"] = {
+        wx_data = A.fetch_weather()
+        if "error" not in wx_data:
+            cur = wx_data.get("current", {})
+            hourly = wx_data.get("hourly", {})
+            cache = {
                 "ts": now_dt.isoformat(timespec="seconds"),
                 "wx": {
                     "t": cur.get("temperature_2m"),
                     "rh": cur.get("relative_humidity_2m"),
-                    "rain": cur.get("precipitation_probability_max", [0])[0],
+                    "rain": wx_data.get("daily", {}).get("precipitation_probability_max", [0])[0],
+                    "hourly": {
+                        "time": hourly.get("time", []),
+                        "temperature_2m": hourly.get("temperature_2m", []),
+                        "relative_humidity_2m": hourly.get("relative_humidity_2m", []),
+                    } if hourly else {},
                 },
             }
-            return state["_vent_wx_cache"]["wx"]
+            state["_vent_wx_cache"] = cache
+            return cache["wx"]
     except Exception:
         pass
     return None
-
 
 def update_kwh(state, now_ts, load_power):
     prev_power = state.get("_prev_power")
@@ -837,10 +845,39 @@ def main():
     if running:
         _predicted_cool_min = A.predict_cooling_time(temp, current_target, _outdoor_t, _model)
 
-    # v8.26 天气预冷：谷电时段读未来 3h 预报，超阈值提前开
+    # v8.28 最优调度：DP 直接给出当前小时决策
+    _schedule_override = False
+    _schedule_target = None
+    _schedule_reason = None
+    if not running and not is_night:
+        _h = now_dt.hour
+        if _wx and "hourly" in _wx and _wx["hourly"].get("temperature_2m"):
+            # Load user preferences
+            try:
+                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "r") as f:
+                    _pref = json.load(f)
+                _cw = _pref.get("comfort_weight", 0.5)
+                _ct = _pref.get("comfort_target", 26.0)
+            except Exception:
+                _cw, _ct = 0.5, 26.0
+            _schedule = A.compute_optimal_schedule(_wx, temp, hum, _learned,
+                                                     comfort_weight=_cw,
+                                                     comfort_target=_ct)
+            if _schedule:
+                _hour_action = _schedule[0][1]  # First hour action
+                _hour_temp = _schedule[0][3]  # Predicted indoor temp
+                if _hour_action == "cool":
+                    _schedule_override = True
+                    _schedule_target = max(24, round(_hour_temp - 2))
+                    _schedule_reason = (
+                        f"DP最优调度：谷电{_h}点，室内{_hour_temp:.1f}°C，"
+                        f"蓄冷至{_schedule_target}°C")
+                    log(_schedule_reason)
+
+    # v8.26 简单预冷（兜底）
     _pre_cool = False
     _pre_cool_target = 24
-    if not running and not is_night:
+    if not _schedule_override and not running and not is_night:
         _h = now_dt.hour
         if _h >= 22 or _h < 6:
             if _wx and "hourly" in _wx:
@@ -873,7 +910,7 @@ def main():
                               is_steady_state=False,
                               predicted_cool_min=_predicted_cool_min)
 
-    # v8.26 天气预冷执行
+    # v8.26 简单预冷执行
     if _pre_cool and new_mode is None:
         new_mode, target, reason = "cooling", _pre_cool_target, "天气预冷：谷电蓄冷"
         log(f"执行预冷：target={target}°C（室外{_outdoor_t}°C 未来更热）")
@@ -889,11 +926,16 @@ def main():
     meta = f"{night_str} T={temp} RH={hum}% {dp_str} {ah_str} {delta_str} {kwh_str} target={current_target}C"
 
     if new_mode is None:
-        log(f"无动作 {cl} {meta} 已开={since_on} 已关={since_off} mode={state.get('mode')}")
-        print(f"ac_watch: 无需动作 · {cl} · {meta}")
-        A.save_state(state)
-        evaluate(state, now_ts)
-        return
+        # v8.28 最优调度覆盖
+        if _schedule_override:
+            new_mode, target, reason = "cooling", _schedule_target, _schedule_reason
+            log(f"执行最优调度预冷：target={target}°C")
+        else:
+            log(f"无动作 {cl} {meta} 已开={since_on} 已关={since_off} mode={state.get('mode')}")
+            print(f"ac_watch: 无需动作 · {cl} · {meta}")
+            A.save_state(state)
+            evaluate(state, now_ts)
+            return
 
     log_decision(state, new_mode, temp, hum, now_ts)
 
@@ -944,7 +986,7 @@ def main():
                         log(f"建议开窗换气：已连续制冷{run_hours:.1f}小时，室外温度可能更低")
                 except Exception:
                     pass
-        # v8.27 TTS 播报（夜间静音）
+        # v8.28 TTS 播报（夜间静音）—— 说清原因
         if not night_hours():
             if new_mode == "cooling":
                 tts_speak(f"已自动开空调制冷{target}度，{reason}")

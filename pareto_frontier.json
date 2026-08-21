@@ -1,0 +1,44 @@
+[
+  {
+    "comfort_weight": 0.0,
+    "total_cost": 0.0,
+    "avg_temp": 27.849984816383778,
+    "comfort_penalty": 6.288025433181477
+  },
+  {
+    "comfort_weight": 0.1,
+    "total_cost": 3.0005550698568415,
+    "avg_temp": 26.196127872421496,
+    "comfort_penalty": 0.37934377910701733
+  },
+  {
+    "comfort_weight": 0.2,
+    "total_cost": 3.3898826206537382,
+    "avg_temp": 25.866030008789267,
+    "comfort_penalty": 0.17396421263619555
+  },
+  {
+    "comfort_weight": 0.5,
+    "total_cost": 4.6424249516343465,
+    "avg_temp": 25.866030008789267,
+    "comfort_penalty": 0.17396421263619555
+  },
+  {
+    "comfort_weight": 1.0,
+    "total_cost": 6.83479149472709,
+    "avg_temp": 25.474878796114865,
+    "comfort_penalty": 0.1686960289469621
+  },
+  {
+    "comfort_weight": 2.0,
+    "total_cost": 10.88349618945418,
+    "avg_temp": 25.474878796114865,
+    "comfort_penalty": 0.1686960289469621
+  },
+  {
+    "comfort_weight": 5.0,
+    "total_cost": 23.029610273635452,
+    "avg_temp": 25.474878796114865,
+    "comfort_penalty": 0.1686960289469621
+  }
+]

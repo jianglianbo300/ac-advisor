@@ -154,70 +154,151 @@ def should_precool(wx, current_hi, threshold_hi):
         return True, max_future_hi, idx
     return False, None, None
 
-# ── 24h 最优调度（v10.0 新增） ─────────────
-def compute_optimal_schedule(wx, current_temp, current_hum, learned):
-    """Compute optimal AC schedule for next 24h using:
-    - QW (CMA) hourly temperature + humidity forecast
-    - Time-of-use electricity price (peak/valley)
-    - Learned thermal mass (from ac_thermal.json)
-    - Returns list of (hour, action, est_cost)"""
+# ── 24h 最优调度（v11.0 DP 重写） ─────────────
+def compute_optimal_schedule(wx, current_temp, current_hum, learned,
+                           comfort_weight=1.0, comfort_target=26.0):
+    """DP-based optimal AC schedule for next 24h.
+    
+    State: (hour, indoor_temp)
+    Action: cool or off
+    Cost: electricity + comfort_penalty
+    Transition: RC thermal model
+    
+    Returns list of (hour, action, est_cost, est_temp)"""
     hourly = wx.get("hourly", {})
     times = hourly.get("time", [])
     temps = hourly.get("temperature_2m", [])
     hums = hourly.get("relative_humidity_2m", [])
     if not times:
         return []
-
-    schedule = []
-    for i, t in enumerate(times):
-        hour = int(t[11:13]) if len(t) >= 13 else i
-        temp = temps[i] if i < len(temps) else None
-        hum = hums[i] if i < len(hums) else None
-        if temp is None:
-            continue
-        hi = comfort_index(temp, hum)
+    
+    # Load RC model
+    thermal_data = load_thermal_data()
+    rc = thermal_data.get("thermal_model", {})
+    a = rc.get("thermal_conductance", 0.003)
+    c = rc.get("baseline_cooling", -0.035)
+    
+    # Discretize indoor temp: 22-32°C, 0.5° steps
+    T_MIN, T_MAX, T_STEP = 22.0, 32.0, 0.5
+    n_temps = int((T_MAX - T_MIN) / T_STEP) + 1
+    
+    def temp_to_idx(t):
+        return min(n_temps - 1, max(0, round((t - T_MIN) / T_STEP)))
+    
+    def idx_to_temp(i):
+        return T_MIN + i * T_STEP
+    
+    # Predict next indoor temp given action
+    def next_temp(t_in, t_out, action, dt_min=60):
+        """Predict indoor temp after dt_min minutes."""
+        t = t_in
+        for _ in range(dt_min):
+            if action == "cool":
+                # Cooling active: baseline + conductance + extra cooling
+                dt = a * (t_out - t) + c
+            else:
+                # Off: only thermal conductance (heat leaks in)
+                dt = a * (t_out - t)
+            t += dt
+        return t
+    
+    # Cost for one hour
+    def hour_cost(hour, t_in, action):
         price = ELECTRIC_VALLEY if hour >= 22 or hour < 6 else ELECTRIC_PEAK
-
-        # Decision per hour
-        if hi >= TEMP_COOLING + seasonal_adjustments()[0]:
-            action = "cool"
-            est_cost = kwh_est(40, COOL_DUTY) * price
-        elif muggy_level(temp, hum) >= 2:
-            action = "dehumid"
-            est_cost = kwh_est(60, dehumid_duty(temp, hum)) * price
+        if action == "cool":
+            # kwh for 1 hour cooling
+            kwh = kwh_est(60, COOL_DUTY)
+            elec_cost = kwh * price
         else:
-            action = "off"
-            est_cost = 0
-        schedule.append((hour, action, est_cost))
-
+            elec_cost = 0
+        # Comfort penalty: quadratic above target
+        comfort_penalty = comfort_weight * max(0, t_in - comfort_target) ** 2
+        return elec_cost + comfort_penalty
+    
+    # DP: backward induction
+    # V[hour][temp_idx] = min cost from hour to end
+    V = [[float('inf')] * n_temps for _ in range(25)]
+    policy = [['off'] * n_temps for _ in range(24)]
+    
+    # Terminal cost at hour 24 = 0
+    for ti in range(n_temps):
+        V[24][ti] = 0
+    
+    # Backward pass
+    for h in range(23, -1, -1):
+        t_out = temps[h] if h < len(temps) else 28.0
+        for ti in range(n_temps):
+            t_in = idx_to_temp(ti)
+            best_cost = float('inf')
+            best_action = 'off'
+            for action in ['off', 'cool']:
+                # Immediate cost
+                imm_cost = hour_cost(h, t_in, action)
+                # Next state
+                t_next = next_temp(t_in, t_out, action)
+                ti_next = temp_to_idx(t_next)
+                # Total cost
+                total = imm_cost + V[h + 1][ti_next]
+                if total < best_cost:
+                    best_cost = total
+                    best_action = action
+            V[h][ti] = best_cost
+            policy[h][ti] = best_action
+    
+    # Forward pass: simulate optimal trajectory
+    schedule = []
+    t_current = current_temp
+    for h in range(min(24, len(times))):
+        ti = temp_to_idx(t_current)
+        action = policy[h][ti]
+        t_out = temps[h] if h < len(temps) else 28.0
+        cost = hour_cost(h, t_current, action)
+        schedule.append((h, action, cost, t_current))
+        t_current = next_temp(t_current, t_out, action)
+    
     return schedule
 
+
 def find_pre_cool_window(schedule, current_hour):
-    """Find cheapest pre-cooling window before hot period
-    Returns (start_hour, end_hour, estimated_savings)"""
-    # Find first hot period (consecutive hours with 'cool')
+    """Find cheapest pre-cooling window before hot period.
+    Returns (start_hour, end_hour, estimated_savings) or None.
+    
+    Strategy: find first peak-hour (6-21) cool period, pre-cool during
+    valley hours (22-6) before it to shift load from peak to valley."""
+    # Find first peak-hour cool period (hours 6-21)
     hot_start = None
     for i, (h, action, cost) in enumerate(schedule):
-        if action == "cool":
-            if hot_start is None:
-                hot_start = h
-        else:
-            if hot_start is not None:
-                break
-
+        if action == "cool" and 6 <= h <= 21:
+            hot_start = h
+            break
     if hot_start is None:
         return None
-
-    # Find cheapest valley/pre-cool window 2-3h before hot period
-    pre_cool_start = max(0, hot_start - 3)
-    pre_cool_end = max(0, hot_start - 1)
-
+    # Pre-cool during valley hours before the hot period
+    # Valley hours: 22, 23, 0, 1, 2, 3, 4, 5
+    # If hot period is after 6am, ALL valley hours before it are pre-cool candidates
+    all_valley = [22, 23, 0, 1, 2, 3, 4, 5]
+    hours_to_hot = []
+    for v in all_valley:
+        # Check if this valley hour is before hot_start (wrapping midnight)
+        if v >= 22:  # 22, 23
+            # hot_start could be later today (unlikely for 22-23) or tomorrow
+            hours_ago = hot_start + 24 - v
+        else:  # 0-5
+            hours_ago = hot_start - v
+        if 1 <= hours_ago <= 16:  # Within 16h before hot period (full valley window)
+            hours_to_hot.append(v)
+    if not hours_to_hot:
+        return None
+    pc_start = hours_to_hot[0]
+    pc_end = hours_to_hot[-1]
     # Calculate savings: pre-cool during valley vs cooling during peak
-    valley_cost = ELECTRIC_VALLEY * kwh_est(40, COOL_DUTY)
-    peak_cost = ELECTRIC_PEAK * kwh_est(40, COOL_DUTY)
+    n_hours = len(hours_to_hot)
+    valley_cost = ELECTRIC_VALLEY * kwh_est(40, COOL_DUTY) * n_hours
+    peak_cost = ELECTRIC_PEAK * kwh_est(40, COOL_DUTY) * n_hours
     savings = peak_cost - valley_cost
+    return (pc_start, pc_end, savings)
 
-    return (pre_cool_start, pre_cool_end, savings)
+
 
 # ── 自适应阈值学习（v9.0 新增，持久化） ────
 LEARN_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_learned.json")
@@ -383,27 +464,40 @@ def record_thermal_event(event_type, temp_before, temp_after, duration_min, outd
     return True
 
 def fit_thermal_model(events):
-    """Simple linear regression: cooling_rate = a * (temp_diff) + b * (outdoor_temp - indoor_temp)
-    Returns {"cooling_rate_per_min": x, "warmup_rate_per_min": y, "time_constant_min": z}"""
-    # Filter first: an existing ac_thermal.json may already hold events whose
-    # temp_after / duration_min are None (written before the guard existed).
-    # Fitting straight over those raised TypeError and took the whole run down.
+    """RC thermal model: dT/dt = a*(T_out - T_in) + c
+    a = thermal conductance (/min), c = baseline cooling rate (C/min, negative=cooling)
+    Returns {"thermal_conductance": a, "baseline_cooling": c, "time_constant_min": z}"""
     usable = [e for e in (events or []) if _thermal_event_usable(e)]
     cooling = [e for e in usable if e.get("type") == "cooling"]
     warming = [e for e in usable if e.get("type") == "warming"]
 
-    model = {"cooling_rate_per_min": 0.05, "warmup_rate_per_min": 0.02, "time_constant_min": 120}
+    model = {"thermal_conductance": 0.003, "baseline_cooling": -0.035, "time_constant_min": 120}
 
-    if cooling:
-        rates = [(e["temp_before"] - e["temp_after"]) / max(e["duration_min"], 1) for e in cooling[-20:]]
-        # A cooling cycle that never cooled carries no usable rate; keep the
-        # default rather than learning a zero/negative rate that would make
-        # predict_cooling_time divide by ~0 and return absurd durations.
-        rates = [r for r in rates if r > 0]
-        if rates:
-            model["cooling_rate_per_min"] = sum(rates) / len(rates)
+    if len(cooling) >= 3:
+        # RC model: dT/dt = a*(T_out - T_in) + c
+        X = []
+        y = []
+        for e in cooling[-30:]:
+            t_in = e["temp_before"]
+            t_out = e["outdoor_temp"] or t_in  # fallback if no outdoor
+            rate = (e["temp_after"] - t_in) / e["duration_min"]
+            X.append([t_out - t_in, 1.0])
+            y.append(rate)
+        if len(X) >= 3:
+            import numpy as np
+            X_arr = np.array(X)
+            y_arr = np.array(y)
+            coeffs, _, _, _ = np.linalg.lstsq(X_arr, y_arr, rcond=None)
+            a, c = coeffs
+            # Sanity bounds
+            if -0.01 < a < 0.1 and -0.2 < c < 0.05:
+                model["thermal_conductance"] = float(a)
+                model["baseline_cooling"] = float(c)
+                # Time constant: tau = 1/|a| (minutes to equalize with outdoor)
+                if abs(a) > 0.0001:
+                    model["time_constant_min"] = round(1.0 / abs(a), 1)
 
-    if warming:
+    if len(warming) >= 3:
         rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in warming[-20:]]
         rates = [r for r in rates if r > 0]
         if rates:
@@ -411,13 +505,30 @@ def fit_thermal_model(events):
 
     return model
 
+
 def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):
-    """Predict minutes needed to cool from temp_current to temp_target"""
-    rate = thermal_model.get("cooling_rate_per_min", 0.05)
+    """Predict minutes needed using RC model.
+    dT/dt = a*(T_out - T_in) + c, integrate until T_in reaches target.
+    Returns estimated minutes (int)."""
+    a = thermal_model.get("thermal_conductance", 0.003)
+    c = thermal_model.get("baseline_cooling", -0.035)
+    # Backward-compatible: old format had cooling_rate_per_min
+    legacy_rate = thermal_model.get("cooling_rate_per_min", 0.05)
+    
     diff = temp_current - temp_target
     if diff <= 0:
         return 0
-    return int(diff / rate)
+    
+    # Simulate minute-by-minute with RC model
+    t = temp_current
+    minutes = 0
+    while t > temp_target and minutes < 600:
+        dt = a * (outdoor_temp - t) + c
+        t += dt
+        minutes += 1
+    
+    return minutes
+
 
 # ── 原有函数（保留） ────────────────────────
 def dehumid_duty(temp, hum=None):

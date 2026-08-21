@@ -1,0 +1,5 @@
+{
+  "comfort_weight": 0.5,
+  "comfort_target": 26.0,
+  "description": "comfort_weight: 0=纯省电, 1=平衡, 2=纯舒适. comfort_target: 目标温度"
+}
