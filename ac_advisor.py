@@ -31,28 +31,21 @@ for p in _MIIO_PATHS:
 # ── 阈值常量（统一头部，可配置） ─────────────
 TEMP_COOLING = 27       # 体感≥27 → 制冷（2026-08-19：28→27，用户在 27.0°C 反馈热；公用一套阈值不分屋）
 TEMP_DEHUMID_LOW = 26   # 除湿温度下限（对齐"不算热"）
-TEMP_DEHUMID_HIGH = 28  # 除湿温度上限
 HUM_DEHUMID_ON = 65     # 除湿开启湿度阈值（68% 就闷了，65% 更合理）
-HUM_DEHUMID_OFF = 55    # 除湿关闭湿度阈值（滞回 10%，防频繁启停）
 TEMP_ABSOLUTE_FLOOR = 24# 除湿温度绝对下限（OR 逃生门，低于此无条件关）
 MIN_RUN = 40            # 开一次至少 40 分钟
 MIN_OFF = 15            # 夜间关后至少 15 分钟再开
 DAY_MIN_OFF = 10        # 白天关后至少 10 分钟再开
-MAX_RUN = 180           # 连续运行超 180 分钟建议切换/关（防死锁）
-
 # ── 空调功率（松川 KFRd-35GW 定频 1.5 匹） ──
 AC_INPUT_W = 1076     # 输入功率 W（铭牌）
-AC_COP = 3.25          # 能效比
 ELECTRIC_PEAK = 0.617   # 上海居民峰电（6:00-22:00）元/度（一户一表第一档）
 ELECTRIC_VALLEY = 0.307 # 上海居民谷电（22:00-6:00）元/度（约半价）
-ELECTRIC_PRICE = ELECTRIC_PEAK  # 兼容旧引用（默认峰电）
 DEHUMID_DUTY = 0.60    # 定频除湿模式占空比（压缩机跑跑停停, 估算）
 COOL_DUTY = 0.70       # 定频制冷模式占空比（估算）
 DEHUMID_MIN = 60       # 定频除湿达标通常更慢（风速低, 估算60分钟）
 COOL_BURST_MIN = 40    # 制冷集中一轮达标（风速高, 约40分钟）
-FILTER_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_state.json")
-FILTER_CLEAN_INTERVAL = 30  # 滤网建议清洗间隔（天）, 脏滤网=风量降=除湿慢=费电
-# 铭牌实测: 制冷1076W/5.1A, 热泵1110W, PTC1000W, 最大2400W/11.3A, 2018-09产(老机除湿稍慢属正常)
+
+
 
 # ── 显式状态机（v9.0 新增） ────────────────
 class ACState(Enum):
