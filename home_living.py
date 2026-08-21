@@ -19,7 +19,6 @@ import sys
 import urllib.request
 from datetime import datetime, date, timezone, timedelta
 
-import ac_advisor
 from ac_advisor import (
     load_learned, save_learned, evaluate_and_learn, log_decision,
     fetch_weather, read_indoor, filter_clean_reminder, weather_cn,
@@ -351,12 +350,14 @@ def load_vent_cycle() -> dict:
 
 
 def save_vent_cycle(d: dict):
+    """Persist vent cycle state (atomic write: tmp -> rename)."""
+    tmp = VENT_CYCLE_FILE + ".tmp"
     try:
-        with open(VENT_CYCLE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, VENT_CYCLE_FILE)
     except Exception:
         pass
-
 
 def in_quiet_hours(now=None):
     """True inside the no-disturb window (default 22:00-07:00, wraps midnight)."""
