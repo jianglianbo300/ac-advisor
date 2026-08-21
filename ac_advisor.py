@@ -677,9 +677,6 @@ def _read_indoor_once(ip, token, timeout):
 
 
 
-AC_MEASURED_W = None     # 空调插座(空调伴侣 mcn02)实测功率，v7.0 引入
-AC_SOCKET = None         # 插座实测开关状态: "on" | "off" | None(未知)
-AC_CTRL = None           # 自动控制句柄，v8.0 引入
 
 
 def ac_control_init():

@@ -79,10 +79,6 @@ _load_env()
 QW_HOST = os.environ.get("QW_HOST", "kf54e6wb7f.re.qweatherapi.com")
 QW_KEY = os.environ.get("QW_API_KEY", "")
 
-# -- Measured power globals --
-AC_MEASURED_W = None
-AC_SOCKET = None
-
 
 # ============================================================
 # AC control stub (home_living does NOT control AC)
