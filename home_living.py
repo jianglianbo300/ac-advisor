@@ -203,18 +203,13 @@ def build_rows(h, today):
             continue
         rh = h["relative_humidity_2m"][i]
         pp = h["precipitation_probability"][i]
-        rain_mm = h["precipitation"][i]
         temp = h["temperature_2m"][i]
-        wind_ms = h["wind_speed_10m"][i] / 3.6
-        wind_dir = h.get("wind_direction_10m", [None] * len(h["time"]))[i]
         rows.append({
-            "hr": hr, "rh": rh, "pp": pp, "rain_mm": rain_mm,
-            "temp": temp, "wind_kmh": wind_ms * 3.6, "wind_ms": wind_ms,
-            "wind_dir": wind_dir,
+            "hr": hr, "rh": rh, "pp": pp, "rain_mm": 0,
+            "temp": temp, "wind_kmh": 0, "wind_ms": 0,
+            "wind_dir": None,
         })
     return rows
-
-
 def pick_best(rows, indoor_temp, indoor_rh, ac_mode, aqi):
     """Unified gate filter + dew-point delta sort."""
     cand = []
