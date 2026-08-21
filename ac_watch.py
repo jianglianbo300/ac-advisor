@@ -974,9 +974,14 @@ def main():
         except Exception:
             pass
     state_comp_before = state.get("compressor_state")
-
-    # v8.10 假运行计数器
+    # v8.10 假运行计数器（必须在 if/elif 链外初始化，否则 comp 非 fan_only 时未定义）
     fake_run_count = state.get("_fake_run_count", 0) or 0
+
+    # 启动次数滑窗裁剪（每次 tick都做，避免 off 时旧记录残留）
+    starts = state.get("_night_comp_starts", [])
+    cutoff = (now_dt - timedelta(hours=1)).isoformat(timespec="seconds")
+    state["_night_comp_starts"] = [s for s in starts if s >= cutoff]
+
 
     if comp == "compressor" and state_comp_before != "compressor":
         state["compressor_restart_cooldown_until"] = (
@@ -987,10 +992,6 @@ def main():
         state["_fake_run_count"] = 0
         # 压缩机启动次数跟踪（1h 滑窗）。v8.21：原先只在夜间记，导致白天无从判断
         # 抖振；改为全天记录，夜间用 NIGHT_MAX_STARTS_PER_H、白天用 DAY_MAX_STARTS_PER_H。
-        starts = state.get("_night_comp_starts", [])
-        starts.append(now_ts)
-        cutoff = (now_dt - timedelta(hours=1)).isoformat(timespec="seconds")
-        state["_night_comp_starts"] = [s for s in starts if s >= cutoff]
     elif comp == "fan_only" and state_comp_before == "compressor":
         state["last_compressor_stop_at"] = now_ts
         last_comp_stop = now_ts
