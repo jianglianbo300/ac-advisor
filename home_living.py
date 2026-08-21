@@ -82,7 +82,6 @@ QW_KEY = os.environ.get("QW_API_KEY", "")
 # -- Measured power globals --
 AC_MEASURED_W = None
 AC_SOCKET = None
-AC_CTRL = None
 
 
 # ============================================================

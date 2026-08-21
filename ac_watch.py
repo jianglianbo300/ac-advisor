@@ -701,8 +701,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                 and comp_min is not None and comp_min >= A.MIN_RUN):
             return (None, None, None)
 
-        # 湿度达标
-        if not evening and hum <= DEHUMID_EXIT_RH:
+        # 湿度达标（也要等 MIN_RUN，防短循环损伤压缩机）
+        if not evening and hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= A.MIN_RUN:
             return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
         # 虚拟变频（v8.8）：湿度接近达标（≤58）且已跑够 MIN_RUN → 升温降负载缓除
