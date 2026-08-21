@@ -46,7 +46,9 @@ v8.9 修复：
 
 v8.5 新增：夜间模式 TTS 静音 + kWh 梯形积分 + 压缩机运行时间统计
 """
+
 import os
+
 import sys
 import json
 import math
@@ -561,10 +563,18 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     v8.6 核心改进：所有"已运行多久"判断改用 compressor_run_min（压缩机实际累计运行分钟），
     不用 since_on（壁钟时间）——定频机到温停压缩机，since_on 包含大量风扇空吹时间。
-    失败/低效判断只基于真实除湿工作时间，避免"看起来跑了很久实际没干活"的误判。
-    v8.7：增加 reason 文本——供 TTS 播报"为什么开关"，让用户听到决策逻辑。
+    # 自适应阈值：读取学习偏移，修正全局阈值
+    learned = A.load_learned()
+    adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    temp_cooling = A.TEMP_COOLING + adj
+
     v8.10：增加 fake_run_count 参数，连续 3 次假运行后停机告警。
     """
+    # 自适应阈值：读取学习偏移
+    learned = A.load_learned()
+    adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    temp_cooling = A.TEMP_COOLING + adj
+
     if running is None:
         # 传感器不可达：放弃本次决策，不动作
         return (None, None, None)
@@ -772,10 +782,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if (night_comp_starts and len(night_comp_starts) >= DAY_MAX_STARTS_PER_H
             and temp < DAY_STARTS_OVERRIDE_T):
         return (None, None, None)
+
     # v8.22 天气感知改为「压低目标」而非「提前启动」：见 HOT_DAY_TARGET_FLOOR 注释，
     # 1°C 分辨率下提前一档会把死区压到 1°C，重新引发抖振。
     hot_day = outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T
-    if temp >= A.TEMP_COOLING:
+    if temp >= temp_cooling:
         # v8.23 持续判据（同夜间）：短暂触碰启动线不算热。高湿闷热走下方除湿分支，
         # 那条不受持续时长约束——闷是即时体感，不需要等。
         if (temp < SUSTAIN_URGENT_T and sustained is False
@@ -1070,7 +1081,10 @@ def main():
     except Exception:
         _wx = None
     _outdoor_t = _wx["t"] if (_wx and "t" in _wx) else None
-    _outdoor_rain = _wx.get("rain") if _wx else None
+    # 自适应阈值
+    _learned = A.load_learned()
+    _adj = _learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    _temp_cooling_adj = A.TEMP_COOLING + _adj
 
     new_mode, target, reason = decide(temp, hum, running, since_on, since_off, is_night,
                               compressor=comp,
@@ -1084,13 +1098,11 @@ def main():
                               compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0),
                               night_comp_starts=state.get("_night_comp_starts"),
                               fake_run_count=fake_run_count,
-                              evening=evening,
-                              outdoor_temp=_outdoor_t,
-                              outdoor_rain=_outdoor_rain,
                               sustained=sustained_above(
                                   state,
-                                  NIGHT_START_T if is_night else A.TEMP_COOLING,
+                                  NIGHT_START_T if is_night else _temp_cooling_adj,
                                   SUSTAIN_MIN, now_ts))
+
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
