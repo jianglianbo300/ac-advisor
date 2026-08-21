@@ -999,7 +999,7 @@ def main():
                         log(f"建议开窗换气：已连续制冷{run_hours:.1f}小时，室外温度可能更低")
                 except Exception:
                     pass
-        # v8.28 TTS 播报（夜间静音）—— 说清原因
+        # TTS 语音播报（白天，夜间静音）
         if not night_hours():
             if new_mode == "cooling":
                 tts_speak(f"已自动开空调制冷{target}度，{reason}")
