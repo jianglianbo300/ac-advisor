@@ -673,6 +673,10 @@ def main():
         if state.get("_sensor_off_since") is None:
             state["_sensor_off_since"] = now_ts
     else:
+        if state.get("_temp_src") != "indoor":
+            log(f"室内传感器恢复（T={temp}°C RH={hum}%），清除 outdoor_fallback 标记")
+            state["_temp_src"] = "indoor"
+            state["_hum_src"] = "indoor"
         state.pop("_sensor_off_since", None)
 
     manual_off = state.get("manual_off_at")
