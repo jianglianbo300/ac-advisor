@@ -214,12 +214,26 @@ def evaluate_and_learn(state, now_ts):
         elif cur_adj < 0: adjusted["temp_cooling"] = cur_adj + 1
         elif cur_adj > 0: adjusted["temp_cooling"] = cur_adj - 1
         entry["evaluated"] = True
+    # v8.29 fix: 日预算学习按"当日"用电判断，且偏移只能回落不能因超预算单向顶死。
+    # 旧逻辑用累计 kWh 对比日预算 → 永远超支 → 偏移被持续 +0.5 顶到上限，
+    # 启动线被推到 29°C，8/24 下午室温 30°C 都不开机。改为当日值+上限放宽到 +3，
+    # 超预算最多把启动线推到 30°C（极端热天用户可手动干预）。
     daily_kwh = state.get("_daily_kwh", 0)
     daily_budget = 8.0
-    if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 2:
-        adjusted["temp_cooling"] = min(2, adjusted.get("temp_cooling", 0) + 0.5)
+    _today_str = now_ts[:10] if isinstance(now_ts, str) else datetime.now().strftime("%Y-%m-%d")
+    if state.get("_budget_prediction", {}).get("date") == _today_str:
+        daily_budget = max(4.0, (state["_budget_prediction"].get("predicted_kwh") or 8.0) * 1.3)
+    if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
+        adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
     elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > -2:
         adjusted["temp_cooling"] = max(-2, adjusted.get("temp_cooling", 0) - 0.5)
+    # 偏移健康护栏：白天(8-21点)若室温≥启动线-0.5 且空调未运行超过20分钟，
+    # 说明启动线过高，强制回落 0.5（自愈，防止再次出现 30°C 不开机）
+    if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
+        if (state.get("last_temp") or 0) >= TEMP_COOLING + adjusted.get("temp_cooling", 0) - 0.5:
+            _off_min = minutes_since(state.get("last_off_at"))
+            if _off_min is not None and _off_min > 20:
+                adjusted["temp_cooling"] = round(max(-2, adjusted.get("temp_cooling", 0) - 0.5), 2)
     # 每日用电预算预测
     _budget_pred = state.get("_budget_prediction", {})
     _today = datetime.now().strftime("%Y-%m-%d")

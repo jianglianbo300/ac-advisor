@@ -801,6 +801,13 @@ def main():
         state["_daily_kwh"] = state.get("_daily_kwh", 0) + daily_increment
     state["_prev_kwh"] = state.get("estimated_kwh", 0)
 
+    # v8.29 fix: _daily_kwh 按日清零（此前从不清零，累计值永远超预算，
+    # 导致 evaluate_and_learn 把 temp_cooling 偏移永久顶到 +2 上限）
+    _today = now_ts[:10] if isinstance(now_ts, str) else now_dt.strftime("%Y-%m-%d")
+    if state.get("_daily_kwh_date") != _today:
+        state["_daily_kwh"] = 0.0
+        state["_daily_kwh_date"] = _today
+
     update_kwh(state, now_ts, load_power)
     update_rh_history(state, now_ts, hum)
     update_temp_history(state, now_ts, temp)
