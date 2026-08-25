@@ -1146,7 +1146,10 @@ def _selftest():
         {"time": (_now - timedelta(minutes=30)).isoformat(), "action": "cooling"},
     ]
     _fake = {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": _fake_dl}
-    with _mock.patch.object(A, "load_learned", return_value=_fake):
+    # audit5 fix: 还需mock current_price为谷电, 否则峰电+1°C阈值(28°C)
+    # 会先拦下27°C的case — 断言假通过(测的是峰电逻辑不是启停上限)
+    with _mock.patch.object(A, "load_learned", return_value=_fake), \
+            _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY):
         r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None,
                    False, None, None, sustained=True)
         assert r[0] is None, f"DAY_MAX_STARTS_PER_H=2 should block at 2 starts, got {r}"
