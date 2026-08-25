@@ -497,8 +497,6 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                 return ("off", None, f"夜间室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门关机")
             if comp_min is not None and comp_min < NIGHT_MIN_COMP_ON:
                 return (None, None, None)
-            if night_comp_starts and len(night_comp_starts) >= NIGHT_MAX_STARTS_PER_H:
-                return (None, None, None)
 
         if not is_night and temp <= DAY_COOL_STOP_T:
             if ah is not None and ah <= DAY_COOL_STOP_AH:
@@ -936,8 +934,7 @@ def main():
                               minutes_since_last_adjust=minutes_since_adjust,
                               ah=ah,
                               compressor_run_min=(state.get("cycle_comp_total") or 0) + (state.get("compressor_on_min") or 0),
-                              night_comp_starts=state.get("_night_comp_starts"),
-                              fake_run_count=fake_run_count,
+                                                            fake_run_count=fake_run_count,
                               evening=evening,
                               outdoor_temp=_outdoor_t,
                               outdoor_rain=_outdoor_rain,
