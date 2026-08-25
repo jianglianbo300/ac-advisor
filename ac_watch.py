@@ -560,21 +560,11 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     effective_min_off = A.MIN_OFF if is_night else A.DAY_MIN_OFF
     if since_off is not None and since_off < effective_min_off:
         return (None, None, None)
-    if is_night:
-        night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
-        if temp >= NIGHT_START_T:
-            if temp < SUSTAIN_URGENT_T and sustained is False:
-                return (None, None, None)
-            return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
-        if (ah is not None and ah >= NIGHT_START_AH + NIGHT_START_AH_HYST
-                and temp - night_target >= 1):
-            return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
-        return (None, None, None)
-
     # ── v8.21 白天启停次数上限 ──
     # v8.29 audit fix: _night_comp_starts 从未被写入，此判定形同虚设。
     # v8.29 audit2 fix: 统计"真启动"= cooling决策且前一条decision非cooling
     # （运行中的降1度加强除湿等target调整也是cooling条目，不能算启停）
+    # v8.29 audit3 fix: 移到 is_night 分支之前，夜间启动同样受每小时次数上限约束
     try:
         _dl = A.load_learned().get("decision_log", [])
         _now = datetime.now()
@@ -591,8 +581,19 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             _prev_act = _act
     except Exception:
         _starts_1h = 0
-    if _starts_1h >= (DAY_MAX_STARTS_PER_H if not is_night else NIGHT_MAX_STARTS_PER_H) \
-            and temp < DAY_STARTS_OVERRIDE_T:
+    _cap = NIGHT_MAX_STARTS_PER_H if is_night else DAY_MAX_STARTS_PER_H
+    if _starts_1h >= _cap and temp < DAY_STARTS_OVERRIDE_T:
+        return (None, None, None)
+
+    if is_night:
+        night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
+        if temp >= NIGHT_START_T:
+            if temp < SUSTAIN_URGENT_T and sustained is False:
+                return (None, None, None)
+            return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
+        if (ah is not None and ah >= NIGHT_START_AH + NIGHT_START_AH_HYST
+                and temp - night_target >= 1):
+            return ("cooling", night_target, f"夜间感觉闷（湿度高），自动开制冷{night_target}度压一压")
         return (None, None, None)
 
     # 峰谷电：峰电提高阈值（晚开省电）
