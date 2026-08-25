@@ -572,8 +572,19 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         return (None, None, None)
 
     # ── v8.21 白天启停次数上限 ──
-    if (night_comp_starts and len(night_comp_starts) >= DAY_MAX_STARTS_PER_H
-            and temp < DAY_STARTS_OVERRIDE_T):
+    # v8.29 audit fix: _night_comp_starts 从未被写入，此判定形同虚设。
+    # 改用 decision_log 统计近1小时的开机次数（跨白天/夜间都有效）。
+    try:
+        _dl = A.load_learned().get("decision_log", [])
+        _now = datetime.now()
+        _starts_1h = sum(1 for e in _dl
+                         if e.get("action") in ("cooling", "dehumid")
+                         and not e.get("_counted", False)
+                         and (datetime.fromisoformat(e["time"]) >= _now - timedelta(minutes=60)))
+    except Exception:
+        _starts_1h = 0
+    if _starts_1h >= (DAY_MAX_STARTS_PER_H if not is_night else NIGHT_MAX_STARTS_PER_H) \
+            and temp < DAY_STARTS_OVERRIDE_T:
         return (None, None, None)
 
     # 峰谷电：峰电提高阈值（晚开省电）
@@ -892,7 +903,9 @@ def main():
                 is_extreme = _outdoor_t is not None and _outdoor_t >= 35
                 if _hour_action == "cool" and (is_valley or is_extreme):
                     _schedule_override = True
-                    _schedule_target = max(24, round(_hour_temp - 2))
+                    # v8.29 audit fix: DP算出的蓄冷目标必须夹在合理区间。
+                    # 此前直接 round(_hour_temp - 2)，热模型参数漂移时算出过55°C这种荒谬值
+                    _schedule_target = int(min(26, max(24, round(_hour_temp - 2))))
                     _schedule_reason = (
                         f"DP最优调度：谷电{_h}点，室内{_hour_temp:.1f}°C，"
                         f"蓄冷至{_schedule_target}°C")

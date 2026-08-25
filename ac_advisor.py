@@ -208,7 +208,13 @@ def evaluate_and_learn(state, now_ts):
             if comp_running: success = True
             elif (pre_temp - cur_temp) < 0.3 and ((pre_hum or 0) - (cur_hum or 0)) < 3: success = False
         elif action in ("off", "fan"):
-            if (cur_temp - pre_temp) > 2.0 or (cur_hum is not None and cur_hum > 80): success = False
+            # v8.29 audit fix: 旧标准 (cur_temp - pre_temp) > 2.0 把"关机后自然回热"
+            # 误判为决策失败 → 偏移被无端扣到-2(启动线25°C, 过早开机费电)。
+            # 关机决策的正确目标 = 不该关的时候关了(关后很快过冷/湿度爆升)。
+            # 回热本身是物理规律, 不是错误。改为: 只有"关机后30分钟内温度不升反降
+            # (说明关早了, 房间还在降温)"或湿度爆升才算失败。
+            if (cur_temp is not None and cur_temp < pre_temp - 0.5) or (cur_hum is not None and cur_hum > 80):
+                success = False
         cur_adj = adjusted.get("temp_cooling", 0)
         # v8.30: 负偏移会把启动线压进抖振死区（启动线<关机线+迟滞），白天已由
         # ac_watch.DAY_START_LINE_FLOOR 兜底，这里不再产出负偏移。
@@ -226,15 +232,15 @@ def evaluate_and_learn(state, now_ts):
         daily_budget = max(4.0, (state["_budget_prediction"].get("predicted_kwh") or 8.0) * 1.3)
     if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
         adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
-    elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > -2:
-        adjusted["temp_cooling"] = max(-2, adjusted.get("temp_cooling", 0) - 0.5)
+    elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
+        adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
     # 偏移健康护栏：白天(8-21点)若室温≥启动线-0.5 且空调未运行超过20分钟，
     # 说明启动线过高，强制回落 0.5（自愈，防止再次出现 30°C 不开机）
     if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
         if (state.get("last_temp") or 0) >= TEMP_COOLING + adjusted.get("temp_cooling", 0) - 0.5:
             _off_min = minutes_since(state.get("last_off_at"))
             if _off_min is not None and _off_min > 20:
-                adjusted["temp_cooling"] = round(max(-2, adjusted.get("temp_cooling", 0) - 0.5), 2)
+                adjusted["temp_cooling"] = round(max(0, adjusted.get("temp_cooling", 0) - 0.5), 2)
     # 每日用电预算预测
     _budget_pred = state.get("_budget_prediction", {})
     _today = datetime.now().strftime("%Y-%m-%d")
