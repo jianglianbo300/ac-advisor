@@ -573,14 +573,22 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     # ── v8.21 白天启停次数上限 ──
     # v8.29 audit fix: _night_comp_starts 从未被写入，此判定形同虚设。
-    # 改用 decision_log 统计近1小时的开机次数（跨白天/夜间都有效）。
+    # v8.29 audit2 fix: 统计"真启动"= cooling决策且前一条decision非cooling
+    # （运行中的降1度加强除湿等target调整也是cooling条目，不能算启停）
     try:
         _dl = A.load_learned().get("decision_log", [])
         _now = datetime.now()
-        _starts_1h = sum(1 for e in _dl
-                         if e.get("action") in ("cooling", "dehumid")
-                         and not e.get("_counted", False)
-                         and (datetime.fromisoformat(e["time"]) >= _now - timedelta(minutes=60)))
+        _starts_1h, _prev_act = 0, None
+        for e in _dl:
+            try:
+                if datetime.fromisoformat(e["time"]) < _now - timedelta(minutes=60):
+                    continue
+            except Exception:
+                continue
+            _act = e.get("action")
+            if _act in ("cooling", "dehumid") and _prev_act not in ("cooling", "dehumid"):
+                _starts_1h += 1
+            _prev_act = _act
     except Exception:
         _starts_1h = 0
     if _starts_1h >= (DAY_MAX_STARTS_PER_H if not is_night else NIGHT_MAX_STARTS_PER_H) \
