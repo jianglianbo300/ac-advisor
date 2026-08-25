@@ -1135,11 +1135,24 @@ def _selftest():
     r = decide(25, 60, True, 100, 90, False, "compressor", None, None, 26, None, None, None, None, None, evening=True)
     assert r[0] != "off", f"evening cruise should not stop at 100min, got {r}"
 
-    # v8.21 启停次数上限
-    r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None, night_comp_starts=["2026-08-14T10:00:00"] * 2)
-    assert r[0] is None, f"DAY_MAX_STARTS_PER_H=2 should block at 2 starts, got {r}"
-    r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None, night_comp_starts=["2026-08-14T10:00:00"] * 2)
-    assert r[0] == "cooling", f"DAY_STARTS_OVERRIDE_T=30 should force start, got {r}"
+    # v8.21 启停次数上限 — v8.29 audit4: 旧断言测的是死参数night_comp_starts,
+    # 新逻辑读load_learned()的decision_log。改为mock注入1小时内2次真启动来验证。
+    import json as _json, tempfile as _tempfile, os as _os
+    from unittest import mock as _mock
+    _now = datetime.now()
+    _fake_dl = [
+        {"time": (_now - timedelta(minutes=50)).isoformat(), "action": "cooling"},
+        {"time": (_now - timedelta(minutes=45)).isoformat(), "action": "off"},
+        {"time": (_now - timedelta(minutes=30)).isoformat(), "action": "cooling"},
+    ]
+    _fake = {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": _fake_dl}
+    with _mock.patch.object(A, "load_learned", return_value=_fake):
+        r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None,
+                   False, None, None, sustained=True)
+        assert r[0] is None, f"DAY_MAX_STARTS_PER_H=2 should block at 2 starts, got {r}"
+        r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None,
+                   False, None, None, sustained=True)
+        assert r[0] == "cooling", f"DAY_STARTS_OVERRIDE_T=30 should force start, got {r}"
 
     # v8.23 持续判据
     r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
