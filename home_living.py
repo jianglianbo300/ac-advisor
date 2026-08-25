@@ -153,11 +153,20 @@ def gate_check(rh, pp, rain_mm, temp, wind_ms, gust_ms, pm25,
     return True, None
 
 
-def vent_advice(now_rh, out_rh, now_temp=None, out_temp=None):
-    """Indoor/outdoor comparison + AC linkage advice."""
+def vent_advice(now_rh, out_rh, now_temp=None, out_temp=None, out_rh_for_dp=None):
+    """Indoor/outdoor comparison + AC linkage advice.
+    v8.30: 露点判据与 gate_check 统一——室外露点比室内高 DEW_DELTA_MAX 以上
+    一律提示湿气灌入，不再出现"舒适但开窗灌湿气"的自相矛盾。"""
     lines = []
     if out_rh is None:
         return lines
+    if (now_temp is not None and out_temp is not None
+            and out_rh is not None):
+        dp_in = dew_point(now_temp, now_rh) if now_rh is not None else None
+        dp_out = dew_point(out_temp, out_rh)
+        if dp_in is not None and dp_out - dp_in >= DEW_DELTA_MAX:
+            lines.append(f"💧 室外露点比室内高 {dp_out - dp_in:.1f}°C，开窗灌湿气（短换≤5分钟）")
+            return lines
     if now_rh is not None:
         if now_rh >= 70:
             lines.append("🥵 室内偏闷，建议短促换气")
@@ -607,11 +616,7 @@ def main():
     lines.append("")
     lines.append("─" * 40)
     lines.append("数据: 和风天气(CMA) + Open-Meteo空气质量 + 小米净化器4Lite")
-
     print("\n".join(lines))
-
-    # Windows toast notification
-    notify_windows("🏠 家居生活顾问", "通风/换气提醒生成")
 
 
 if __name__ == "__main__":

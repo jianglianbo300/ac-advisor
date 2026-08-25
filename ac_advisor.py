@@ -210,8 +210,9 @@ def evaluate_and_learn(state, now_ts):
         elif action in ("off", "fan"):
             if (cur_temp - pre_temp) > 2.0 or (cur_hum is not None and cur_hum > 80): success = False
         cur_adj = adjusted.get("temp_cooling", 0)
-        if not success: adjusted["temp_cooling"] = max(-2, min(2, cur_adj - 1))
-        elif cur_adj < 0: adjusted["temp_cooling"] = cur_adj + 1
+        # v8.30: 负偏移会把启动线压进抖振死区（启动线<关机线+迟滞），白天已由
+        # ac_watch.DAY_START_LINE_FLOOR 兜底，这里不再产出负偏移。
+        if not success: adjusted["temp_cooling"] = max(0, min(2, cur_adj - 1))
         elif cur_adj > 0: adjusted["temp_cooling"] = cur_adj - 1
         entry["evaluated"] = True
     # v8.29 fix: 日预算学习按"当日"用电判断，且偏移只能回落不能因超预算单向顶死。

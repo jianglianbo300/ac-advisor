@@ -127,6 +127,7 @@ HOT_DAY_TARGET_FLOOR = 24
 
 SUSTAIN_MIN = 10
 SUSTAIN_URGENT_T = 29.0
+DAY_START_LINE_FLOOR = 27.0  # v8.30: 白天温度启动线地板 = target_min(25)+SLACK(1)+迟滞(1)
 
 SENSOR_FALLBACK_OFF_ALLOWED = True
 SENSOR_FALLBACK_ON_ALLOWED = False
@@ -431,7 +432,9 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     learned = A.load_learned()
     adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
-    temp_cooling = A.TEMP_COOLING + adj
+    # v8.30 防抖振：启动线不得低于 关机线(target最低25)+slack(1)+迟滞(1)=27。
+    # 学习负偏移把启动线压进 [25,26] 死区 → 25开/26关 20分钟一轮短循环（08-25 实录）。
+    temp_cooling = max(A.TEMP_COOLING + adj, DAY_START_LINE_FLOOR)
 
     if running is None:
         return (None, None, None)
