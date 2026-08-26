@@ -599,8 +599,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if is_night:
         night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
         if temp >= NIGHT_START_T:
-            if temp < SUSTAIN_URGENT_T and sustained is False:
-                return (None, None, None)
+                        # 夜间短循环已由 MIN_OFF(15min)+每小时启停上限 防护;
+            # sustained(10min)过滤会把一次缓慢夜间升温卡死在27°C -> 不再抑制
             return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
         if (ah is not None and ah >= NIGHT_START_AH + NIGHT_START_AH_HYST
                 and temp - night_target >= 1):
@@ -900,7 +900,7 @@ def main():
     _schedule_override = False
     _schedule_target = None
     _schedule_reason = None
-    if not running and not is_night:
+    if not running:
         _h = now_dt.hour
         # 检查缓存：同一小时内不重算
         _dp_cache = state.get("_dp_schedule_cache", {})
@@ -970,7 +970,7 @@ def main():
     _dehumidify = False
     _dehumidify_target = None
     _dehumidify_reason = None
-    if not running and not is_night:
+    if not running:
         _h = now_dt.hour
         if _h >= 22 or _h < 6:
             if _wx and "hourly" in _wx and _wx["hourly"].get("relative_humidity_2m"):
