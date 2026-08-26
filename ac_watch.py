@@ -831,6 +831,7 @@ def main():
     state["cycle_comp_total"] = cycle_comp_total
 
     daily_increment = state.get("estimated_kwh", 0) - state.get("_prev_kwh", 0)
+    _today_str = now_ts[:10] if isinstance(now_ts, str) else now_dt.strftime("%Y-%m-%d")
     if daily_increment > 0:
         state["_daily_kwh"] = state.get("_daily_kwh", 0) + daily_increment
         # v8.31 峰谷套利：按当前时段把电量记到峰/谷账本，供成本预算学习用
