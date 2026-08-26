@@ -372,7 +372,7 @@ def open_cycle(state, now_ts, ah, rh, temp=None, outdoor_temp=None):
 
 
 def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_reason=None,
-                temp=None, outdoor_temp=None):
+                temp=None, outdoor_temp=None, mode_before=None):
     cs = state.get("cycle_start")
     if not cs:
         return False
@@ -405,6 +405,18 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
     path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cycle_log.jsonl")
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # v8.30: 记录热力学事件（此前从未调用，8/21 后模型停止更新）
+    if mode_before in ("cooling", "dehumid", "dehumid_alert") and dur_min >= 5:
+        try:
+            A.record_thermal_event(
+                "cooling",
+                cs.get("temp"),
+                temp,
+                dur_min,
+                cs.get("outdoor_temp") if cs.get("outdoor_temp") is not None else outdoor_temp,
+            )
+        except Exception:
+            pass
     state.pop("cycle_start", None)
     return True
 
@@ -417,7 +429,8 @@ def handle_cycle_after_action(state, new_mode, mode_before, now_ts, ah, hum, run
         return True
     if new_mode == "off" and mode_before in ("cooling", "dehumid", "dehumid_alert"):
         return close_cycle(state, now_ts, ah, hum, running_target, comp_min, path=path,
-                           abort_reason=abort_reason, temp=temp, outdoor_temp=outdoor_temp)
+                           abort_reason=abort_reason, temp=temp, outdoor_temp=outdoor_temp,
+                           mode_before=mode_before)
     return False
 
 
@@ -820,6 +833,13 @@ def main():
     daily_increment = state.get("estimated_kwh", 0) - state.get("_prev_kwh", 0)
     if daily_increment > 0:
         state["_daily_kwh"] = state.get("_daily_kwh", 0) + daily_increment
+        # v8.31 峰谷套利：按当前时段把电量记到峰/谷账本，供成本预算学习用
+        _band = "valley" if (now_dt.hour >= 22 or now_dt.hour < 6) else "peak"
+        _by_band = state.setdefault("_kwh_by_price_band", {"peak": 0.0, "valley": 0.0, "date": _today_str})
+        if _by_band.get("date") != _today_str:
+            _by_band = {"peak": 0.0, "valley": 0.0, "date": _today_str}
+            state["_kwh_by_price_band"] = _by_band
+        _by_band[_band] = round(_by_band.get(_band, 0.0) + daily_increment, 4)
     state["_prev_kwh"] = state.get("estimated_kwh", 0)
 
     # v8.29 fix: _daily_kwh 按日清零（此前从不清零，累计值永远超预算，

@@ -234,6 +234,24 @@ def evaluate_and_learn(state, now_ts):
         adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
     elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
         adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
+    # v8.31 峰谷套利：预算按"加权电价成本"而非 kWh 判断。
+    # 谷电(22-6点, 0.307元)制冷多跑不罚；峰电(0.617元)超支才推高启动线。
+    # 效果：同样8度电，谷电花的钱≈4度峰电，系统自然学会"往夜里搬负荷"。
+    try:
+        _wh = state.get("_kwh_by_price_band") or {}
+        _peak_kwh = _wh.get("peak", 0.0)
+        _valley_kwh = _wh.get("valley", 0.0)
+        if (_peak_kwh + _valley_kwh) > 0:  # 有分时数据才启用，否则回退旧口径
+            daily_cost = _peak_kwh * ELECTRIC_PEAK + _valley_kwh * ELECTRIC_VALLEY
+            _cost_budget = max(2.0, (state["_budget_prediction"].get("predicted_kwh", 8.0) * 1.3
+                                     if state.get("_budget_prediction", {}).get("date") == _today_str
+                                     else 8.0 * 1.3) * (ELECTRIC_PEAK + ELECTRIC_VALLEY) / 2)
+            if daily_cost > _cost_budget and adjusted.get("temp_cooling", 0) < 3:
+                adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
+            elif daily_cost < _cost_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
+                adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
+    except Exception:
+        pass
     # 偏移健康护栏：白天(8-21点)若室温≥启动线-0.5 且空调未运行超过20分钟，
     # 说明启动线过高，强制回落 0.5（自愈，防止再次出现 30°C 不开机）
     if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
