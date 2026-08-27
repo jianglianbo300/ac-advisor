@@ -403,8 +403,13 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
         "compressor_runtime_min": round(comp_min, 1) if comp_min else 0,
         "kwh_used": round(state.get("estimated_kwh", 0) - cs.get("kwh", 0), 4),
         "duration_min": dur_min,
-        "duty": min(1.0, dur_min / 60) if dur_min else 0,
-        "duty_invalid": False,
+        # v8.33: 恢复 v8.21 占空比语义。b301eae(v8.27) 把 duty 改成挂钟时长占比、
+        # duty_invalid 恒 False —— 压缩机分钟数超过周期时长的计量脏数据从此无人标记。
+        # duty=压缩机运行分钟/周期分钟，>1.01 标记异常供分析端剔除。
+        "duty": (round(comp_min / dur_min, 3)
+                 if dur_min and comp_min is not None
+                 else (round(min(1.0, dur_min / 60), 3) if dur_min else 0)),
+        "duty_invalid": bool(dur_min and comp_min is not None and comp_min / dur_min > 1.01),
         "abort_reason": abort_reason,
         "rh_spike": (rh is not None and cs.get("rh") is not None
                      and rh > cs["rh"] + 3),
@@ -548,9 +553,12 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             return (None, None, None)
 
         if not evening and hum <= DEHUMID_EXIT_RH and comp_min is not None and comp_min >= A.MIN_RUN:
-            return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
+            # v8.33: 该分支此前无温度前置，target=25 时 26°C 即可经此停机，
+            # 绕过 v8.32 收紧的 DAY_TEMP_REACHED_SLACK=0.5（今日审计实测 6 次白天停机全部 T=26.0）。
+            if current_target is None or temp <= current_target + DAY_TEMP_REACHED_SLACK:
+                return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
-        if not evening and hum <= DEHUMID_EXIT_RH and predicted_cool_min is not None and predicted_cool_min <= 5:
+        if not evening and hum <= DEHUMID_EXIT_RH and temp <= current_target + DAY_TEMP_REACHED_SLACK and predicted_cool_min is not None and predicted_cool_min <= 5:
             return ("off", None, f"湿度达标{hum:.0f}%，热模型预测再跑{predicted_cool_min}分钟即可到位，提前关省电")
 
         if (hum <= VIRTUAL_INV_APPROACH_RH
@@ -691,7 +699,13 @@ def main():
             log(f"[WARN] 天气兜底获取失败：{type(e).__name__}: {e}")
         if _wx_fallback and _wx_fallback.get("t") is not None:
             temp = _wx_fallback["t"]
-            hum = None
+            # 室外湿度不能代表室内（a552db13/v8.24 曾设 hum=None）。
+            # 但主流程下方闸门「temp/hum 任一 None → 无天气兜底跳过」会立即
+            # 把它当无兜底处理 → 兜底后仍每轮跳过，整个兜底功能失效；
+            # 且 decide() 对 hum=None 直接 TypeError（08-27 审计实证）。
+            # 改回中性 50：低于除湿启动线(62/65)不误触除湿，只走温度分支，
+            # 与当初「缺省 50 只走温度分支」的设计意图一致。
+            hum = 50
             wx_fallback_used = True
             state["_temp_src"] = "outdoor_fallback"
             state["_hum_src"] = "outdoor_fallback"
@@ -1191,9 +1205,10 @@ def _selftest():
                    False, None, None, sustained=True)
         assert r[0] == "cooling", f"DAY_STARTS_OVERRIDE_T=30 should force start, got {r}"
 
-    # v8.23 持续判据
+    # v8.23 持续判据（白天）——d464391(v8.31) 已移除白天 sustained 闸门，
+    # 27°C 未持续现在也直接开机（与夜间新语义一致，见 decide() 内注释）。
     r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
-    assert r[0] is None, f"SUSTAIN_MIN=10 should block brief touch, got {r}"
+    assert r[0] == "cooling", f"v8.31: 27°C brief touch should start (sustained gate removed), got {r}"
     r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None, None, None, False, None, None, True, None)
     assert r[0] == "cooling", f"sustained should start, got {r}"
 
@@ -1228,11 +1243,12 @@ def _selftest():
     r = decide(25, 56, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, predicted_cool_min=10)
     assert r[0] is None, f"predicted_cool_min=10 should not early stop, got {r}"
 
-    # 峰谷电测试
-    r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
-    assert r[0] is None, f"peak electricity should block 27°C (adj threshold), got {r}"
-    r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
-    assert r[0] == "cooling", f"peak electricity should allow 30°C, got {r}"
+    # 峰谷电测试 — audit7: 隔离电价，否则结果随运行时段漂移（白/夜/谷电都可能直接开机）
+    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_PEAK):
+        r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
+        assert r[0] is None, f"peak electricity should block 27°C (adj threshold), got {r}"
+        r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
+        assert r[0] == "cooling", f"peak electricity should allow 30°C, got {r}"
 
     # close_cycle 测试
     st_spike = {"estimated_kwh": 1.0, "cycle_start": {"ts": "2026-08-16T10:00:00", "ah": 16.0, "rh": 70, "kwh": 0.5},
@@ -1246,7 +1262,7 @@ def _selftest():
     assert _rec["rh_spike"] is True
     os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
 
-    print("ac_watch selftest: ALL PASS (v8.32)")
+    print("ac_watch selftest: ALL PASS (v8.33)")
 
 
 if __name__ == "__main__":

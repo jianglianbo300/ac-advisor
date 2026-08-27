@@ -26,6 +26,10 @@ from datetime import datetime, timedelta
 import ac_advisor as A
 import ac_watch as W
 
+# v8.33 审计修复：启停判据里峰电封锁(20-22点跑到本测试即挂)——测试只验分支逻辑，
+# 与真实钟点解耦，统一锁定谷电价。
+A.current_price = lambda: 0.307
+
 
 class R:
     def __init__(self):
@@ -139,47 +143,78 @@ R_.check("温度分支不受 AH 迟滞影响（热了就该开）", mode == "coo
 
 # ── 5. 白天启停次数上限 ──
 print("\n[5] 白天启停次数上限")
+# v8.33 审计修复：v8.29 audit2/3 起 decide() 的启停计数改为读真实 decision_log
+# （参数 night_comp_starts 已成死参，保留只为位置兼容）。测试改由 monkeypatch
+# load_learned 注入可控历史，与真实学习文件解耦。
+def _mock_load_learned(starts):
+    entries = []
+    now = datetime.now()
+    for m in starts:  # m = 分钟前
+        entries.append({"time": (now - timedelta(minutes=m)).isoformat(timespec="seconds"),
+                        "action": "cooling"})
+        entries.append({"time": (now - timedelta(minutes=m, seconds=1)).isoformat(timespec="seconds"),
+                        "action": "off"})
+    orig = A.load_learned
+    _learned = orig()
+    _learned["decision_log"] = entries
+    A.load_learned = lambda: _learned
+    return orig
+
 now = datetime.now()
 recent = [(now - timedelta(minutes=m)).isoformat(timespec="seconds") for m in (10, 30)]
 # 用 28.5°C：既触发温度分支(>=TEMP_COOLING 28)，又低于安全阀(29.0)，
 # 才能真正验证次数上限的拦截/放行。27.5 达不到任何启动线，验不出闸门效果。
-mode, _, reason = W.decide(
-    temp=28.5, hum=60, running=False, since_on=None, since_off=60, is_night=False,
-    compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
-    night_comp_starts=recent,
-)
-R_.check(f"抖振温区达上限({len(recent)}>={W.DAY_MAX_STARTS_PER_H}) → 不开",
+_orig_ll = _mock_load_learned([10, 30])  # 1h 内 2 次启动
+try:
+    mode, _, reason = W.decide(
+        temp=28.5, hum=60, running=False, since_on=None, since_off=60, is_night=False,
+        compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
+    )
+finally:
+    A.load_learned = _orig_ll
+R_.check(f"抖振温区达上限(2>={W.DAY_MAX_STARTS_PER_H}) → 不开",
          mode is None, f"got mode={mode} reason={reason}")
-mode, _, _ = W.decide(
-    temp=28.5, hum=60, running=False, since_on=None, since_off=60, is_night=False,
-    compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
-    night_comp_starts=recent[:1],
-)
+_orig_ll = _mock_load_learned([30])
+try:
+    mode, _, _ = W.decide(
+        temp=28.5, hum=60, running=False, since_on=None, since_off=60, is_night=False,
+        compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
+    )
+finally:
+    A.load_learned = _orig_ll
 R_.check("1h 内仅 1 次 → 允许开", mode == "cooling", f"got={mode}")
 
 # 安全阀：真热(>=29)时突破次数上限，不能因为压次数把人热着
-many = [(now - timedelta(minutes=m)).isoformat(timespec="seconds") for m in (5, 20, 40)]
-mode, _, reason = W.decide(
-    temp=W.DAY_STARTS_OVERRIDE_T, hum=60, running=False, since_on=None, since_off=60,
-    is_night=False, compressor=None, current_target=26, ah=16.0,
-    compressor_run_min=None, night_comp_starts=many,
-)
-R_.check(f"安全阀：{W.DAY_STARTS_OVERRIDE_T}°C 且已启动 {len(many)} 次 → 仍放行",
-         mode == "cooling", f"got mode={mode} reason={reason}")
-mode, _, _ = W.decide(
-    temp=W.DAY_STARTS_OVERRIDE_T - 0.1, hum=60, running=False, since_on=None,
-    since_off=60, is_night=False, compressor=None, current_target=26, ah=16.0,
-    compressor_run_min=None, night_comp_starts=many,
-)
+_orig_ll = _mock_load_learned([5, 20, 40])
+# v8.33: 用例 C、D 共用同一 mock——真实 learned.json 当前 1h 无启动记录，
+# 若在两者之间解除 mock，D 的 28.9°C 会直接走温度分支放行，验不出「上限约束」。
+try:
+    mode, _, reason = W.decide(
+        temp=W.DAY_STARTS_OVERRIDE_T, hum=60, running=False, since_on=None, since_off=60,
+        is_night=False, compressor=None, current_target=26, ah=16.0,
+        compressor_run_min=None,
+    )
+    R_.check(f"安全阀：{W.DAY_STARTS_OVERRIDE_T}°C 且已启动 3 次 → 仍放行",
+             mode == "cooling", f"got mode={mode} reason={reason}")
+    mode, _, _ = W.decide(
+        temp=W.DAY_STARTS_OVERRIDE_T - 0.1, hum=60, running=False, since_on=None,
+        since_off=60, is_night=False, compressor=None, current_target=26, ah=16.0,
+        compressor_run_min=None,
+    )
+finally:
+    A.load_learned = _orig_ll
 R_.check(f"{W.DAY_STARTS_OVERRIDE_T-0.1}°C 未达安全阀 → 仍受上限约束",
          mode is None, f"got={mode}")
 
 # 夜间仍用夜间上限（不被白天上限误伤）
-mode, _, _ = W.decide(
-    temp=29.0, hum=60, running=False, since_on=None, since_off=60, is_night=True,
-    compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
-    night_comp_starts=recent,
-)
+_orig_ll = _mock_load_learned([10, 30])
+try:
+    mode, _, _ = W.decide(
+        temp=29.0, hum=60, running=False, since_on=None, since_off=60, is_night=True,
+        compressor=None, current_target=26, ah=16.0, compressor_run_min=None,
+    )
+finally:
+    A.load_learned = _orig_ll
 R_.check("夜间 2 次未达夜间上限 4 → 仍可开", mode == "cooling", f"got={mode}")
 
 # ── 6. cycle_log 温度字段 ──

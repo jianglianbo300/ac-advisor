@@ -26,6 +26,11 @@ import sys
 import ac_advisor as A
 import ac_watch as W
 
+# v8.33 审计修复：本文件用例只验温度/持续/AH 分支逻辑，不测峰谷电策略。
+# 峰电封锁(temp_cooling+1)是按真实钟点生效的（20-22点跑测试必挂），
+# 锁定谷电价使结果与运行时段解耦。
+A.current_price = lambda: 0.307
+
 
 class R:
     def __init__(self):

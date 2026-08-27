@@ -23,6 +23,11 @@ from datetime import datetime, timedelta
 import ac_advisor as A
 import ac_watch as W
 
+# v8.33 审计修复：本文件用例只验温度/持续/AH 分支逻辑，不测峰谷电策略。
+# 峰电封锁(temp_cooling+1)是按真实钟点生效的（20-22点跑测试必挂），
+# 锁定谷电价使结果与运行时段解耦。
+A.current_price = lambda: 0.307
+
 
 class R:
     def __init__(self):
@@ -94,10 +99,14 @@ def night(temp, sustained, hum=50, ah=13.0):
                     compressor_run_min=None, night_comp_starts=[], sustained=sustained)
 
 
-m, _, _ = night(27.0, False)
-R_.check("27°C 短暂触碰 → 不开（这就是用户说的'也不太热'）", m is None, f"got={m}")
+# v8.33 审计注：d464391(v8.31) 有意移除夜间 sustained 判据（夜间短循环已由
+# MIN_OFF 15min + 每小时启停上限防护；sustained 过滤会把缓慢夜间升温卡死在 27°C，
+# 见 ac_watch.py decide() 内注释）。本组断言随新语义更新：
+# 「短暂触碰」与「持续」现在都放行，未持续/数据不足不再有区别。
+m, t, reason = night(27.0, False)
+R_.check("27°C 未持续 → 开机（v8.31 移除夜间持续闸门后的新语义）", m == "cooling", f"got={m} {reason}")
 m, t, reason = night(27.0, True)
-R_.check("27°C 持续 10min → 开机", m == "cooling", f"got={m} {reason}")
+R_.check("27°C 持续 10min → 开机（语义不变）", m == "cooling", f"got={m} {reason}")
 R_.check(f"目标 {t}°C 低于室温 ≥2°C", t is not None and 27.0 - t >= 2, f"target={t}")
 m, _, _ = night(27.0, None)
 R_.check("数据不足 → 放行开机（fail-open 不因缺数据不制冷）", m == "cooling", f"got={m}")
@@ -108,8 +117,8 @@ m, _, reason = night(W.SUSTAIN_URGENT_T, False)
 R_.check(f"{W.SUSTAIN_URGENT_T}°C + 未持续 → 仍开机（明确过热）",
          m == "cooling", f"got={m} {reason}")
 m, _, _ = night(W.SUSTAIN_URGENT_T - 0.1, False)
-R_.check(f"{W.SUSTAIN_URGENT_T - 0.1}°C + 未持续 → 不开（未达紧急线）",
-         m is None, f"got={m}")
+R_.check(f"{W.SUSTAIN_URGENT_T - 0.1}°C + 未持续 → 开机（夜间无持续闸门，v8.31 起）",
+         m == "cooling", f"got={m}")
 
 # ── 4. 白天同样受约束 ──
 print("\n[4] 白天启动")

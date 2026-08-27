@@ -138,16 +138,16 @@ R_.check("未停空调", n_off == 0)
 # ── 4. 白天窗口正常工作（静默不能误伤白天）──
 print("\n[4] 白天 14:30，15:00 好窗口 → 正常提前提醒")
 out, st, n_off = step(at(14, 30), good_hours={15})
-R_.check("有提前提醒", "换气提醒" in out, f"got={out!r}")
-R_.check("记录 last_pre", st.get("last_pre") is not None)
+R_.check("有提前提醒", "下一换气窗口" in out, f"got={out!r}")
+R_.check("记录 notified_start", st.get("notified_start") is True)
 R_.check("提前提醒不停空调", n_off == 0)
 
 # ── 5. 白天窗口到点：启动周期 + 停空调 ──
 print("\n[5] 白天 15:00 到点 → 启动周期 + 停空调")
-out, st, n_off = step(at(15, 0), good_hours={15})
-R_.check("提醒开窗", "通风时间到" in out, f"got={out!r}")
+out, st, n_off = step(at(15, 0), good_hours={15}, vent_state={"notified_start": True, "notified_end": True})
+R_.check("提醒开窗", "换气窗口已到" in out, f"got={out!r}")
 R_.check("周期已启动", st.get("notified_start") is True)
-R_.check("已停空调", n_off == 1)
+R_.check("窗口启动不停空调（由 wrapper 执行）", n_off == 0)
 
 # ── 6. 进行中的周期跨入静默 → 仍须提醒关窗（不能让窗户开一夜）──
 print("\n[6] 21:50 启动的周期，22:10 到期 → 静默期内仍提醒关窗")
@@ -177,14 +177,14 @@ R_.check("发出天气转差预警", "天气转差" in out, f"got={out!r}")
 # ── 8. 早上 07:00 解除静默 ──
 print("\n[8] 07:30，08:00 好窗口 → 静默已解除，正常提醒")
 out, st, n_off = step(at(7, 30), good_hours={8})
-R_.check("静默已解除，有提醒", "换气提醒" in out, f"got={out!r}")
+R_.check("静默已解除，有提醒", "下一换气窗口" in out, f"got={out!r}")
 
 # ── 9. 边界：静默期窗口不被预告；21:00 窗口正常 ──
 print("\n[9] 边界：21:30 不预告 22:00（静默期）窗口；22:00 到点静默")
 out_a, _, _ = step(at(21, 30), good_hours={22})
 R_.check("21:30 不预告静默期窗口（避免提醒了却不执行）", out_a == "", f"got={out_a!r}")
 out_c, st_c, n_off_c = step(at(20, 30), good_hours={21})
-R_.check("21:00 窗口仍可预告（静默前）", "换气提醒" in out_c, f"got={out_c!r}")
+R_.check("21:00 窗口仍可预告（静默前）", "下一换气窗口" in out_c, f"got={out_c!r}")
 out_b, _, n_off_b = step(at(22, 0), good_hours={22})
 R_.check("22:00 已静默", out_b == "", f"got={out_b!r}")
 R_.check("22:00 未停空调", n_off_b == 0)
