@@ -113,7 +113,10 @@ NIGHT_MAX_STARTS_PER_H = 4
 DAY_MAX_STARTS_PER_H = 2
 
 DAY_STOP_AH_HYST = 2.0
-DAY_TEMP_REACHED_SLACK = 1.0
+# v8.32 收回 0.5（原 v8.24 曾放宽到 +1.0）：传感器 1°C 分辨率下 slack=1.0
+# 意味着 target=25 时读到 26 就算"达标"放行湿度判据停机 → 实际只保住 26，
+# 与"降到设定值是履约"原则冲突（08-27 下午连续 4 周期止步于 26°C 的实录）。
+DAY_TEMP_REACHED_SLACK = 0.5
 
 STEADY_STATE_MIN_MIN = 15
 THERMAL_FAIL_WINDOW = 3
@@ -137,6 +140,10 @@ FAN_ONLY_POWER_MAX = 50
 COMPRESSOR_FALSE_RUN_MIN = 10
 COMPRESSOR_RESTART_COOLDOWN = 30
 COMPRESSOR_RESTART_DROP = 2
+# v8.32 最小有效运行闸门：开机 N 分钟压缩机从未启动（纯风扇空转）→ 止损关机。
+# 08-27 凌晨实录：05:28~06:50 连续 4 个 mode=cooling 周期 compressor_runtime_min=0、
+# 耗电为零，纯粹风扇开关切换。阈值对齐 COMPRESSOR_FALSE_RUN_MIN=10。
+FALSE_RUN_ABORT_MIN = 10
 
 KWH_MAX_GAP_MIN = 10
 
@@ -452,6 +459,13 @@ def decide(temp, hum, running, since_on, since_off, is_night,
     if running is None:
         return (None, None, None)
     if running:
+        # v8.32 最小有效运行闸门：开机 N 分钟压缩机从未启动（一直仅风扇/未知）
+        # → 纯风扇空转，止损关机。放最前面，白天/夜间/除湿路径统一生效。
+        if ((compressor_run_min or 0) <= 0
+                and compressor != "compressor"
+                and since_on is not None and since_on >= FALSE_RUN_ABORT_MIN):
+            return ("off", None,
+                    f"开机{int(since_on)}分钟压缩机始终未启动（仅风扇空转），最小有效运行闸门止损关机")
         if compressor == "fan_only":
             stop_duration = None
             if compressor_stop_duration_min is not None and since_on is not None:
@@ -1139,10 +1153,12 @@ def _selftest():
     assert decide(27, 65, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, None, None)[:2] == (None, None)
 
     # v8.10 假运行计数器测试
+    # v8.32: 传入 compressor_run_min=20 绕过最小有效运行闸门（本组用例专测假运行重试，
+    # 若 runtime=0 会被新闸门先拦，模拟不到 COMPRESSOR_RESTART_DROP 重试路径）
     for i in range(FAKE_RUN_MAX_CYCLES):
-        r = decide(27, 75, True, 30, 90, False, "fan_only", 15, None, 26, 0, 0, None, None, None, None, fake_run_count=i)
+        r = decide(27, 75, True, 30, 90, False, "fan_only", 15, None, 26, 0, 0, None, None, 20, None, fake_run_count=i)
         assert r[0] == "cooling", f"fake_run #{i} should restart, got {r}"
-    r = decide(27, 75, True, 30, 90, False, "fan_only", 15, None, 26, 0, 0, None, None, None, None, fake_run_count=FAKE_RUN_MAX_CYCLES)
+    r = decide(27, 75, True, 30, 90, False, "fan_only", 15, None, 26, 0, 0, None, None, 20, None, fake_run_count=FAKE_RUN_MAX_CYCLES)
     assert r[0] == "off", f"fake_run #{FAKE_RUN_MAX_CYCLES} should stop, got {r}"
 
     # v8.16 白天双轴停止（AH+RH）
@@ -1185,6 +1201,27 @@ def _selftest():
     r = decide(25, 60, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, is_steady_state=True)
     assert r[0] is None, f"steady state should not stop, got {r}"
 
+    # v8.32 最小有效运行闸门：开机12min压缩机runtime=0且非压缩机状态 → 止损关机
+    r = decide(27, 60, True, 12, None, False, "fan_only", 12, None, 25, None, None,
+               None, None, 0)
+    assert r[0] == "off" and "止损" in (r[2] or ""), f"false-run gate should abort fan-only run, got {r}"
+    # v8.32 但压缩机已启动(runtime>0)或未满10min时不触发
+    r = decide(27, 60, True, 12, None, False, "fan_only", 0, None, 25, None, None,
+               None, None, 8)
+    assert r[0] != "off" or "止损" not in r[2], f"gate should wait until {FALSE_RUN_ABORT_MIN}min, got {r}"
+    r = decide(27, 60, True, 12, None, False, "fan_only", 0, None, 25, None, None,
+               None, None, 30)
+    assert r[0] != "off" or "止损" not in r[2], f"compressor has run, gate should not fire, got {r}"
+
+    # v8.32 达标容差收回：target=25 时 temp=26 + AH达标 不再放行湿度判据停机（slack=0.5 需 ≤25.5）
+    # hum 用 58 隔离：>DEHUMID_EXIT_RH(55) 避开"湿度已达标"停机路径，专测温度前置
+    r = decide(26, 58, True, 40, None, False, "compressor", None, None, 25, -3, -5,
+               None, 13.0, 10)
+    assert r[0] is None, f"slack=0.5: T=26 vs target=25 should NOT humidity-stop, got {r}"
+    r = decide(25, 58, True, 40, None, False, "compressor", None, None, 25, -3, -5,
+               None, 13.0, 10)
+    assert r[0] == "off", f"T=target with AH ok should stop, got {r}"
+
     # 热模型预测
     r = decide(25, 55, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, predicted_cool_min=3)
     assert r[0] == "off", f"predicted_cool_min=3 should early stop, got {r}"
@@ -1209,7 +1246,7 @@ def _selftest():
     assert _rec["rh_spike"] is True
     os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
 
-    print("ac_watch selftest: ALL PASS (v8.27)")
+    print("ac_watch selftest: ALL PASS (v8.32)")
 
 
 if __name__ == "__main__":
