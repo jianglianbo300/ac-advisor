@@ -30,6 +30,11 @@ import ac_watch as W
 # 与真实钟点解耦，统一锁定谷电价。
 A.current_price = lambda: 0.307
 
+# 2026-08-28 审计：隔离真实学习数据——夜间 DP 蓄冷实跑会在近 1h 留下真实启动记录，
+# 触发启停上限（_starts_1h>=2 且 temp<29）把启动类用例拦成假红。默认空账本；
+# 需要模拟上限的用例（[5] 节）自行注入后还原。
+A.load_learned = lambda: {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": []}
+
 
 class R:
     def __init__(self):

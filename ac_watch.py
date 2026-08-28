@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 空调自动监控 v8.27 — 每 2 分钟自动环（Hermes cron: */2 * * *）
 
@@ -11,13 +10,14 @@ v8.27 变更：
   - RC 热模型拟合（数据不足，暂缓）
 """
 
-import os
-import sys
 import json
 import math
-import pyttsx3
+import os
+import sys
 import threading
 from datetime import datetime, timedelta
+
+import pyttsx3
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -948,7 +948,7 @@ def main():
                 pass
         if not _schedule_override and _wx and "hourly" in _wx and _wx["hourly"].get("temperature_2m"):
             try:
-                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json"), "r") as f:
+                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "ac_user_pref.json")) as f:
                     _pref = json.load(f)
                 _cw = _pref.get("comfort_weight", 0.5)
                 _ct = _pref.get("comfort_target", 26.0)
@@ -1190,7 +1190,7 @@ def _selftest():
 
     # v8.21 启停次数上限 — v8.29 audit4: 旧断言测的是死参数night_comp_starts,
     # 新逻辑读load_learned()的decision_log。改为mock注入1小时内2次真启动来验证。
-    import json as _json, tempfile as _tempfile, os as _os
+    import json as _json
     from unittest import mock as _mock
     _now = datetime.now()
     _fake_dl = [
@@ -1266,11 +1266,11 @@ def _selftest():
                                     ["2026-08-16T10:04:00", 74], ["2026-08-16T10:06:00", 74]]}
     assert close_cycle(st_spike, "2026-08-16T10:06:00", 14.0, 74, 25, 6.0,
                        path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
-    import json as _json
-    _rec = _json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"),
-                            encoding="utf-8").read().splitlines()[-1])
+    _rec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl")
+    with open(_rec_path, encoding="utf-8") as _f:
+        _rec = _json.loads(_f.read().splitlines()[-1])
     assert _rec["rh_spike"] is True
-    os.remove(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test_cycle.tmp.jsonl"))
+    os.remove(_rec_path)
 
     print("ac_watch selftest: ALL PASS (v8.33)")
 
