@@ -783,18 +783,18 @@ def main():
             pass
 
     manual_on = state.get("manual_on_at")
-    if manual_on and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+    if manual_on:
         try:
             on_dt = datetime.fromisoformat(manual_on) if isinstance(manual_on, str) else manual_on
             mins = (now_dt - on_dt).total_seconds() / 60
-            if 0 <= mins < 30 and mins < MANUAL_ANCHOR_TTL:
+            if mins >= MANUAL_ANCHOR_TTL:
+                log(f"手动开锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑")
+                state.pop("manual_on_at", None)
+            elif 0 <= mins < 30 and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
                 log(f"手动开后{int(mins)}分钟，暂不自动关（保护用户意图）")
                 print(f"ac_watch: 手动开后{int(mins)}分钟，暂不自动关")
                 A.save_state(state)
                 return
-            if mins >= MANUAL_ANCHOR_TTL:
-                log(f"手动开锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑")
-                state.pop("manual_on_at", None)
         except Exception:
             pass
 
@@ -939,6 +939,11 @@ def main():
                     _schedule_override = _dp_cache.get("override", False)
                     _schedule_target = _dp_cache.get("target")
                     _schedule_reason = _dp_cache.get("reason")
+                    # audit8 fix: 已达蓄冷目标则缓存失效，避免凌晨抖振（关机→缓存未清→又开→又关循环）
+                    if _schedule_override and _schedule_target is not None and temp <= _schedule_target:
+                        _schedule_override = False
+                        _schedule_target = None
+                        _schedule_reason = None
             except Exception:
                 pass
         if not _schedule_override and _wx and "hourly" in _wx and _wx["hourly"].get("temperature_2m"):
@@ -1207,10 +1212,12 @@ def _selftest():
 
     # v8.23 持续判据（白天）——d464391(v8.31) 已移除白天 sustained 闸门，
     # 27°C 未持续现在也直接开机（与夜间新语义一致，见 decide() 内注释）。
-    r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
-    assert r[0] == "cooling", f"v8.31: 27°C brief touch should start (sustained gate removed), got {r}"
-    r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None, None, None, False, None, None, True, None)
-    assert r[0] == "cooling", f"sustained should start, got {r}"
+    # audit8 fix: mock 谷电，否则峰电+1°C阈值(28°C)会拦下27°C/30°C的启动用例（白天假挂晚上绿）
+    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY):
+        r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
+        assert r[0] == "cooling", f"v8.31: 27°C brief touch should start (sustained gate removed), got {r}"
+        r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None, None, None, False, None, None, True, None)
+        assert r[0] == "cooling", f"sustained should start, got {r}"
 
     # v8.24 稳态运行
     r = decide(25, 60, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, is_steady_state=True)

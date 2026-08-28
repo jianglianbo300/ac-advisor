@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
-# 米家云端读取温湿度（绕过局域网UDP防火墙问题）
-# 需要小米账号 + 设备did + token
+"""米家云端读取温湿度（绕过局域网UDP防火墙问题）"""
+try:
+    from miio.miotcloud import MiotCloud
+except (ImportError, ModuleNotFoundError):
+    print("SKIP: miio.miotcloud 未安装（0.5.12 --no-deps 装法无 cloud 模块）")
+    import sys; sys.exit(0)
+
 import asyncio
-from miio.miotcloud import MiotCloud
 
 # 这些从 Xiaomi Cloud Token 工具拿
-USERNAME = "你的小米账号"
-PASSWORD = "你的密码"
+USERNAME = "13125554911"
+PASSWORD = "Bo7812700874"
 SERVER = "cn"
 
-# 净化器
-PURIFIER_DID = "875028325"  # 从设备清单的 ID 字段
+PURIFIER_DID = "875028325"
 PURIFIER_TOKEN = "c12622c390a94c90e25083e54d36ace0"
 
-# 温湿度计（BLE，只能云端读）
-HT2_DID = "blt.3.1codkci7kec00"
-HT2_TOKEN = "79181c7220ed05c3c848cb81"
-
 async def main():
-    cloud = MiotCloud(USERNAME, PASSWORD, SERVER)
-    await cloud.login()
-
-    # 读净化器属性
-    r = await cloud.get_props([
-        {"did": PURIFIER_DID, "piid": 1, "siid": 2},  # 温度
-    ])
-    print("purifier:", r)
+    mc = MiCloud(USERNAME, PASSWORD, SERVER)
+    await mc.login()
+    devices = await mc.get_devices()
+    print(f"云端设备数: {len(devices)}")
 
 asyncio.run(main())

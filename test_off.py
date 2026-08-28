@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""模拟测试：凉快天气时不用开空调的提醒"""
+"""凉快天气不用开空调 — 回归测试"""
 import sys
 sys.path.insert(0, r"D:\work\ac-advisor")
-import ac_advisor
+from unittest import mock
+import ac_advisor as A
+import ac_watch as W
 
-# 模拟凉快天气：24°C, 体感23°C, 湿度60%
-orig = ac_advisor.fetch
-ac_advisor.fetch = lambda: {
-    "current": {"temperature_2m": 24.0, "apparent_temperature": 23.0,
-                "relative_humidity_2m": 60, "weather_code": 3},
-    "daily": {"temperature_2m_max": [25.0], "temperature_2m_min": [21.0],
-              "precipitation_probability_max": [10]}
-}
-ac_advisor.main()
-print()
-print("---")
-print("✅ 凉快天气下会明确提醒'不用开空调'，并可关掉已开的空调")
+# 凉快天气 24°C/60%：低于启动线 27°C，不应开机
+with mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY), \
+     mock.patch.object(A, "load_learned", return_value={"adjusted_thresholds":{"temp_cooling":0},"decision_log":[]}):
+    r = W.decide(24, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
+    assert r[0] is None, f"24°C 不应开机，got {r}"
+    print("PASS: 24°C/60% 不启动制冷")
+print("✅ 凉快天气下系统不会建议开机")

@@ -373,6 +373,12 @@ def fit_thermal_model(events):
         rates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in warming[-20:]]
         rates = [r for r in rates if r > 0]
         if rates: model["warmup_rate_per_min"] = sum(rates) / len(rates)
+    # 兼容旧接口：cooling_rate_per_min = 平均制冷速率（负值=降温），default=0.05
+    if len(cooling) >= 1:
+        crates = [(e["temp_after"] - e["temp_before"]) / max(e["duration_min"], 1) for e in cooling[-30:]]
+        model["cooling_rate_per_min"] = sum(crates) / len(crates)
+    else:
+        model["cooling_rate_per_min"] = 0.05
     return model
 
 def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):

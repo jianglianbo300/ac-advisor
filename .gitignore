@@ -56,3 +56,11 @@ home_state.json
 # 通风周期状态机（vent_cycle_step 生成，不入库）
 vent_cycle_state.json
 
+
+# prime-agent 排查残留（2026-08-28 审计清理）
+gh_*.json
+pa_readme.md
+pa_rel.json
+_audit_plan_*.py
+_check_conn.py
+_ac_on_now.py
