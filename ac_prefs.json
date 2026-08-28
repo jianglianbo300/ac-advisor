@@ -1,0 +1,15 @@
+{
+  "manual_actions": [],
+  "learned_prefs": {
+    "comfort_temp": 26,
+    "max_humidity": 65,
+    "sensitivity": "cool_preference",
+    "note": "初始默认值，会根据手动操作自动学习调整"
+  },
+  "learning_rules": {
+    "cool_preference": "用户怕热，启动线降低0.5°C",
+    "heat_preference": "用户怕冷，启动线提高0.5°C",
+    "humidity_sensitive": "湿度敏感，提前开除湿",
+    "cost_sensitive": "电费敏感，启动线提高1°C"
+  }
+}
