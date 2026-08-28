@@ -1213,7 +1213,10 @@ def _selftest():
     # v8.23 持续判据（白天）——d464391(v8.31) 已移除白天 sustained 闸门，
     # 27°C 未持续现在也直接开机（与夜间新语义一致，见 decide() 内注释）。
     # audit8 fix: mock 谷电，否则峰电+1°C阈值(28°C)会拦下27°C/30°C的启动用例（白天假挂晚上绿）
-    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY):
+    # audit9 fix: 还需mock load_learned清除近1小时真启动，否则真启动≥2次时本用例被启停上限拦下（假阴性）
+    _fake_zero = {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": []}
+    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY), \
+            _mock.patch.object(A, "load_learned", return_value=_fake_zero):
         r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
         assert r[0] == "cooling", f"v8.31: 27°C brief touch should start (sustained gate removed), got {r}"
         r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None, None, None, False, None, None, True, None)
