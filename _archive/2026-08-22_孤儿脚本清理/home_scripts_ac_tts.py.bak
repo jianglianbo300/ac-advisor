@@ -1,0 +1,8 @@
+# ac_tts.py - TTS wrapper for Hermes cron
+import os, sys
+
+# Add venv site-packages for xiaomi_tts dependencies
+sys.path.insert(0, r"D:\workc-advisor\.venv\Lib\site-packages")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from xiaomi_tts import speak

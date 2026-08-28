@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ac_off_alert.py — 空调达标关提醒 + 反向提醒（cron 每30分钟 8:00~23:00）
+
+触发逻辑（v2.4，2026-08-11 定版）：
+  A. 正向（空调运行中）：
+    - 温度 < 24°C 逃生门 → 立即提醒（不等 MIN_RUN，防越吹越冷）
+    - 湿度 ≤ 60% → 运行满 40 分钟才提醒（防定频频繁启停）
+  B. 反向（空调 off/fan）：
+    - 室内湿度 > 78% 且 温度 ≥ 24°C → 提醒"该开空调压湿度了"（每天最多1次）
+
+去重：同一 run_start 只提醒 1 次（ac_off_state.json），重开空调才再提醒。
+电脑弹窗：触发提醒时同步弹 Windows toast（PowerShell 原生通知）。
+
+决策逻辑参照: D:\Knowledge\02_Projects\Active\室内空气环境管理\00_联动决策模型.md §6
+"""
+
+import json
+import os
+import sys
+import math
+import subprocess
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# === 路径 ===
+SCRIPTS_DIR = Path(__file__).parent
+MIIO_CONFIG = SCRIPTS_DIR / "miio_config.json"
+AC_STATE = SCRIPTS_DIR / "ac_state.json"
+AC_OFF_STATE = SCRIPTS_DIR / "ac_off_state.json"
+AC_HUMIDITY_LOG = SCRIPTS_DIR / "ac_humidity_log.jsonl"
+
+# === 阈值（对齐 ac_advisor v4） ===
+HUM_DEHUMID_OFF = 60       # 湿度达标关判据
+TEMP_ABSOLUTE_FLOOR = 24   # 温度逃生门
+MIN_RUN = 40               # 最小运行分钟（防频繁启停）
+REVERSE_HUM_TRIGGER = 78   # 反向提醒湿度阈值
+REVERSE_TEMP_TRIGGER = 24  # 反向提醒温度阈值
+
+# === 传感器读取 ===
+def read_miio():
+    """读小米净化器 4 Lite 室内温湿度。返回 (temp, humidity) 或 None。"""
+    if not MIIO_CONFIG.exists():
+        return None
+    try:
+        cfg = json.loads(MIIO_CONFIG.read_text(encoding="utf-8"))
+        ip = cfg.get("purifier_ip", "192.168.71.120")
+        token = cfg.get("purifier_token", "")
+        if not token:
+            return None
+        url = f"http://{ip}/get_prop?token={token}&props=temperature,humidity"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        if "result" in data:
+            r = data["result"]
+            if isinstance(r, list) and len(r) >= 2:
+                return float(r[0]) / 10 if r[0] > 100 else float(r[0]), float(r[1])
+    except Exception:
+        pass
+    return None
+
+
+def read_ac_state():
+    """读 ac_state.json。"""
+    if not AC_STATE.exists():
+        return {}
+    try:
+        return json.loads(AC_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def read_off_state():
+    """读 ac_off_state.json 去重状态。"""
+    if not AC_OFF_STATE.exists():
+        return {}
+    try:
+        return json.loads(AC_OFF_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_off_state(state):
+    """写 ac_off_state.json 去重状态。"""
+    AC_OFF_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_humidity(temp, rh, mode):
+    """记录湿度轨迹到 ac_humidity_log.jsonl。"""
+    try:
+        with open(AC_HUMIDITY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "time": datetime.now().isoformat(),
+                "temp": temp,
+                "humidity": rh,
+                "mode": mode,
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# === 电脑弹窗 ===
+def notify_windows(title, message):
+    """Windows toast 通知（PowerShell 原生）。"""
+    try:
+        ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$notify = New-Object System.Windows.Forms.NotifyIcon
+$notify.Icon = [System.Drawing.SystemIcons]::Information
+$notify.BalloonTipTitle = '{title}'
+$notify.BalloonTipText = '{message}'
+$notify.Visible = $true
+$notify.ShowBalloonTip(5000)
+"""
+        subprocess.run(["powershell", "-Command", ps], timeout=10, capture_output=True)
+    except Exception:
+        pass
+
+
+# === 主逻辑 ===
+def main():
+    now = datetime.now()
+
+    # 仅 8:00~23:00 运行
+    if now.hour < 8 or now.hour >= 23:
+        return
+
+    indoor = read_miio()
+    if not indoor:
+        return  # 无传感器数据，静默
+    temp, rh = indoor
+
+    ac = read_ac_state()
+    ac_mode = ac.get("mode", "unknown")
+    run_start = ac.get("run_start")  # ISO 时间戳或 None
+
+    # 记录湿度轨迹
+    log_humidity(temp, rh, ac_mode)
+
+    off_state = read_off_state()
+
+    # ============================================================
+    # A. 正向：空调运行中（cooling / dehumid）
+    # ============================================================
+    if ac_mode in ("cooling", "dehumid"):
+        # 计算已运行时长
+        run_minutes = 0
+        if run_start:
+            try:
+                rs = datetime.fromisoformat(run_start)
+                run_minutes = (now - rs).total_seconds() / 60
+            except Exception:
+                run_minutes = 0
+
+        # A1. 温度逃生门：< 24°C 立即提醒（不等 MIN_RUN）
+        if temp < TEMP_ABSOLUTE_FLOOR:
+            # 去重：同一 run_start 只提醒一次
+            if off_state.get("last_run_start") == run_start and off_state.get("last_reason") == "temp_floor":
+                return
+            msg = f"🌡️ 空调关提醒\n室内 {temp:.1f}°C < {TEMP_ABSOLUTE_FLOOR}°C\n空调运行 {run_minutes:.0f} 分钟\n建议：关空调，防越吹越冷"
+            print(msg)
+            notify_windows("空调关提醒", f"室内 {temp:.1f}°C，建议关空调")
+            off_state["last_run_start"] = run_start
+            off_state["last_reason"] = "temp_floor"
+            off_state["last_alert"] = now.isoformat()
+            write_off_state(off_state)
+            return
+
+        # A2. 湿度达标：≤ 60% 且运行满 40 分钟
+        if rh <= HUM_DEHUMID_OFF and run_minutes >= MIN_RUN:
+            if off_state.get("last_run_start") == run_start and off_state.get("last_reason") == "humidity":
+                return
+            msg = f"💧 空调关提醒\n室内湿度 {rh:.0f}% ≤ {HUM_DEHUMID_OFF}%\n运行 {run_minutes:.0f} 分钟\n建议：关空调"
+            print(msg)
+            notify_windows("空调关提醒", f"湿度 {rh:.0f}% 达标，建议关空调")
+            off_state["last_run_start"] = run_start
+            off_state["last_reason"] = "humidity"
+            off_state["last_alert"] = now.isoformat()
+            write_off_state(off_state)
+            return
+
+        # 运行中但未达标，清除去重标记（重开空调才能再提醒）
+        if off_state.get("last_run_start") == run_start:
+            off_state["last_run_start"] = None
+            off_state["last_reason"] = None
+            write_off_state(off_state)
+        return
+
+    # ============================================================
+    # B. 反向：空调 off / fan → 湿度爆表提醒
+    # ============================================================
+    if ac_mode in ("off", "fan"):
+        if rh > REVERSE_HUM_TRIGGER and temp >= REVERSE_TEMP_TRIGGER:
+            # 每天最多 1 次
+            today_str = now.strftime("%Y-%m-%d")
+            if off_state.get("reverse_date") == today_str:
+                return
+            msg = f"🌿 该开空调了\n室内 {temp:.1f}°C / {rh:.0f}%（湿度 > {REVERSE_HUM_TRIGGER}%）\n空调未在除湿\n建议：开空调压湿度"
+            print(msg)
+            notify_windows("空调提醒", f"湿度 {rh:.0f}%，该开空调了")
+            off_state["reverse_date"] = today_str
+            off_state["last_alert"] = now.isoformat()
+            write_off_state(off_state)
+            return
+
+    # 其他状态静默
+    return
+
+
+if __name__ == "__main__":
+    main()

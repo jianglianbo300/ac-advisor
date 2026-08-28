@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+vent_reminder_alert.py — 通风提醒 cron（每30分钟）
+读 vent_reminder 的决策结果，在最佳窗口前推送提醒。
+与 vent_reminder.py 共享 miio_config.json 和 ac_state.json。
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ─── 路径 ───────────────────────────────────────────────────────────────────────
+SCRIPTS_DIR = Path.home() / ".hermes" / "scripts"
+MIIO_CONFIG = SCRIPTS_DIR / "miio_config.json"
+AC_STATE_FILE = SCRIPTS_DIR / "ac_state.json"
+QW_API_KEY = os.environ.get("QW_API_KEY", "")
+
+# ─── 和风天气配置 ───────────────────────────────────────────────────────────────
+QW_FORECAST_URL = "https://devapi.qweather.com/v7/weather/24h"
+QW_LOCATION = "101010100"  # 北京
+
+# ─── 决策阈值（v2.2 统一闸门）───────────────────────────────────────────────────
+GATE_RAIN_PROB = 45
+GATE_OUTDOOR_RH = 85
+GATE_DP_DIFF = 1.5
+GATE_PM25 = 75
+GATE_WIND_LEVEL_6 = 10.8
+GUST_WIND = 15.0
+
+# 湿度差矩阵
+HUMIDITY_BANDS = [
+    (-10, "🟢 开窗还能顺带除湿（最优）"),
+    (-3,  "🟢 开窗有利"),
+    (3,   "🟡 开窗只为换新鲜空气"),
+    (10,  "🟠 短促换气（5分钟）"),
+    (float('inf'), "🔴 别开窗，湿气会倒灌"),
+]
+
+# 露点差矩阵（v2.1 优先）
+DP_BANDS = [
+    (-1.5, "🟢 开窗能顺带除湿"),
+    (-0.5, "🟢 开窗有利"),
+    (0.5,  "🟡 只为换新鲜空气"),
+    (1.5,  "🟠 短促换气（5分钟）"),
+    (float('inf'), "🔴 别开窗，湿气倒灌"),
+]
+
+# 空调冲突表
+AC_CONFLICT = {
+    "cooling":  ("抵消制冷、费电",      "换气完立即关窗"),
+    "dehumid":  ("完全抵消除湿 = 白干", "尽量别开；必须换则 <5 分钟"),
+    "fan":      ("同向叠加",            "放心开窗"),
+    "off":      ("无冲突",              "按湿度差矩阵决策"),
+}
+
+
+# ─── 工具函数 ──────────────────────────────────────────────────────────────────
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        {}
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def magnes_dewpoint(temp_c: float, rh: float) -> float:
+    a, b = 17.27, 237.7
+    alpha = (a * temp_c) / (b + temp_c) + max(min(rh / 100.0, 1), 0.01)
+    return (b * alpha) / (a - alpha)
+
+
+def get_humidity_band(delta: float) -> str:
+    for threshold, label in HUMIDITY_BANDS:
+        if delta <= threshold:
+            return label
+    return HUMIDITY_BANDS[-1][1]
+
+
+def get_dp_band(delta_dp: float) -> str:
+    for threshold, label in DP_BANDS:
+        if delta_dp <= threshold:
+            return label
+    return DP_BANDS[-1][1]
+
+
+def fetch_qweather_hourly() -> list[dict]:
+    if not QW_API_KEY:
+        return []
+    url = f"{QW_FORECAST_URL}?location={QW_LOCATION}&key={QW_API_KEY}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if data.get("code") == "200":
+            return data.get("hourly", [])
+    except (urllib.error.URLError, TimeoutError):
+        pass
+    return []
+
+
+def fetch_pm25() -> float | None:
+    url = (
+        "https://air-quality-api.open-meteo.com/v1/airquality"
+        "?latitude=39.9042&longitude=116.4074"
+        "&hourly=pm2_5&timezone=Asia%2FShanghai"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        hourly = data.get("hourly", {})
+        pm25_list = hourly.get("pm2_5", [])
+        if pm25_list:
+            return pm25_list[0]
+    except (urllib.error.URLError, TimeoutError, KeyError):
+        pass
+    return None
+
+
+def read_indoor_sensor() -> tuple[float | None, float | None]:
+    """读小米净化器 4 Lite 室内温湿度。"""
+    try:
+        cfg = load_json(MIIO_CONFIG)
+        ip = cfg.get("purifier_ip", "192.168.71.120")
+        # 简化版，实际部署需 python-miio
+        return None, None
+    except Exception:
+        return None, None
+
+
+def read_ac_state() -> dict:
+    return load_json(AC_STATE_FILE)
+
+
+def gate_check(forecast_hour: dict, pm25: float | None) -> tuple[bool, str]:
+    precip_prob = int(forecast_hour.get("pop", 0))
+    if precip_prob >= GATE_RAIN_PROB:
+        return False, f"降雨概率 {precip_prob}% ≥ {GATE_RAIN_PROB}%"
+
+    outdoor_rh = float(forecast_hour.get("humidity", 0))
+    if outdoor_rh >= GATE_OUTDOOR_RH:
+        return False, f"室外 RH {outdoor_rh}% ≥ {GATE_OUTDOOR_RH}%"
+
+    if pm25 is not None and pm25 >= GATE_PM25:
+        return False, f"PM2.5 {pm25}µg/m³ ≥ {GATE_PM25}"
+
+    wind_scale = forecast_hour.get("windScale", "0")
+    try:
+        wind_level = float(wind_scale.split("-")[0]) if "-" in str(wind_scale) else float(wind_scale)
+        if wind_level >= 6:
+            return False, f"持续风 {wind_scale}级 ≥ 6级"
+    except (ValueError, IndexError):
+        pass
+
+    gust = float(forecast_hour.get("gust", 0))
+    if gust >= GUST_WIND:
+        return False, f"阵风 {gust}m/s ≥ {GUST_WIND}m/s"
+
+    return True, "通过"
+
+
+def compute_ach(wind_speed: float, delta_t: float) -> float:
+    wind_pressure = 47.0 * (wind_speed / 3.6) / 6.9
+    thermal_pressure = 0.0
+    if abs(delta_t) >= 4.0:
+        thermal_pressure = 2.5 * (abs(delta_t) / 8.0) ** 0.5
+    return (wind_pressure ** 2 + thermal_pressure ** 2) ** 0.5 * 0.7
+
+
+def compute_duration(ach: float) -> float:
+    if ach <= 0:
+        return 30.0
+    return 3.0 / ach * 60 * 1.2
+
+
+def find_best_window(
+    hourly: list[dict],
+    indoor_temp: float | None,
+    indoor_rh: float | None,
+    pm25: float | None,
+) -> dict | None:
+    candidates = []
+    for hour in hourly:
+        passed, reason = gate_check(hour, pm25)
+        if not passed:
+            continue
+
+        outdoor_temp = float(hour.get("temp", 0))
+        outdoor_rh = float(hour.get("humidity", 0))
+        precip_prob = int(hour.get("pop", 0))
+        wind_speed = float(hour.get("windSpeed", 0)) / 3.6
+
+        if indoor_temp is not None and indoor_rh is not None:
+            indoor_dp = magnes_dewpoint(indoor_temp, indoor_rh)
+        else:
+            indoor_dp = None
+        outdoor_dp = magnes_dewpoint(outdoor_temp, outdoor_rh)
+        dp_diff = outdoor_dp - indoor_dp if indoor_dp is not None else 0.0
+
+        rh_diff = outdoor_rh - (indoor_rh if indoor_rh is not None else outdoor_rh)
+
+        if indoor_dp is not None:
+            conclusion = get_dp_band(dp_diff)
+        else:
+            conclusion = get_humidity_band(rh_diff)
+
+        if conclusion.startswith("🔴"):
+            continue
+
+        delta_t = outdoor_temp - (indoor_temp if indoor_temp is not None else outdoor_temp)
+        ach = compute_ach(wind_speed, delta_t)
+        duration = compute_duration(ach)
+
+        candidates.append({
+            "time": hour.get("fxTime", ""),
+            "outdoor_temp": outdoor_temp,
+            "outdoor_rh": outdoor_rh,
+            "precip_prob": precip_prob,
+            "wind_speed": wind_speed,
+            "dp_diff": round(dp_diff, 2),
+            "rh_diff": round(rh_diff, 1),
+            "conclusion": conclusion,
+            "ach": round(ach, 1),
+            "duration_min": round(duration, 1),
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x["dp_diff"], x["precip_prob"]))
+    return candidates[0]
+
+
+def generate_alert(window: dict, ac_state: dict) -> str:
+    ac_mode = ac_state.get("mode", "off")
+    ac_conflict, ac_action = AC_CONFLICT.get(ac_mode, ("未知", "按湿度差矩阵决策"))
+
+    now = datetime.now().strftime("%H:%M")
+    lines = [
+        f"🪟 换气提醒 [{now}]",
+        f"━━━━━━━━━━━━━━━━",
+        f"最佳窗口：{window['time']}",
+        f"室外 {window['outdoor_temp']}°C / {window['outdoor_rh']}% RH",
+        f"降雨概率 {window['precip_prob']}%｜风速 {window['wind_speed']:.1f}m/s",
+        f"露点差 {window['dp_diff']:+.1f}°C｜{window['conclusion']}",
+        f"ACH {window['ach']}｜建议开窗 {window['duration_min']} 分钟",
+        f"━━━━━━━━━━━━━━━━",
+        f"空调状态：{ac_mode}（{ac_conflict}）",
+        f"联动建议：{ac_action}",
+    ]
+    return "\n".join(lines)
+
+
+def should_alert(window: dict) -> bool:
+    """
+    判断是否需要推送提醒。
+    最佳窗口在 30 分钟内开始时推送。
+    """
+    if not window or "time" not in window:
+        return False
+    try:
+        window_time = datetime.fromisoformat(window["time"])
+        now = datetime.now()
+        delta = window_time - now
+        return timedelta(0) <= delta <= timedelta(minutes=30)
+    except (ValueError, TypeError):
+        return False
+
+
+def send_wechat(message: str) -> bool:
+    """
+    推送微信通知。
+    实际部署时接入企业微信/个人微信 API。
+    """
+    # TODO: 接入微信推送
+    print(f"[微信推送] {message}")
+    return True
+
+
+def main():
+    """主流程：每30分钟检查一次，最佳窗口在30分钟内时推送。"""
+    # 1. 读室内温湿度
+    indoor_temp, indoor_rh = read_indoor_sensor()
+
+    # 2. 读 ac_state.json
+    ac_state = read_ac_state()
+
+    # 3. 预报当日逐小时
+    hourly = fetch_qweather_hourly()
+    if not hourly:
+        print("⚠️ 无法获取和风天气预报，跳过换气决策")
+        return
+
+    # 4. PM2.5
+    pm25 = fetch_pm25()
+
+    # 5. 找最佳窗口
+    window = find_best_window(hourly, indoor_temp, indoor_rh, pm25)
+    if window is None:
+        print("⚠️ 今日无合适开窗窗口（闸门全拒或结论全红）")
+        return
+
+    # 6. 判断是否需要推送（窗口在30分钟内）
+    if should_alert(window):
+        alert = generate_alert(window, ac_state)
+        send_wechat(alert)
+        print(alert)
+    else:
+        print(f"🪟 最佳窗口 {window['time']}，尚无需提醒")
+
+
+if __name__ == "__main__":
+    main()

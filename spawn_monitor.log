@@ -1,0 +1,6 @@
+[20:13:13] === spawn monitor start (10min) ===
+[20:13:28] NEW powershell.exe pid=3912 parent=pythonw.exe(pid=30700)
+[20:13:28]     cmd: powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress -Depth 2"
+[20:13:28] NEW conhost.exe pid=8280 parent=powershell.exe(pid=3912)
+[20:13:28]     cmd: \??\C:\WINDOWS\system32\conhost.exe 0x4
+[20:13:28] NEW conhost.exe pid=19512 parent=bash.exe(pid=31284)
