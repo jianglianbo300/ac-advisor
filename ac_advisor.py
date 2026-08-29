@@ -759,12 +759,13 @@ def _learn_from_manual(state, now_ts):
         if manual_on_count >= 3 and current_cw > 0.1:
             user_pref["comfort_weight"] = round(max(0.1, current_cw - 0.1), 1)
             try:
-                with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False)
+                # v8.36+: json.dump 不写末尾换行，每次回写都会产生 "\ No newline at end of file" 的 git 噪音
+                with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False); f.write("\n")
             except: pass
         elif manual_off_count >= 3 and current_cw < 1.0:
             user_pref["comfort_weight"] = round(min(1.0, current_cw + 0.1), 1)
             try:
-                with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False)
+                with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False); f.write("\n")
             except: pass
         state["user_pref"] = pref
     except: pass

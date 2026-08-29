@@ -25,6 +25,9 @@ filter_state.json
 ac_watch.log
 _winddown_log.txt
 
+# 子代理运行输出快照（omp/pi 审计时落盘的 stdout 转储，一次性产物，不入库）
+_*_run_stdout.log
+
 # 环境/凭据（API key 统一存 .env，review_*.py 从环境读取）
 .env
 # QR 扫码会话缓存（含 passToken，禁止入库）
