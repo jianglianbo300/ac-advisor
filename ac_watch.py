@@ -1085,7 +1085,7 @@ def main():
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
     cl = COMP_LABEL.get(comp, comp)
-    kwh_str = f"kWh={state.get('estimated_kwh', 0):.3f}"
+    kwh_str = f"kWh今={state.get('_daily_kwh', 0):.2f}/累={state.get('estimated_kwh', 0):.1f}"
     delta_str = f"dRH20={delta_rh_20}% dRH60={delta_rh_60}%"
     dp_str = f"dp={dp:.1f}C" if dp is not None else "dp=?"
     ah_str = f"AH={ah:.1f}" if ah is not None else "AH=?"
