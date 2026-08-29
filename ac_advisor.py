@@ -95,7 +95,20 @@ def compute_optimal_schedule(wx, current_temp, current_hum, learned,
             t += dt
         return t
 
-    def hour_cost(hour, t_in, action):
+    def hour_cost(hour_idx, t_in, action):
+        # v8.36 fix (hy4审计#9): 形参原名 hour 有误导——两个调用点（下方 DP 递推的
+        # `for h in range(23,-1,-1)` 与正向生成的 `for h in range(min(24,len(...)))`）
+        # 传的都是 local_times 的**数组索引**（相对当前小时的偏移 0..23），不是绝对
+        # 小时。原代码直接拿索引跟 22/6 比较判峰谷 → 把索引 0-5 与 22-23 恒判为谷电，
+        # DP 的 V[] 递推与 policy 全部建立在错误电价上，"谷电蓄冷"算出的时机不可信。
+        # 主流程触发时机用的是真实小时（ac_watch.py: is_valley = _h>=22 or _h<6），
+        # 所以线上未炸，但 DP 本身是错的。改为从 local_times 取真实小时。
+        hour = hour_idx
+        if isinstance(hour_idx, int) and 0 <= hour_idx < len(local_times):
+            try:
+                hour = int(local_times[hour_idx][11:13])
+            except Exception:
+                pass
         price = ELECTRIC_VALLEY if hour >= 22 or hour < 6 else ELECTRIC_PEAK
         elec_cost = kwh_est(60, COOL_DUTY) * price if action == "cool" else 0
         comfort_penalty = comfort_weight * max(0, t_in - comfort_target) ** 2
@@ -218,8 +231,26 @@ def evaluate_and_learn(state, now_ts):
         cur_adj = adjusted.get("temp_cooling", 0)
         # v8.30: 负偏移会把启动线压进抖振死区（启动线<关机线+迟滞），白天已由
         # ac_watch.DAY_START_LINE_FLOOR 兜底，这里不再产出负偏移。
-        if not success: adjusted["temp_cooling"] = max(0, min(2, cur_adj - 1))
-        elif cur_adj > 0: adjusted["temp_cooling"] = cur_adj - 1
+        #
+        # v8.36 fix (hy4审计#2): 原写法两条分支在 cur_adj∈[0,3] 上数学等价——
+        # 失败 `max(0, min(2, a-1))` 与成功 `a-1` 在 a=0/1/2/3 时结果完全相同，
+        # 决策质量回评信号彻底失效（成功与失败对偏移的影响无差别）；且成功分支
+        # 缺 max(0,·) 夹紧，cur_adj=0.5 时会产出 **负偏移 -0.5**，与上面这段
+        # v8.30 注释「这里不再产出负偏移」直接冲突（0.5 是高频取值，预算每次 ±0.5）。
+        #
+        # 新语义（按动作类型分向，不再让 cooling 失败与 off 失败同向）：
+        #   成功            → -1（保守回归默认，保留 v8.29 的防顶死收敛速度）
+        #   off/fan 失败    → -1（关早了：关后温度反降或湿度爆升 → 更早开机保舒适）
+        #   cooling/dehumid 失败 → **不动**（开了但温湿度都没改善，多半是硬件/功率
+        #                          计量问题；此时调启动线无意义，若按"更早开"处理
+        #                          只会白白多耗电，按"更晚开"处理则会单向累加顶到
+        #                          +3（启动线 30°C）——正是 v8.29 这段注释要防的事故）
+        # 三者在偏移上互不相同，回评信号恢复；且失败路径永不增大偏移，杜绝顶死。
+        if not success:
+            if action not in ("cooling", "dehumid"):
+                adjusted["temp_cooling"] = round(max(0, cur_adj - 1), 2)
+        elif cur_adj > 0:
+            adjusted["temp_cooling"] = round(max(0, cur_adj - 1), 2)
         entry["evaluated"] = True
     # v8.29 fix: 日预算学习按"当日"用电判断，且偏移只能回落不能因超预算单向顶死。
     # 旧逻辑用累计 kWh 对比日预算 → 永远超支 → 偏移被持续 +0.5 顶到上限，
@@ -230,18 +261,28 @@ def evaluate_and_learn(state, now_ts):
     _today_str = now_ts[:10] if isinstance(now_ts, str) else datetime.now().strftime("%Y-%m-%d")
     if state.get("_budget_prediction", {}).get("date") == _today_str:
         daily_budget = max(4.0, (state["_budget_prediction"].get("predicted_kwh") or 8.0) * 1.3)
-    if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
-        adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
-    elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
-        adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
+    # v8.36 fix (hy4审计#3): v8.31 引入成本口径时注释写的是"预算按加权电价成本
+    # **而非** kWh 判断"，但旧的 kWh 分支并未删除，两套独立 if/elif 叠加生效：
+    # 每次 evaluate_and_learn 调用最多 +1.0，而 main() 一轮调用 evaluate 两次
+    # （ac_watch.py 的 decide 前后各一次）→ 一轮最多 +2.0；护栏一次仅 -0.5，
+    # 净增益 2:1 失配，实测 2 轮即顶到上限 +3（启动线 30°C），正是 v8.29 这段
+    # 注释声称要防止的"30°C 不开机"事故。改为互斥：有峰谷分时数据走成本口径，
+    # 无数据才回退 kWh 口径（这才是 v8.31 注释的原意）。
+    _wh = state.get("_kwh_by_price_band") or {}
+    _peak_kwh = _wh.get("peak", 0.0)
+    _valley_kwh = _wh.get("valley", 0.0)
+    _has_band = (_peak_kwh + _valley_kwh) > 0
+    if not _has_band:
+        # 回退口径：无峰谷分时数据时按原始 kWh 判断
+        if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
+            adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
+        elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
+            adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
     # v8.31 峰谷套利：预算按"加权电价成本"而非 kWh 判断。
     # 谷电(22-6点, 0.307元)制冷多跑不罚；峰电(0.617元)超支才推高启动线。
     # 效果：同样8度电，谷电花的钱≈4度峰电，系统自然学会"往夜里搬负荷"。
-    try:
-        _wh = state.get("_kwh_by_price_band") or {}
-        _peak_kwh = _wh.get("peak", 0.0)
-        _valley_kwh = _wh.get("valley", 0.0)
-        if (_peak_kwh + _valley_kwh) > 0:  # 有分时数据才启用，否则回退旧口径
+    else:
+        try:
             daily_cost = _peak_kwh * ELECTRIC_PEAK + _valley_kwh * ELECTRIC_VALLEY
             _cost_budget = max(2.0, (state["_budget_prediction"].get("predicted_kwh", 8.0) * 1.3
                                      if state.get("_budget_prediction", {}).get("date") == _today_str
@@ -250,12 +291,17 @@ def evaluate_and_learn(state, now_ts):
                 adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
             elif daily_cost < _cost_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
                 adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
-    except Exception:
-        pass
+        except Exception:
+            pass
     # 偏移健康护栏：白天(8-21点)若室温≥启动线-0.5 且空调未运行超过20分钟，
     # 说明启动线过高，强制回落 0.5（自愈，防止再次出现 30°C 不开机）
     if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
-        if (state.get("last_temp") or 0) >= TEMP_COOLING + adjusted.get("temp_cooling", 0) - 0.5:
+        # v8.36 fix (hy4审计#5): 原条件 `last_temp >= TEMP_COOLING + adj - 0.5` 自指
+        # ——触发门槛随偏移一起被抬高，形成死锁：adj=2 时启动线 29°C、护栏却要求
+        # last_temp >= 28.5°C；adj=3 时启动线 30°C、要求 >= 29.5°C。启动线越高越
+        # 难开机，室温越涨不到门槛，护栏越不触发 → 温和天气下永久顶死。
+        # 改为对绝对启动线 TEMP_COOLING 判定，任何正偏移在高温下都能自愈。
+        if (state.get("last_temp") or 0) >= TEMP_COOLING:
             _off_min = minutes_since(state.get("last_off_at"))
             if _off_min is not None and _off_min > 20:
                 adjusted["temp_cooling"] = round(max(0, adjusted.get("temp_cooling", 0) - 0.5), 2)
@@ -384,8 +430,12 @@ def fit_thermal_model(events):
 def predict_cooling_time(temp_current, temp_target, outdoor_temp, thermal_model):
     a = thermal_model.get("thermal_conductance", 0.003)
     c = thermal_model.get("baseline_cooling", -0.035)
+    if temp_current is None or temp_target is None: return 0
     diff = temp_current - temp_target
     if diff <= 0: return 0
+    # v8.36 fix (hy4审计#4): 室外温度缺失（天气 API 失败）时降级为"忽略室外传热"，
+    # 只保留基础制冷速率 c，而不是让 `a * (None - t)` 抛 TypeError 打断主循环。
+    if outdoor_temp is None: outdoor_temp = temp_current
     t, minutes = temp_current, 0
     while t > temp_target and minutes < 600:
         t += a * (outdoor_temp - t) + c; minutes += 1
@@ -553,13 +603,20 @@ def ac_apply(new_mode, target_temp=None):
         try:
             if st.mode is not None and st.mode.value != want_mode:
                 AC_CTRL.send_command("set_mode", [want_mode]); act.append(f"模式{want_mode}")
-        except: pass
+        # v8.36 fix (hy4审计#7): 原为裸 `except: pass`，设置失败被完全吞掉。
+        # 此时 act 为空 → 返回 no_action → 上层的 apply_and_commit 无法区分
+        # "本来就已是目标状态"与"设置失败"，日志显示"已处目标状态无需动作"。
+        except Exception as e:
+            return {"status": "failed", "action": "，".join(act) or "设定模式",
+                    "reason": f"set_mode_failed: {e}"}
         if want_mode == "dry": pass
         else:
             try:
                 if target_temp and st.target_temperature != target_temp:
                     AC_CTRL.send_command("set_tar_temp", [target_temp]); act.append(f"设定{target_temp}°C")
-            except: pass
+            except Exception as e:
+                return {"status": "failed", "action": "，".join(act) or "设定温度",
+                        "reason": f"set_tar_temp_failed: {e}"}
     elif new_mode == "fan_locked": pass
     elif new_mode in ("fan", "off"):
         if on:
@@ -579,7 +636,15 @@ def reconcile_state(state, now_ts):
         never_ran = not state.get("run_start")
         if not is_system_off and not never_ran: state["manual_off_at"] = now_ts
         state["mode"] = "off"; state["last_off_at"] = now_ts; state["run_start"] = None
-        state.pop("_system_off_at", None); return
+        state.pop("_system_off_at", None)
+        # v8.36 fix (hy4审计#12): 用户手动关机也要喂给偏好学习。此前 _learn_from_manual
+        # 只在下方"手动开机"分支被调用，且调用时 state["mode"] 已被置为 "cooling"，
+        # 于是 manual_on_log 里 mode 恒为 cooling → manual_off_count 恒为 0 →
+        # comfort_weight 只能单调下降、永不回升：用户嫌冷手动关机，系统永远学不会
+        # 把舒适度权重调回去。这里在 mode 置 "off" 之后补调，使 off 样本得以入账。
+        if not is_system_off and not never_ran:
+            _learn_from_manual(state, now_ts)
+        return
     if state.get("_system_off_at"): state.pop("_system_off_at", None)
     if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
         state["manual_on_at"] = now_ts; state["mode"] = "cooling"
@@ -589,6 +654,22 @@ def reconcile_state(state, now_ts):
 def verify_socket():
     if AC_CTRL is None: return None
     try: s = AC_CTRL.status(); return "on" if s.is_on else "off"
+    except: return None
+
+def verify_target_temp():
+    """v8.36 (hy4审计#7): 回读空调**实际**设定温度。
+
+    verify_socket() 只验 is_on，不验目标温度。设温指令失败（或空调拒绝该档位）
+    时，state 记的是期望值而设备是另一个值，decide() 用
+    `temp <= current_target + DAY_TEMP_REACHED_SLACK` 判断是否达标就会永远
+    判不达标，压缩机一路跑到 WATCH_MAX_RUN=90 分钟被强关。
+    不可读（离线/不支持）时返回 None，由调用方按"未验证"处理。
+    """
+    if AC_CTRL is None: return None
+    try:
+        s = AC_CTRL.status()
+        t = getattr(s, "target_temperature", None)
+        return t if isinstance(t, (int, float)) and not isinstance(t, bool) else None
     except: return None
 
 def apply_state_from_verify(state, new_mode, real, now_ts):
@@ -617,7 +698,19 @@ def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None, tts_r
                 "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on"}
     if meta and not contradict:
         for k, v in meta.items(): state[k] = v
-    if not contradict and target_temp is not None: state["target_temp"] = target_temp
+    if not contradict and target_temp is not None:
+        # v8.36 fix (hy4审计#7): 原来无条件写入期望值。若设温实际未生效（指令失败、
+        # 或空调拒绝该档位），state 记 24 而设备是 26 → 后续 decide() 的达标判据
+        # `temp <= current_target + DAY_TEMP_REACHED_SLACK` 永不满足 → 无效长跑到
+        # WATCH_MAX_RUN=90min 强关。改为回读实测值：一致即记账，不一致则以实测为准
+        # 并留下 _target_drift 供排查（实测不可读时保持原行为，记期望值）。
+        state["target_temp"] = target_temp
+        _real_t = verify_target_temp()
+        if _real_t is not None and abs(_real_t - target_temp) >= 0.5:
+            state["target_temp"] = _real_t
+            state["_target_drift"] = {"want": target_temp, "got": _real_t}
+        else:
+            state.pop("_target_drift", None)
     save_state(state)
     if tts_reason and not contradict:
         try:

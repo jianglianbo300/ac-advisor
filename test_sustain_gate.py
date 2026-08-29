@@ -28,6 +28,10 @@ import ac_watch as W
 # 锁定谷电价使结果与运行时段解耦。
 A.current_price = lambda: 0.307
 
+# 2026-08-28 审计：隔离真实学习数据（同 test_day_short_cycle.py 注释）——
+# 近 1h 真实启动记录会触发启停上限，启动类用例假红。
+A.load_learned = lambda: {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": []}
+
 
 class R:
     def __init__(self):

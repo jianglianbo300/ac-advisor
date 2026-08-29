@@ -31,6 +31,10 @@ import ac_watch as W
 # 锁定谷电价使结果与运行时段解耦。
 A.current_price = lambda: 0.307
 
+# 2026-08-28 审计：隔离真实学习数据（同 test_day_short_cycle.py 注释）——
+# 近 1h 真实启动记录会触发启停上限，启动类用例假红。
+A.load_learned = lambda: {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": []}
+
 
 class R:
     def __init__(self):
@@ -71,7 +75,7 @@ R_.check("24.5°C <= target 25 → 允许关机", mode == "off", f"got mode={mod
 R_.check("理由仍是夜间湿度达标", "湿度已达标" in str(reason), f"got={reason}")
 
 # ── 3. 边界：SLACK=0 是闭区间 ──
-print("\n[3] 温度边界（SLACK=%.1f）" % W.DAY_TEMP_REACHED_SLACK)
+print(f"\n[3] 温度边界（SLACK={W.DAY_TEMP_REACHED_SLACK:.1f}）")
 edge = 25 + W.DAY_TEMP_REACHED_SLACK
 mode_at, _, _ = W.decide(
     temp=edge, hum=48, running=True, since_on=30, since_off=None, is_night=True,
@@ -102,9 +106,9 @@ R_.check("过冷逃生门仍无条件关机", mode == "off", f"got={mode} {reaso
 
 # ── 6. 阈值调整生效（用户在 27.0°C 反馈热）──
 print("\n[6] 启动阈值下调")
-R_.check(f"NIGHT_START_T = 27.0（原 28.0）", W.NIGHT_START_T == 27.0,
+R_.check("NIGHT_START_T = 27.0（原 28.0）", W.NIGHT_START_T == 27.0,
          f"got={W.NIGHT_START_T}")
-R_.check(f"TEMP_COOLING = 27（原 28）", A.TEMP_COOLING == 27, f"got={A.TEMP_COOLING}")
+R_.check("TEMP_COOLING = 27（原 28）", A.TEMP_COOLING == 27, f"got={A.TEMP_COOLING}")
 # 炎热日改为「压低目标」而非「提前启动」：传感器 1°C 分辨率下提前一档会把死区
 # 压到 1°C 重新引发抖振，故 TEMP_COOLING_HOT_DAY 已废弃，改用 HOT_DAY_TARGET_FLOOR。
 R_.check("炎热日目标下限严于常规（多压一度）",

@@ -73,20 +73,29 @@ def acquire_lock():
     except ImportError:
         return True
     try:
-        _LOCK_FD = open(_LOCK_FILE, "w")
+        # v8.36 fix (hy4审计#8): 旧写法先 open(...,"w") 再读 mtime——open 截断会
+        # 把 mtime 刷成 now，残留锁 age 恒为 0 永远判不过期 → 进程被强杀后控制
+        # 永久停摆。改为：O_RDWR|O_CREAT 打开不截断不刷 mtime；抢锁失败后读
+        # 真实 mtime 判陈旧(≥120s)，陈旧先删再抢；新鲜锁拒绝启动。
+        fd = os.open(_LOCK_FILE, os.O_RDWR | os.O_CREAT)
         try:
-            msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            _LOCK_FD = os.fdopen(fd, "w")
             atexit.register(_cleanup_lock)
             return True
         except OSError:
-            _LOCK_FD.close()
-            _LOCK_FD = None
+            os.close(fd)
             age = ((datetime.now() - datetime.fromtimestamp(os.path.getmtime(_LOCK_FILE)))
                    .total_seconds()) if os.path.exists(_LOCK_FILE) else 0
             if age < _LOCK_STALE_SEC:
                 return False
-            _LOCK_FD = open(_LOCK_FILE, "w")
-            msvcrt.locking(_LOCK_FD.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                os.remove(_LOCK_FILE)
+            except Exception:
+                pass
+            fd = os.open(_LOCK_FILE, os.O_RDWR | os.O_CREAT)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            _LOCK_FD = os.fdopen(fd, "w")
             atexit.register(_cleanup_lock)
             return True
     except Exception:
@@ -375,6 +384,11 @@ def open_cycle(state, now_ts, ah, rh, temp=None, outdoor_temp=None):
         "rh": rh,
         "temp": temp,
         "outdoor_temp": outdoor_temp,
+        # v8.36 fix (hy4审计#10): close_cycle 里算 "kwh_used" 时用的是
+        # `state["estimated_kwh"] - cs.get("kwh", 0)`，但本函数此前从不写 kwh 键，
+        # cs.get("kwh", 0) 恒为 0 → kwh_used 落的是**累计总电量**（实测样例中
+        # 为 66.4）而非本周期用电，cycle_log.jsonl 该字段长期不可用。
+        "kwh": state.get("estimated_kwh", 0),
     }
 
 
@@ -558,7 +572,20 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             if current_target is None or temp <= current_target + DAY_TEMP_REACHED_SLACK:
                 return ("off", None, f"湿度已达标降到{hum:.0f}%，压缩机工作完成关机")
 
-        if not evening and hum <= DEHUMID_EXIT_RH and temp <= current_target + DAY_TEMP_REACHED_SLACK and predicted_cool_min is not None and predicted_cool_min <= 5:
+        # v8.36 fix (hy4审计#11): 本分支原带 `temp <= current_target +
+        # DAY_TEMP_REACHED_SLACK` 条件，与上方 L~566「湿度达标完成关」的判据完全
+        # 相同——上位分支未命中意味着温度**未**达标，本分支却又要求温度达标，
+        # 逻辑自相矛盾，实测任何输入都不可达（temp=25.4 命中上位，25.6 直落
+        # 缓除上调），"热模型预测提前关机"实际从未生效。
+        # 改为不再重复温度判据：湿度已达标且热模型预测很快到位即可提前关，
+        # 这才是"提前"二字的本义（若温度已达标，上位分支已处理）。
+        if (not evening and hum <= DEHUMID_EXIT_RH
+                and predicted_cool_min is not None and predicted_cool_min <= 5
+                # 保留温度上限但放宽到 +1.5（上位分支用的是 SLACK=0.5）：
+                # 完全去掉温度条件会让"室温还差好几度"也能提前关，违背 v8.32
+                # "降到设定值是履约"的原则；放宽到 1.5 度才是"提前"的本义。
+                and current_target is not None
+                and temp <= current_target + 1.5):
             return ("off", None, f"湿度达标{hum:.0f}%，热模型预测再跑{predicted_cool_min}分钟即可到位，提前关省电")
 
         if (hum <= VIRTUAL_INV_APPROACH_RH
@@ -571,9 +598,16 @@ def decide(temp, hum, running, since_on, since_off, is_night,
                     f"湿度近达标（{hum:.0f}%），目标升1度到{new_target}度缓除防过冷")
 
         if (comp_min is not None and comp_min >= DEHUMID_STALL_MIN and not evening
+                and not is_night
+                # v8.36 fix (hy4审计#1): 此前无温度前置——室温超目标 3°C、湿度 70%
+                # 也会因"降幅不足"被关机，且压制了后面加强除湿分支；且 delta_rh_60min
+                # 实际窗口 = rh_history 上限 12 条 × 2min ≈ 22 分钟（hist[-12:] 截断
+                # 使 60min 过滤失效），变量名有误导，判定语义按"近 22 分钟"理解。
+                and current_target is not None
+                and temp <= current_target + DAY_TEMP_REACHED_SLACK
                 and delta_rh_60min is not None
                 and delta_rh_60min > -DEHUMID_STALL_RH_BAND):
-            return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度降幅不足，判定无效空耗关机")
+            return ("off", None, f"压缩机跑了{int(comp_min)}分钟湿度降幅不足且温度已达标，判定无效空耗关机")
 
         if delta_rh_20min is not None and delta_rh_20min <= DEHUMID_DELTA_RH_MIN:
             return (None, None, None)
@@ -620,7 +654,15 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     if is_night:
         night_target = max(NIGHT_MIN_TARGET, min(NIGHT_TARGET, round(temp - 2)))
-        if temp >= NIGHT_START_T:
+        # v8.36 fix (hy4审计#13): 夜间（谷电 22-6）启动线原为硬编码 NIGHT_START_T，
+        # 完全不受学习偏移 adj 影响，峰谷套利只做了一半——v8.31 的目标是"系统自然
+        # 学会往夜里搬负荷"，而夜间恰是最该多跑的时段却固定不动；白天偏移被预算
+        # 推高时，系统只能被动忍受 30°C，无法把负荷转移到谷电。
+        # 改为按 adj 反向微调：预算压力越大(adj 越高)夜间越积极（启动线越低），
+        # 把制冷量搬到谷电。限幅 1°C 且仅在 adj>0 时生效：adj=0 行为与原先完全一致，
+        # 既避免 selftest 与线上行为漂移，也防止谷电再便宜就激进到 24°C 开机。
+        _night_line = NIGHT_START_T - min(1.0, max(0.0, adj))
+        if temp >= _night_line:
                         # 夜间短循环已由 MIN_OFF(15min)+每小时启停上限 防护;
             # sustained(10min)过滤会把一次缓慢夜间升温卡死在27°C -> 不再抑制
             return ("cooling", night_target, f"夜间室温{temp:.0f}度偏热，自动开制冷{night_target}度")
@@ -858,8 +900,22 @@ def main():
         state.pop("compressor_on_since", None)
     state["cycle_comp_total"] = cycle_comp_total
 
+    # v8.29 fix: _daily_kwh 按日清零（此前从不清零，累计值永远超预算，
+    # 导致 evaluate_and_learn 把 temp_cooling 偏移永久顶到 +2 上限）
+    #
+    # v8.36 fix (hy4审计#6): 清零必须发生在累加**之前**。原顺序是"先累加
+    # (L880) → 再判日清零(L893)"，于是跨日那一轮的增量被加进昨天的账之后立刻
+    # 被清掉丢失；而下方的 _kwh_by_price_band 是在累加**之前**重置的，造成同一
+    # 轮两套账本背离：_daily_kwh 归零、峰谷账本却已正确计入本轮增量。
+    # pi 线 _audit_report_pi.md"峰谷账本交叉 ✓ 差 0.0353"正是本 bug 的量化痕迹
+    # （0.0353 kWh ≈ 2min × 1.06kW 的单轮增量），当时被当作可接受误差。
+    _today = now_ts[:10] if isinstance(now_ts, str) else now_dt.strftime("%Y-%m-%d")
+    _today_str = _today
+    if state.get("_daily_kwh_date") != _today:
+        state["_daily_kwh"] = 0.0
+        state["_daily_kwh_date"] = _today
+
     daily_increment = state.get("estimated_kwh", 0) - state.get("_prev_kwh", 0)
-    _today_str = now_ts[:10] if isinstance(now_ts, str) else now_dt.strftime("%Y-%m-%d")
     if daily_increment > 0:
         state["_daily_kwh"] = state.get("_daily_kwh", 0) + daily_increment
         # v8.31 峰谷套利：按当前时段把电量记到峰/谷账本，供成本预算学习用
@@ -870,13 +926,6 @@ def main():
             state["_kwh_by_price_band"] = _by_band
         _by_band[_band] = round(_by_band.get(_band, 0.0) + daily_increment, 4)
     state["_prev_kwh"] = state.get("estimated_kwh", 0)
-
-    # v8.29 fix: _daily_kwh 按日清零（此前从不清零，累计值永远超预算，
-    # 导致 evaluate_and_learn 把 temp_cooling 偏移永久顶到 +2 上限）
-    _today = now_ts[:10] if isinstance(now_ts, str) else now_dt.strftime("%Y-%m-%d")
-    if state.get("_daily_kwh_date") != _today:
-        state["_daily_kwh"] = 0.0
-        state["_daily_kwh_date"] = _today
 
     update_kwh(state, now_ts, load_power)
     update_rh_history(state, now_ts, hum)
@@ -921,7 +970,15 @@ def main():
     _thermal_data = A.load_thermal_data()
     _model = _thermal_data.get("thermal_model", {})
     _predicted_cool_min = None
-    if running:
+    # v8.36 fix (hy4审计#4): 天气 API 失败时 _outdoor_t 为 None，而
+    # predict_cooling_time 内部直接算 `a * (outdoor_temp - t)` → TypeError，
+    # 未捕获即穿到 main() 顶层，整个控制环中断（实测：
+    # predict_cooling_time(28,25,None,m) → TypeError: unsupported operand
+    # type(s) for -: 'NoneType' and 'int'）。同函数其他调用点均有 None 保护
+    # （如 hot_day = outdoor_temp is not None and ...），此处独漏。
+    # 仅在 running 且 temp > current_target 时才会进循环，故此前只在"运行中且
+    # 室温高于目标"这一常见态下偶发崩溃。
+    if running and _outdoor_t is not None and current_target is not None:
         _predicted_cool_min = A.predict_cooling_time(temp, current_target, _outdoor_t, _model)
 
     # v8.28 最优调度：每小时算一次 DP，缓存结果
@@ -1165,9 +1222,16 @@ def _selftest():
     # Test: running, humidity above threshold, not time to stop yet
     assert decide(28, 65, True, 50, 90, False, "compressor", None, None, 26, 0, None, None, 13.5, 50) == (None, None, None)
     assert decide(25, 65, True, 30, 90, False, "compressor", None, None, 26, -1.0, None, None, 13.5, 30)[:2] != ("off", None)
-    assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None)[:2] == ("cooling", 26)
-    assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None)[:2] == ("cooling", 24)
-    assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None)[:2] == (None, None)
+    # v8.36: 这三个夜间启动用例此前依赖真实 ac_learned.json（adj 与 decision_log）。
+    # #13 让夜间启动线随 adj 反向微调后，一旦线上偏移转正（超预算时），
+    # _night_line 下调会让 26°C 用例由"不动"变成"开机"，用例随线上状态漂移。
+    # 补 load_learned 隔离：固定 adj=0、decision_log 为空（同时屏蔽启停上限干扰）。
+    from unittest import mock as _mock_night
+    _night_zero = {"adjusted_thresholds": {"temp_cooling": 0}, "decision_log": []}
+    with _mock_night.patch.object(A, "load_learned", return_value=_night_zero):
+        assert decide(29, 60, False, None, None, True, "off", None, None, 26, None, None, False, None, None)[:2] == ("cooling", 26)
+        assert decide(26, 75, False, None, None, True, "off", None, None, 26, None, None, False, 18.0, None)[:2] == ("cooling", 24)
+        assert decide(26, 65, False, None, None, True, "off", None, None, 26, None, None, False, 15.0, None)[:2] == (None, None)
     assert decide(24, 60, True, 30, 90, True, "compressor", None, None, 27, 0, 0, None, 13.5, None)[:2] == ("off", None)
     assert decide(27, 65, True, 50, 90, False, "compressor", None, None, 26, -2.0, None, None, None, None)[:2] == (None, None)
 
