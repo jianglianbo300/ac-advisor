@@ -140,6 +140,9 @@ HOT_DAY_TARGET_FLOOR = 24
 SUSTAIN_MIN = 10
 SUSTAIN_URGENT_T = 29.0
 DAY_START_LINE_FLOOR = 27.0  # v8.30: 白天温度启动线地板 = target_min(25)+SLACK(1)+迟滞(1)
+PEAK_START_DEFERRAL = 1.0    # v8.37: 峰电启动线推迟量。传感器分辨率 1°C → 本值取 (0,1] 内
+                             # 任意数在整数读数下等价（27.5 与 28 的触发点相同），要真正
+                             # 改变行为只能置 0，改动前先看下面的闷热豁免逻辑
 
 SENSOR_FALLBACK_OFF_ALLOWED = True
 SENSOR_FALLBACK_ON_ALLOWED = False
@@ -673,7 +676,14 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     # 峰谷电：峰电提高阈值（晚开省电）
     is_peak = A.current_price() >= A.ELECTRIC_PEAK
-    temp_threshold = temp_cooling + (1.0 if is_peak else 0.0)
+    # v8.37 fix: 峰电推迟对"闷热"豁免。上海居民分时确为峰 6-22 时/谷 22-6 时（已核实
+    # 沪发改价管〔2022〕50号），电价表无误；问题在推迟量本身——传感器分辨率 1°C，
+    # (0,1] 内任何推迟在整数读数下都等价于 +1°C，等于把白天启动线**永久**抬到 28°C，
+    # "峰电推迟"名存实亡。08-29 实测 27.0°C/RH67% 判无动作，用户 15:18 与 16:00
+    # 两次手动开机（近 10 条 manual_on=6）→ 该阈值下用户不认可。
+    # 改为：湿度已达代码自身定义的"闷"阈值 HUM_DEHUMID_ON(65) 时不推迟；干热仍省电。
+    muggy = hum is not None and hum >= A.HUM_DEHUMID_ON
+    temp_threshold = temp_cooling + (0.0 if muggy else (PEAK_START_DEFERRAL if is_peak else 0.0))
 
     # 峰电时：温度未达提高阈值 → 不动作（晚开省电）
     if is_peak and temp < temp_threshold:
