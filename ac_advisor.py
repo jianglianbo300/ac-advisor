@@ -756,14 +756,21 @@ def _learn_from_manual(state, now_ts):
             with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "r") as f: user_pref = json.load(f)
             current_cw = user_pref.get("comfort_weight", 0.5)
         except: current_cw = 0.5
-        if manual_on_count >= 3 and current_cw > 0.1:
-            user_pref["comfort_weight"] = round(max(0.1, current_cw - 0.1), 1)
+        # v8.37 fix: 两个分支方向此前都是反的。comfort_weight 全仓只作用于本文件
+        # :114 的 comfort_penalty = comfort_weight * (t_in - comfort_target)**2，
+        # DP 求最小化 → **越大 = 越舍得开制冷**。旧逻辑：手动开机≥3 → 减 0.1（更
+        # 不肯开）、手动关机≥3 → 加 0.1（更积极），与用户行为构成正反馈——嫌热手动
+        # 开 → 系统更保守 → 手动开更多 → 一路砸到 0.1 底；反之亦然。
+        # 08-29 实测近 10 条 manual_on=6 / manual_off=4，系统却在下调舒适权重。
+        # 非 v8.36 引入（git show f7f32f9 已比对分支方向前后一致），是既有 bug。
+        if manual_on_count >= 3 and current_cw < 1.0:
+            user_pref["comfort_weight"] = round(min(1.0, current_cw + 0.1), 1)
             try:
                 # v8.36+: json.dump 不写末尾换行，每次回写都会产生 "\ No newline at end of file" 的 git 噪音
                 with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False); f.write("\n")
             except: pass
-        elif manual_off_count >= 3 and current_cw < 1.0:
-            user_pref["comfort_weight"] = round(min(1.0, current_cw + 0.1), 1)
+        elif manual_off_count >= 3 and current_cw > 0.1:
+            user_pref["comfort_weight"] = round(max(0.1, current_cw - 0.1), 1)
             try:
                 with open(os.path.join(SCRIPT_DIR, "ac_user_pref.json"), "w") as f: json.dump(user_pref, f, indent=2, ensure_ascii=False); f.write("\n")
             except: pass
