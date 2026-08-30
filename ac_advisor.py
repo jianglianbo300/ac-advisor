@@ -340,12 +340,13 @@ def evaluate_and_learn(state, now_ts):
     learned["decision_log"] = log[-50:]
     save_learned(learned)
 
-def log_decision(state, action, pre_temp, pre_hum, now_ts):
+def log_decision(state, action, pre_temp, pre_hum, now_ts, reason=None):  # v8.39: 加 reason 参数，支持决策归因
     learned = load_learned()
     log = learned.get("decision_log", [])
     power_at_decision = state.get("_prev_power") or state.get("measured_w")
     log.append({"time": now_ts, "action": action, "pre_temp": pre_temp,
-                "pre_hum": pre_hum, "evaluated": False, "power_at_decision": power_at_decision})
+                "pre_hum": pre_hum, "evaluated": False, "power_at_decision": power_at_decision,
+                "reason": reason})  # v8.39: 决策原因，支持 grep 归因
     learned["decision_log"] = log[-50:]
     save_learned(learned)
 
@@ -577,7 +578,7 @@ def _read_indoor_once(ip, token, timeout):
     except: pass
     return None, None
 
-AC_MEASURED_W = None; AC_SOCKET = None
+AC_MEASURED_W = None; AC_SOCKET = None; AC_COMPANION_TARGET = None  # v8.42: 伴侣设定温度（回声字段，仅镜像我方发射命令）
 
 def ac_control_init():
     global AC_CTRL; AC_CTRL = None
@@ -720,7 +721,7 @@ def apply_and_commit(new_mode, target_temp, state, now_ts=None, meta=None, tts_r
     return ctrl
 
 def read_ac_power(timeout=4.0):
-    global AC_MEASURED_W, AC_SOCKET; AC_SOCKET = None
+    global AC_MEASURED_W, AC_SOCKET, AC_COMPANION_TARGET; AC_SOCKET = None
     try:
         with open(CONFIG_FILE) as f: cfg = json.load(f)
         ap = cfg.get("ac_partner") or {}
@@ -728,6 +729,8 @@ def read_ac_power(timeout=4.0):
         from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
         d = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
         st = d.status(); AC_SOCKET = "on" if st.is_on else "off"; AC_MEASURED_W = None
+        # v8.42: 顺手读伴侣设定温度（回声字段，仅镜像我方发射的命令；用户改温不更新——2026-08-29 实验证实）
+        AC_COMPANION_TARGET = getattr(st, "target_temperature", None)
         if st.is_on and st.load_power and st.load_power > 0:
             AC_MEASURED_W = round(st.load_power); return AC_MEASURED_W
     except: pass

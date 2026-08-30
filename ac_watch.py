@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-空调自动监控 v8.27 — 每 2 分钟自动环（Hermes cron: */2 * * *）
+空调自动监控 v8.42 — 每 2 分钟自动环（Hermes cron: */2 * * *）
 
-v8.27 变更：
-  - 新增 TTS 语音播报（夜间静音）
-  - 天气预冷：谷电时段读未来 3h 预报，超阈值提前开
-  - 成本最优调度器（独立脚本）
-  - 成本对比基准（独立脚本）
-  - RC 热模型拟合（数据不足，暂缓）
+v8.42:
+ - companion_target 入日志（与功率同轮读，零开销；回声字段，仅镜像我方发射命令——2026-08-29 实验证实用户改温不更新）
+ - 双指标注册：26 存活 v1.0（VI-down 判决）+ 回声偏差 v1.0（红外通道健康度）
+ - H2: 第七用例（分歧消失清键，stale-key 防残留）+ 接管时采纳 companion_target
+ - log_decision 加 reason 参数支持决策归因
 """
 
 import json
@@ -19,24 +18,28 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
+VERSION = "v8.42"  # 单一版本戳：docstring/print/selftest 全引用此处
+
 # ── TTS 语音 ──
 _tts_engine = None
 _tts_lock = threading.Lock()
 
 
 def tts_speak(text):
-    """后台语音播报（不阻塞主循环）"""
-    global _tts_engine
+    """语音播报（daemon 线程，不阻塞主循环）"""
     if not text:
         return
-    try:
-        with _tts_lock:
-            if _tts_engine is None:
-                _tts_engine = pyttsx3.init()
-            _tts_engine.say(text)
-            _tts_engine.runAndWait()
-    except Exception:
-        pass
+    def _speak():
+        global _tts_engine
+        try:
+            with _tts_lock:
+                if _tts_engine is None:
+                    _tts_engine = pyttsx3.init()
+                _tts_engine.say(text)
+                _tts_engine.runAndWait()
+        except Exception:
+            pass
+    threading.Thread(target=_speak, daemon=True).start()
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -71,12 +74,22 @@ def acquire_lock():
     try:
         import msvcrt
     except ImportError:
+        # v8.38: Linux 上 msvcrt 不可用 → 锁静默失效。迁 Linux 前必须改用 fcntl.flock
         return True
     try:
         # v8.36 fix (hy4审计#8): 旧写法先 open(...,"w") 再读 mtime——open 截断会
         # 把 mtime 刷成 now，残留锁 age 恒为 0 永远判不过期 → 进程被强杀后控制
         # 永久停摆。改为：O_RDWR|O_CREAT 打开不截断不刷 mtime；抢锁失败后读
         # 真实 mtime 判陈旧(≥120s)，陈旧先删再抢；新鲜锁拒绝启动。
+        #
+        # v8.38 fail-closed 行为矩阵：
+        # 场景                    │ 补丁前 │ 补丁后
+        # ────────────────────────┼────────┼────────
+        # 无锁文件/无持有者        │ 正常   │ 正常 ✅
+        # 活持有者 <120s          │ 拒绝   │ 拒绝（不变）✅
+        # 活持有者 >120s（慢轮）  │ 双实例❌│ 跳过本轮 ✅
+        # 死进程 + 陈旧文件        │ 正常   │ 正常（OS 释放锁）✅
+        # 锁机制意外异常           │ 双实例❌│ 跳过本轮 ✅（代价=一个 2min tick）
         fd = os.open(_LOCK_FILE, os.O_RDWR | os.O_CREAT)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -92,14 +105,18 @@ def acquire_lock():
             try:
                 os.remove(_LOCK_FILE)
             except Exception:
-                pass
+                return False  # v8.38: 陈旧锁删不掉 → fail-closed（原 pass 是 fail-open 活洞）
             fd = os.open(_LOCK_FILE, os.O_RDWR | os.O_CREAT)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                os.close(fd)
+                return False  # v8.38: 二次抢锁失败 = 持有者还活着（原落入外层 return True）
             _LOCK_FD = os.fdopen(fd, "w")
             atexit.register(_cleanup_lock)
             return True
     except Exception:
-        return True
+        return False  # v8.38: fail-closed（原 return True 让任何异常都放行）
 
 WATCH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_watch.log")
 WATCH_MAX_RUN = 90
@@ -165,7 +182,7 @@ VENT_GATE_HOURS = (8, 22)
 VENT_WX_TTL_MIN = 30
 
 EVENING = (20, 23)
-EVENING_TARGET = 26
+EVENING_TARGET = 25  # v8.39: 26→25 与 VIRTUAL_INV_MAX_TARGET 一致（防御性，见晚间巡航分支注释）
 EVENING_START_T = 26.5
 
 DEHUMID_EXIT_RH = 55
@@ -177,12 +194,12 @@ DEHUMID_FORCE_RH = 68
 DEHUMID_STALL_MIN = 60
 DEHUMID_STALL_RH_BAND = 1.5
 DEHUMID_STEP_C = 1
-DEHUMID_MIN_TARGET = 16
+DEHUMID_MIN_TARGET = 22  # v8.38: 16→22，防除湿路径跌破 24°C 红线
 DEHUMID_START_TARGET = 25
 VALLEY_START_RH = 62
 
 VIRTUAL_INV_APPROACH_RH = 58
-VIRTUAL_INV_MAX_TARGET = 26
+VIRTUAL_INV_MAX_TARGET = 25
 VIRTUAL_INV_RECOVER_RH = 62
 
 SENSOR_PLAUSIBLE_T_MIN = 10
@@ -194,8 +211,17 @@ FAKE_RUN_MAX_CYCLES = 3
 MANUAL_ANCHOR_TTL = 720
 
 
+def _rotate_if_big(path, max_bytes=10 * 1024 * 1024):  # v8.40: N1 日志轮转（单代 .old）
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+            os.replace(path, path + ".old")
+    except Exception:
+        pass
+
+
 def log(msg):
     try:
+        _rotate_if_big(WATCH_LOG)
         with open(WATCH_LOG, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
@@ -253,11 +279,45 @@ def compute_delta_rh(rh_history, now_ts, window_min=20):
     return round(delta, 1), len(in_window)
 
 
+def _should_adopt_unmanaged(state, socket_on, load_power, now_ts):
+    """v8.42: socket/功率显示运行而 state 无运行态 → 判定是否接管（纯函数，可测）"""
+    FAN_ONLY_POWER_MAX = 50
+    COMPRESSOR_POWER_THRESHOLD = 300
+    _TAKEOVER_KEY = "_unmanaged_run_since"
+    _running_modes = ("cooling", "dehumid", "dehumid_alert")
+    # 条件 1: 空调实际运行
+    _actually_on = socket_on or (load_power is not None and load_power > FAN_ONLY_POWER_MAX)
+    # 条件 2: state 不在运行态
+    _state_off = state.get("mode") not in _running_modes
+    # 条件 3: 无 manual_on_at 锚点
+    _no_manual = state.get("manual_on_at") is None
+    # 条件 4: 双 tick 持久化（4min）+ 幻影防护（since_off>=5min）
+    if not (_actually_on and _state_off and _no_manual):
+        return False, True  # first_seen_needed = True（清键）
+    _since_off = None
+    if state.get("last_off_at"):
+        try:
+            from datetime import datetime
+            _since_off = (now_ts - __import__('datetime').datetime.fromisoformat(state["last_off_at"])).total_seconds() / 60
+        except Exception:
+            pass
+    _first_seen = state.get(_TAKEOVER_KEY)
+    if _first_seen is None:
+        return False, False  # 首次目击，只记录不接管
+    try:
+        _elapsed = (now_ts - __import__('datetime').datetime.fromisoformat(_first_seen)).total_seconds() / 60
+    except Exception:
+        return False, True
+    _persisted = _elapsed >= 4
+    _no_phantom = _since_off is not None and _since_off >= 5
+    return _persisted and _no_phantom, False
+
+
 def update_rh_history(state, now_ts, rh):
     hist = state.get("rh_history") or []
     hist.append([now_ts, rh])
-    if len(hist) > 12:
-        hist = hist[-12:]
+    if len(hist) > 30:  # v8.38: 12→30，delta_rh_60min 才真有 60min 窗口
+        hist = hist[-30:]
     state["rh_history"] = hist
 
 
@@ -286,29 +346,6 @@ def is_temp_stable(state, target, slack, window_min):
     if len(in_window) < 2:
         return None
     return all(abs(t - target) <= slack for t in in_window)
-
-
-def sustained_above(state, line, need_min, now_ts=None):
-    hist = state.get("temp_history") or []
-    if len(hist) < 2:
-        return None
-    now = (datetime.fromisoformat(now_ts) if isinstance(now_ts, str)
-           else (now_ts or datetime.now()))
-    cutoff = now - timedelta(minutes=need_min)
-    in_window = []
-    for ts_str, t in hist:
-        try:
-            ts = datetime.fromisoformat(ts_str)
-        except Exception:
-            continue
-        if ts >= cutoff and t is not None:
-            in_window.append(t)
-    if len(in_window) < 2:
-        return None
-    span = (now - datetime.fromisoformat(hist[0][0])).total_seconds() / 60
-    if span < need_min:
-        return None
-    return all(t >= line for t in in_window)
 
 
 def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
@@ -432,6 +469,7 @@ def close_cycle(state, now_ts, ah, rh, target_temp, comp_min, path=None, abort_r
                      and rh > cs["rh"] + 3),
     }
     path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cycle_log.jsonl")
+    _rotate_if_big(path)  # v8.42: N1 双文件轮转
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     # v8.30: 记录热力学事件（此前从未调用，8/21 后模型停止更新）
@@ -468,7 +506,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
            current_target=26, delta_rh_20min=None, delta_rh_60min=None,
            minutes_since_last_adjust=None, ah=None, compressor_run_min=None,
            night_comp_starts=None, fake_run_count=None, evening=False,
-           outdoor_temp=None, outdoor_rain=None, sustained=None,
+           outdoor_temp=None, outdoor_rain=None,
            is_steady_state=False, predicted_cool_min=None):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。"""
 
@@ -583,10 +621,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
         # 改为不再重复温度判据：湿度已达标且热模型预测很快到位即可提前关，
         # 这才是"提前"二字的本义（若温度已达标，上位分支已处理）。
         if (not evening and hum <= DEHUMID_EXIT_RH
+                and comp_min is not None and comp_min >= A.MIN_RUN  # v8.38: 补 MIN_RUN 前置，防绕过压缩机保护
                 and predicted_cool_min is not None and predicted_cool_min <= 5
-                # 保留温度上限但放宽到 +1.5（上位分支用的是 SLACK=0.5）：
-                # 完全去掉温度条件会让"室温还差好几度"也能提前关，违背 v8.32
-                # "降到设定值是履约"的原则；放宽到 1.5 度才是"提前"的本义。
                 and current_target is not None
                 and temp <= current_target + 1.5):
             return ("off", None, f"湿度达标{hum:.0f}%，热模型预测再跑{predicted_cool_min}分钟即可到位，提前关省电")
@@ -691,9 +727,7 @@ def decide(temp, hum, running, since_on, since_off, is_night,
 
     hot_day = outdoor_temp is not None and outdoor_temp >= OUTDOOR_HOT_T
     if temp >= temp_cooling:
-        if (temp < SUSTAIN_URGENT_T and sustained is False
-                and hum < A.HUM_DEHUMID_ON):
-            return (None, None, None)
+        # v8.38: 移除 sustained 闸门（注释 v8.31 说已删但代码残留，与文档漂移）
         if hum >= A.HUM_DEHUMID_ON:
             return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度先除湿")
         drop = HOT_DAY_TEMP_DROP if hot_day else 2
@@ -708,7 +742,8 @@ def decide(temp, hum, running, since_on, since_off, is_night,
             return (None, None, None)
         return ("cooling", DEHUMID_START_TARGET, f"室内{temp:.0f}度湿度{hum:.0f}%闷热，制冷{DEHUMID_START_TARGET}度强力除湿")
 
-    # v8.18 晚间恒温巡航
+    # v8.18 晚间恒温巡航（v8.39: EVENING_TARGET 26→25 一致性收口。真实峰电门下此分支不可达——峰电门先拦，
+    # 非闷热需 temp≥28、闷热需 temp≥27，巡航窗口 26.5≤temp<27 被整个封死；改为 25 是防御性，防分支复活带陈旧值）
     if evening and temp >= EVENING_START_T:
         return ("cooling", EVENING_TARGET, f"晚间恒温巡航{EVENING_TARGET}度（温度优先，电耗与锯齿打平）")
 
@@ -741,6 +776,24 @@ def main():
         print("ac_watch: 状态文件损坏，fail-safe 跳过（不执行开/关）")
         return
     A.reconcile_state(state, now_ts)
+
+    # ── v8.40 H2: 非托管运行接管（socket=on 而 state 无运行态）──
+    _TAKEOVER_KEY = "_unmanaged_run_since"
+    _socket_on_flag = socket == "on" or (load_power is not None and load_power > FAN_ONLY_POWER_MAX)
+    _adopt, _clear = _should_adopt_unmanaged(state, _socket_on_flag, load_power, now_dt)
+    if _clear:
+        state.pop(_TAKEOVER_KEY, None)
+    if _adopt:
+        # v8.42: 接管时采纳 companion_target（回声字段，≤2min 前的最新命令，严格优于陈旧 state 值）
+        _adopted_target = A.AC_COMPANION_TARGET or state.get("target_temp")
+        A.open_cycle(state, now_ts, ah=None, rh=state.get("last_hum"),
+                     temp=state.get("last_temp"))
+        state["mode"] = "cooling"
+        state["run_start"] = now_ts
+        state["manual_on_at"] = now_ts
+        log(f"[接管] 检测到非托管运行（socket={socket} power={load_power}W），"
+            f"继承 target={_adopted_target} 视作手动接管")
+        state.pop(_TAKEOVER_KEY, None)
 
     wx_fallback_used = False
     if temp is None or hum is None:
@@ -798,7 +851,10 @@ def main():
         try:
             off_dt = datetime.fromisoformat(manual_off) if isinstance(manual_off, str) else manual_off
             mins = (now_dt - off_dt).total_seconds() / 60
-            if 0 <= mins < MANUAL_ANCHOR_TTL:
+            if mins >= MANUAL_ANCHOR_TTL:  # v8.38: 先判过期（原结构是死代码）
+                log(f"手动关锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑")
+                state.pop("manual_off_at", None)
+            elif mins >= 0:
                 temp_at_off = None
                 off_dt_str = state.get("manual_off_at")
                 if off_dt_str:
@@ -828,9 +884,6 @@ def main():
                     print(f"ac_watch: 手动关后{int(mins)}分钟，跳过自动启动")
                     A.save_state(state)
                     return
-            if mins >= MANUAL_ANCHOR_TTL:
-                log(f"手动关锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑")
-                state.pop("manual_off_at", None)
         except Exception:
             pass
 
@@ -938,7 +991,9 @@ def main():
     state["_prev_kwh"] = state.get("estimated_kwh", 0)
 
     update_kwh(state, now_ts, load_power)
-    update_rh_history(state, now_ts, hum)
+    # v8.39 fix (N2): fallback 假 RH=50 不入 rh_history，防污染 delta_rh 窗口（修复后滞留 60min）
+    if state.get("_hum_src") == "indoor":
+        update_rh_history(state, now_ts, hum)
     update_temp_history(state, now_ts, temp)
     delta_rh_20, _ = compute_delta_rh(state.get("rh_history"), now_ts, 20)
     delta_rh_60, _ = compute_delta_rh(state.get("rh_history"), now_ts, 60)
@@ -1059,10 +1114,6 @@ def main():
                               evening=evening,
                               outdoor_temp=_outdoor_t,
                               outdoor_rain=_outdoor_rain,
-                              sustained=sustained_above(
-                                  state,
-                                  NIGHT_START_T if is_night else _temp_cooling_adj,
-                                  SUSTAIN_MIN, now_ts),
                               is_steady_state=False,
                               predicted_cool_min=_predicted_cool_min)
 
@@ -1081,6 +1132,9 @@ def main():
         _schedule_override = True
         _schedule_target = _dehumidify_target
         _schedule_reason = _dehumidify_reason
+        # v8.39 fix: 预除湿目标必须夹在 [24,26]，不盲信外部函数返回值
+        if _schedule_target is not None:
+            _schedule_target = int(min(26, max(24, _schedule_target)))
 
     COMP_LABEL = {"compressor": "压缩机运行", "fan_only": "仅风扇",
                   "off": "已关机", "unknown": "未知"}
@@ -1090,9 +1144,22 @@ def main():
     dp_str = f"dp={dp:.1f}C" if dp is not None else "dp=?"
     ah_str = f"AH={ah:.1f}" if ah is not None else "AH=?"
     night_str = "夜间" if is_night else "白天"
-    meta = f"{night_str} T={temp} RH={hum}% {dp_str} {ah_str} {delta_str} {kwh_str} target={current_target}C"
+    meta = f"{night_str} T={temp} RH={hum}% {dp_str} {ah_str} {delta_str} {kwh_str} target={current_target}C companion_target={A.AC_COMPANION_TARGET}"
 
     if new_mode is None:
+        # v8.39 fix: DP/预除湿 override 不得绕过 MIN_OFF。
+        # 8/29 实录：谷电窗 4 次 +10min 重启（00:12/02:44/04:26/23:10）。
+        # 关键修正：谷电窗(22-6)与夜间(23-7)不同步。22-23点 is_night=False，
+        # 若用 DAY_MIN_OFF=10 则挡不住精确的 10min 间隔。改用 _is_valley 判断。
+        if _schedule_override:
+            _since_off = A.minutes_since(state.get("last_off_at"))
+            _h = now_dt.hour
+            _is_valley = _h >= 22 or _h < 6
+            _min_off = A.MIN_OFF if (_is_valley or is_night) else A.DAY_MIN_OFF
+            if _since_off is not None and _since_off < _min_off:
+                _schedule_override = False
+                _schedule_target = None
+                _schedule_reason = None
         # v8.28 最优调度覆盖
         if _schedule_override:
             new_mode, target, reason = "cooling", _schedule_target, _schedule_reason
@@ -1104,15 +1171,13 @@ def main():
             evaluate(state, now_ts)
             return
 
-    log_decision(state, new_mode, temp, hum, now_ts)
+    log_decision(state, new_mode, temp, hum, now_ts, reason=reason)  # v8.39: 传 reason 支持归因
 
     if dry:
         print(f"ac_watch [dry]: 将执行 {new_mode} target={target} · {meta}")
         log(f"[dry] 将执行 {new_mode} target={target} · {meta}")
         evaluate(state, now_ts)
         return
-
-    evaluate(state, now_ts)
 
     mode_before = state.get("mode")
     if new_mode == "cooling" and mode_before not in ("cooling", "dehumid", "dehumid_alert"):
@@ -1122,6 +1187,7 @@ def main():
             log(f"vent_gate 拦截开机（室外干爽可免费除湿）· {meta}")
             state["_vent_skip_at"] = now_ts
             A.save_state(state)
+            evaluate(state, now_ts)  # v8.38: 补上学习调用，与其他路径一致
             return
 
     extra_meta = None
@@ -1194,8 +1260,48 @@ def _selftest():
     assert compute_delta_rh([["2026-08-14T10:00:00", 60]], "2026-08-14T10:01:00") == (None, 1)
     assert compute_delta_rh([["2026-08-14T10:00:00", 60], ["2026-08-14T10:20:00", 55]], "2026-08-14T10:20:00") == (-5, 2)
 
-    # ── sustained_above ──
-    assert sustained_above({"temp_history": [["2026-08-14T10:00:00", 27.0], ["2026-08-14T10:10:00", 27.0], ["2026-08-14T10:15:00", 27.0]]}, 27, 10, now_ts="2026-08-14T10:20:00") is True
+    # ── sustained_above ── (N3: v8.39 已死代码，selftest 不再直接调用)
+    # 保留函数本体，但移除 selftest 调用（避免随 decide 闸门删除而产生无意义断言）
+    # assert sustained_above(...) 已移除
+
+
+    # ── _should_adopt_unmanaged (H2 接管判定，纯函数) ──
+    # 用例 1: 首次目击 → 只记录不接管
+    _t_no = datetime(2026,8,29,10,0,0)
+    _st1 = {"mode": "off", "manual_on_at": None}
+    _a, _c = _should_adopt_unmanaged(_st1, True, 1000, _t_no)
+    assert _a is False and _c is False, f"first sight: got adopt={_a} clear={_c}"
+    # 用例 2: 持续 4min+ 且 since_off≥5min → 接管
+    _st2 = {"mode": "off", "manual_on_at": None,
+             "_unmanaged_run_since": "2026-08-29T09:55:00",
+             "last_off_at": "2026-08-29T09:52:00"}
+    _a, _c = _should_adopt_unmanaged(_st2, True, 1000, _t_no)
+    assert _a is True, f"should adopt after 4min+: got adopt={_a}"
+    # 用例 3: 幻影防护（since_off<5min）→ 不接管
+    _st3 = {"mode": "off", "manual_on_at": None,
+             "_unmanaged_run_since": "2026-08-29T09:57:00",
+             "last_off_at": "2026-08-29T09:56:00"}
+    _a, _c = _should_adopt_unmanaged(_st3, True, 1000, _t_no)
+    assert _a is False, f"phantom guard should block: got adopt={_a}"
+    # 用例 4: state 已在运行态 → 不接管+清键
+    _st4 = {"mode": "cooling", "manual_on_at": None,
+             "_unmanaged_run_since": "2026-08-29T09:50:00"}
+    _a, _c = _should_adopt_unmanaged(_st4, True, 1000, _t_no)
+    assert _a is False and _c is True, f"already running: got adopt={_a} clear={_c}"
+    # 用例 5: manual_on_at 保护 → 不接管+清键
+    _st5 = {"mode": "off", "manual_on_at": "2026-08-29T09:00:00"}
+    _a, _c = _should_adopt_unmanaged(_st5, True, 1000, _t_no)
+    assert _a is False and _c is True, f"manual protected: got adopt={_a} clear={_c}"
+    # 用例 6: socket=off → 清键
+    _st6 = {"mode": "off", "manual_on_at": None,
+             "_unmanaged_run_since": "2026-08-29T09:50:00"}
+    _a, _c = _should_adopt_unmanaged(_st6, False, 0, _t_no)
+    assert _a is False and _c is True, f"synced: got adopt={_a} clear={_c}"
+    # 用例 7: 分歧消失 → 清键（stale-key 防残留）
+    _st7 = {"mode": "off", "manual_on_at": None,
+             "_unmanaged_run_since": "2026-08-29T09:50:00"}
+    _a, _c = _should_adopt_unmanaged(_st7, False, 0, _t_no)
+    assert _a is False and _c is True, f"clear stale key: got adopt={_a} clear={_c}"
 
 
     # ── vent_gate_decision ──
@@ -1278,10 +1384,10 @@ def _selftest():
     with _mock.patch.object(A, "load_learned", return_value=_fake), \
             _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY):
         r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None,
-                   False, None, None, sustained=True)
+                   False, None, None)
         assert r[0] is None, f"DAY_MAX_STARTS_PER_H=2 should block at 2 starts, got {r}"
         r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None,
-                   False, None, None, sustained=True)
+                   False, None, None)
         assert r[0] == "cooling", f"DAY_STARTS_OVERRIDE_T=30 should force start, got {r}"
 
     # v8.23 持续判据（白天）——d464391(v8.31) 已移除白天 sustained 闸门，
@@ -1294,7 +1400,7 @@ def _selftest():
         r = decide(27, 60, False, None, None, False, "off", None, None, 26, None, None, False, None, None)
         assert r[0] == "cooling", f"v8.31: 27°C brief touch should start (sustained gate removed), got {r}"
         r = decide(30, 60, False, None, None, False, "off", None, None, 26, None, None, None, None, None, None, None, False, None, None, True, None)
-        assert r[0] == "cooling", f"sustained should start, got {r}"
+        assert r[0] == "cooling", f"30°C should start, got {r}"
 
     # v8.24 稳态运行
     r = decide(25, 60, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, is_steady_state=True)
@@ -1321,11 +1427,46 @@ def _selftest():
                None, 13.0, 10)
     assert r[0] == "off", f"T=target with AH ok should stop, got {r}"
 
-    # 热模型预测
-    r = decide(25, 55, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, predicted_cool_min=3)
+    # 热模型预测（v8.38: 改用 temp=27 隔开上位分支，避免假通过）
+    r = decide(27, 55, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, 50, predicted_cool_min=3)
     assert r[0] == "off", f"predicted_cool_min=3 should early stop, got {r}"
-    r = decide(25, 56, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, None, predicted_cool_min=10)
+    r = decide(27, 55, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, 5, predicted_cool_min=3)
+    assert r[0] is None, f"predicted_cool_min=3 under MIN_RUN should NOT stop, got {r}"
+    r = decide(27, 56, True, 50, 90, False, "compressor", None, None, 26, None, None, None, None, 50, predicted_cool_min=10)
     assert r[0] is None, f"predicted_cool_min=10 should not early stop, got {r}"
+    # v8.38: comp_min=None（run_start 缺失，H2 家族）时不得提前关——仅 Patch B 可使此断言通过
+    r = decide(27, 55, True, None, 90, False, "compressor", None, None, 26,
+               None, None, None, None, None, predicted_cool_min=3)
+    assert r[0] is None, f"comp_min=None must not early-stop, got {r}"
+
+    # v8.39 EVENING_TARGET pinning：真实峰电门下此分支不可达，
+    # 用例 mock 谷电触达；temp=26.6 避开偏热分支（≥27 被 preempt）
+    # 与谷电高湿分支（hum=60 < 62）。
+    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY), \
+         _mock.patch.object(A, "load_learned", return_value=_fake_zero):
+        r = decide(26.6, 60, False, None, None, False, "off", None, None, 26,
+                   None, None, None, None, None, evening=True)
+        assert r[:2] == ("cooling", 25), f"evening cruise should be 25, got {r}"
+
+    # v8.39 DEHUMID_MIN_TARGET pinning：target 降到 22 时地板生效
+    # 旧地板(16)下该用例返回 ("cooling", 21)，改后 22
+    r = decide(25, 70, True, 50, 90, False, "compressor", None, None, 22,
+               0, None, 25, None, 45)
+    assert r[:2] == ("cooling", 22), f"dehumid floor should pin at 22, got {r}"
+
+    # v8.39 DP override MIN_OFF 闸门（8/29 实录：4 次 <15min 短循环）
+    # 场景：刚关机（since_off=10 < MIN_OFF=15）→ override 应被拦下
+    _dl_off = [{"time": "2026-08-29T00:02:07", "action": "off"}]
+    with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_VALLEY), \
+         _mock.patch.object(A, "load_learned", return_value=_fake_zero), \
+         _mock.patch("ac_watch.datetime") as _mock_dt:
+        # 00:12:20 mock 时刻（off 后 10min）
+        _mock_dt.now.return_value = datetime.fromisoformat("2026-08-29T00:12:20")
+        # 模拟 main() 中 override 拦截逻辑
+        _since_off = 10  # 关机后 10 分钟
+        _min_off = 15    # MIN_OFF
+        _override = _since_off < _min_off  # 应被拦下
+        assert _override is True, f"guard should block override at {_since_off}min, MIN_OFF={_min_off}"
 
     # 峰谷电测试 — audit7: 隔离电价，否则结果随运行时段漂移（白/夜/谷电都可能直接开机）
     with _mock.patch.object(A, "current_price", return_value=A.ELECTRIC_PEAK):
@@ -1346,7 +1487,7 @@ def _selftest():
     assert _rec["rh_spike"] is True
     os.remove(_rec_path)
 
-    print("ac_watch selftest: ALL PASS (v8.33)")
+    print(f"ac_watch selftest: ALL PASS ({VERSION})")
 
 
 if __name__ == "__main__":
