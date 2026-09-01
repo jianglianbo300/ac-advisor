@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 空调数据采集器 — 纯只读，绝不控制空调。
-读取: 米家净化器 4 Lite (DID 875028325) 室内温湿度 + (可选)和风天气
+读取: 米家净化器 4 Lite (DID 875028325, zhimi.airp.rma3) 室内温湿度 + (可选)和风天气
 输出: 追加一行 JSONL 到 ac_data/readings.jsonl
 铁律: 只用 prop/get 读取，绝不发 prop/set / action，无任何开关/温度设置指令。
+
+2026-09-01 重构: 云读取 → 本地 miio 直读。
+原因: 小米云 ssecurity 8-30 09:00 起失效（binascii.Error: Incorrect padding），
+      234 条 indoor err；且 micloud 重新登录 Access denied。
+      miio_config.json 本就存有净化器 IP/token，本地直读与空调伴侣同构，无云依赖。
+注意: PIID 4 实际为 PM2.5（2026-09-01 实测 value=2），历史键名 co2 保留以兼容下游。
 """
 import json, os, sys, time, datetime
 
-AUTH_PATH = os.path.join(os.environ["USERPROFILE"], "xiaomi_auth.json")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ac_data")
 DATA_FILE = os.path.join(DATA_DIR, "readings.jsonl")
-PURIFIER_DID = "875028325"   # 米家空气净化器 4 Lite（温湿度源）
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miio_config.json")
 
-# 正确属性映射（2026-08-23 实测确认）
+# 正确属性映射（2026-08-23 实测确认；2026-09-01 本地直读复测 code=0）
 SIID_ENV = 3
 PIID_TEMP = 7   # 温度 °C (直接值，非华氏)
 PIID_HUM = 1    # 湿度 %
-PIID_CO2 = 4    # CO2/PM2.5
+PIID_CO2 = 4    # PM2.5（键名 co2 沿用历史，兼容下游解析）
 
 def _retry(fn, tries=4, base_delay=2, label="op"):
     """简单指数退避重试：失败重试 base_delay*2^n 秒，全败抛最后异常。"""
@@ -42,19 +47,21 @@ def _load_env():
                     k, _, v = line.partition("=")
                     os.environ.setdefault(k.strip(), v.strip())
 
-def read_indoor(mc, base):
-    """只读净化器温湿度+CO2。纯 prop/get，无任何写操作。带自动重试。"""
+def read_indoor():
+    """本地 miio 直读净化器温湿度+PM2.5。纯 get_properties，无任何写操作。带自动重试。"""
     def _one():
-        params = [
-            {"did": PURIFIER_DID, "siid": SIID_ENV, "piid": PIID_TEMP},
-            {"did": PURIFIER_DID, "siid": SIID_ENV, "piid": PIID_HUM},
-            {"did": PURIFIER_DID, "siid": SIID_ENV, "piid": PIID_CO2},
+        from miio import Device
+        cfg = json.load(open(CONFIG_PATH))
+        dev = Device(ip=cfg["ip"], token=cfg["token"])
+        props = [
+            {"did": "t", "siid": SIID_ENV, "piid": PIID_TEMP},
+            {"did": "h", "siid": SIID_ENV, "piid": PIID_HUM},
+            {"did": "c", "siid": SIID_ENV, "piid": PIID_CO2},
         ]
-        resp = mc.request(base + "/miotspec/prop/get", {"data": json.dumps({"params": params})})
-        result = json.loads(resp)
+        result = dev.send("get_properties", props)
         out = {}
-        for r in result.get("result", []):
-            if r.get("code") == 0:
+        for r in result:
+            if isinstance(r, dict) and r.get("code") == 0:
                 out[r.get("piid")] = r.get("value")
         if not out:
             raise RuntimeError("empty result")
@@ -90,18 +97,10 @@ def read_weather():
 def main():
     _load_env()
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(AUTH_PATH) as f:
-        auth = json.load(f)
-    mc = MiCloud("13125554911", "Bo7812700874")
-    mc.service_token = auth["serviceToken"]
-    mc.user_id = auth["userId"]
-    mc.ssecurity = auth["ssecurity"]
-    mc.default_server = "cn"
-    base = mc._get_api_url("cn")
 
     rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds")}
     try:
-        indoor = read_indoor(mc, base)
+        indoor = read_indoor()
         rec.update(indoor)
     except Exception as e:
         rec["err"] = f"indoor:{e!r}"
@@ -114,6 +113,4 @@ def main():
           f"wx_t={ (rec.get('wx') or {}).get('t') } err={rec.get('err')}")
 
 if __name__ == "__main__":
-    # 延迟 import 以兼容脚本在无 micloud 环境下的报错信息
-    from micloud import MiCloud
     main()
