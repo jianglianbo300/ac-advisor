@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-空调自动监控 v8.43 — 每 2 分钟自动环（Hermes cron: */2 * * *）
+空调自动监控 v8.44 — 每 2 分钟自动环（Hermes cron: */2 * * *）
 
 v8.43:
  - P0 修复：reconcile_state 手动锚点震荡循环——伴侣 is_on 是 IR 信念非物理现实，
@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.43"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.44"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -1493,7 +1493,7 @@ def _selftest():
     assert _rec["rh_spike"] is True
     os.remove(_rec_path)
 
-    print(f"ac_watch selftest: ALL PASS ({VERSION})")
+    print(f"ac_watch   ({VERSION})")
 
 
 if __name__ == "__main__":

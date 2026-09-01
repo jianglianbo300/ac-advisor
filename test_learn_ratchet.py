@@ -62,8 +62,10 @@ def run_learn(start_adj, action, pre_temp, cur_temp, pre_hum=50, cur_hum=50,
     A.LEARN_FILE = path
     A.AC_MEASURED_W = measured_w
     try:
+        _today = datetime.now().strftime("%Y-%m-%d")
         state = {"last_temp": cur_temp, "last_hum": cur_hum,
-                 "_prev_power": measured_w, "_daily_kwh": daily_kwh}
+                 "_prev_power": measured_w, "_daily_kwh": daily_kwh,
+                 "_budget_prediction": {"date": _today, "predicted_kwh": 8.0}}  # P2: 短路 fetch_weather 真网络调用
         A.evaluate_and_learn(state, datetime.now().isoformat())
         return json.load(open(path, encoding="utf-8"))["adjusted_thresholds"]["temp_cooling"]
     finally:
@@ -119,10 +121,10 @@ R_.check("连续 5 次失败 → 钳在 0 不越界", adj == 0, f"got={adj}")
 
 # ── 预算逻辑（显式传入 daily_kwh 触发）──
 print("\n[预算逻辑]")
-got = run_learn(0, "cooling", 27.0, 25.0, measured_w=0, daily_kwh=10.0)
-R_.check("超预算(10kWh > 8kWh) → 偏移 +0.5", got == 0.5, f"got={got}")
+got = run_learn(0, "cooling", 27.0, 25.0, measured_w=0, daily_kwh=12.0)
+R_.check("超预算(12kWh > 8x1.3=10.4) → 偏移 +0.5", got == 0.5, f"got={got}")
 
-got = run_learn(2, "cooling", 27.0, 25.0, measured_w=0, daily_kwh=10.0)
+got = run_learn(2, "cooling", 27.0, 25.0, measured_w=0, daily_kwh=12.0)
 R_.check("超预算 + 成功收敛 → +1 后 +0.5 = 1.5", got == 1.5, f"got={got}")
 
 # ── 当前线上状态 ──

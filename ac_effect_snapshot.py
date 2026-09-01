@@ -57,6 +57,19 @@ def latest_after():
     return snaps[-1].get("after") if snaps else None
 
 
+def latest_adj():
+    """自学习偏移（v8.33 审计：长期钉在 ±2 边界 = 学习失效信号）。
+    直接读 ac_learned.json 当前值，不依赖快照历史字段。"""
+    p = os.path.join(BASE, "ac_learned.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        return d.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    except Exception:
+        return None
+
+
 def latest_v821():
     """取最新快照里的 v8.21 白天短循环指标。"""
     snaps = _snaps()
@@ -143,6 +156,11 @@ def main():
     out = run_verify()
     after = latest_after()
     v821 = latest_v821()
+    adj = latest_adj()
+
+    if adj is not None:
+        flag = "🔴 学习失效" if abs(adj) >= 2 else ("🟡 学习中" if adj else "✅ 中性")
+        print(f"🧠 自学习偏移: {adj}（{flag}）")
 
     print("🏠 空调修复效果周报")
     print(f"📅 {datetime.now():%m-%d}")

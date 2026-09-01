@@ -597,3 +597,320 @@
 {"ts": "2026-08-29T16:30:31", "temp": 27, "hum": 54, "co2": 13, "wx": {"t": "31", "rh": "68", "text": "多云", "rain": "0.0"}}
 {"ts": "2026-08-29T16:45:32", "temp": 27, "hum": 55, "co2": 9, "wx": {"t": "31", "rh": "69", "text": "多云", "rain": "0.0"}}
 {"ts": "2026-08-29T17:00:33", "temp": 26, "hum": 54, "co2": 8, "wx": {"t": "31", "rh": "69", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T17:15:35", "temp": 27, "hum": 53, "co2": 6, "wx": {"t": "31", "rh": "70", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T17:30:35", "temp": 26, "hum": 50, "co2": 5, "wx": {"t": "30", "rh": "73", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T17:45:36", "temp": 25, "hum": 50, "co2": 20, "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T18:00:38", "temp": 25, "hum": 53, "co2": 15, "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T18:15:38", "temp": 26, "hum": 57, "co2": 10, "wx": {"t": "29", "rh": "77", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T18:30:39", "temp": 27, "hum": 63, "co2": 10, "wx": {"t": "29", "rh": "79", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T18:45:40", "temp": 28, "hum": 64, "co2": 15, "wx": {"t": "29", "rh": "79", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T19:00:41", "temp": 26, "hum": 59, "co2": 11, "wx": {"t": "29", "rh": "78", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T19:15:42", "temp": 26, "hum": 54, "co2": 8, "wx": {"t": "29", "rh": "78", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T19:30:43", "temp": 26, "hum": 52, "co2": 8, "wx": {"t": "28", "rh": "80", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T19:45:44", "temp": 27, "hum": 54, "co2": 113, "wx": {"t": "28", "rh": "81", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T20:00:23", "temp": 26, "hum": 52, "co2": 66, "wx": {"t": "28", "rh": "82", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T20:15:24", "temp": 26, "hum": 51, "co2": 40, "wx": {"t": "28", "rh": "84", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T20:30:26", "temp": 26, "hum": 49, "co2": 25, "wx": {"t": "28", "rh": "85", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T20:45:26", "temp": 26, "hum": 48, "co2": 17, "wx": {"t": "28", "rh": "85", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T21:00:27", "temp": 25, "hum": 47, "co2": 13, "wx": {"t": "28", "rh": "85", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T21:15:28", "temp": 25, "hum": 46, "co2": 9, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T21:30:29", "temp": 25, "hum": 45, "co2": 7, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T21:45:30", "temp": 25, "hum": 44, "co2": 5, "wx": {"t": "28", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T22:00:31", "temp": 25, "hum": 44, "co2": 4, "wx": {"t": "28", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T22:15:32", "temp": 25, "hum": 43, "co2": 4, "wx": {"t": "28", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T22:30:34", "temp": 25, "hum": 44, "co2": 4, "wx": {"t": "28", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-29T22:45:36", "temp": 25, "hum": 44, "co2": 3, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T23:00:37", "temp": 25, "hum": 43, "co2": 2, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T23:15:38", "temp": 26, "hum": 44, "co2": 2, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T23:30:39", "temp": 25, "hum": 44, "co2": 2, "wx": {"t": "28", "rh": "86", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-29T23:45:39", "temp": 25, "hum": 43, "co2": 5, "wx": {"t": "28", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T00:00:41", "temp": 25, "hum": 43, "co2": 5, "wx": {"t": "27", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T00:15:42", "temp": 25, "hum": 45, "co2": 5, "wx": {"t": "27", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T00:30:43", "temp": 26, "hum": 44, "co2": 4, "wx": {"t": "27", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T00:45:44", "temp": 25, "hum": 43, "co2": 2, "wx": {"t": "27", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T01:00:45", "temp": 25, "hum": 42, "co2": 3, "wx": {"t": "28", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T01:15:46", "temp": 25, "hum": 42, "co2": 5, "wx": {"t": "28", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T01:30:47", "temp": 26, "hum": 44, "co2": 5, "wx": {"t": "28", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T01:45:48", "temp": 26, "hum": 43, "co2": 1, "wx": {"t": "28", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T02:00:49", "temp": 25, "hum": 42, "co2": 4, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T02:15:50", "temp": 25, "hum": 41, "co2": 4, "wx": {"t": "28", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T02:30:50", "temp": 25, "hum": 40, "co2": 1, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T02:45:52", "temp": 25, "hum": 40, "co2": 4, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T03:00:53", "temp": 26, "hum": 43, "co2": 5, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T03:15:54", "temp": 26, "hum": 45, "co2": 1, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T03:30:56", "temp": 26, "hum": 41, "co2": 1, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T03:45:57", "temp": 26, "hum": 44, "co2": 4, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T04:00:58", "temp": 26, "hum": 41, "co2": 3, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T04:15:59", "temp": 26, "hum": 43, "co2": 2, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T04:30:00", "temp": 26, "hum": 41, "co2": 5, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T04:45:01", "temp": 25, "hum": 40, "co2": 3, "wx": {"t": "27", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T05:00:02", "temp": 25, "hum": 39, "co2": 2, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T05:15:04", "temp": 25, "hum": 40, "co2": 3, "wx": {"t": "27", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T05:30:05", "temp": 25, "hum": 43, "co2": 5, "wx": {"t": "27", "rh": "90", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T05:45:06", "temp": 25, "hum": 40, "co2": 3, "wx": {"t": "27", "rh": "90", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T06:00:07", "temp": 25, "hum": 39, "co2": 4, "wx": {"t": "27", "rh": "90", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T06:15:08", "temp": 25, "hum": 39, "co2": 5, "wx": {"t": "27", "rh": "90", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T06:30:09", "temp": 25, "hum": 43, "co2": 1, "wx": {"t": "27", "rh": "90", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T06:45:11", "temp": 26, "hum": 45, "co2": 3, "wx": {"t": "27", "rh": "90", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T07:00:11", "temp": 26, "hum": 42, "co2": 2, "wx": {"t": "28", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T07:15:13", "temp": 25, "hum": 44, "co2": 5, "wx": {"t": "28", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T07:30:14", "temp": 26, "hum": 48, "co2": 4, "wx": {"t": "28", "rh": "91", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T07:45:15", "temp": 27, "hum": 50, "co2": 4, "wx": {"t": "28", "rh": "89", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T08:00:16", "temp": 27, "hum": 60, "co2": 3, "wx": {"t": "28", "rh": "91", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T08:15:17", "temp": 27, "hum": 65, "co2": 5, "wx": {"t": "28", "rh": "91", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T08:30:18", "temp": 27, "hum": 65, "co2": 172, "wx": {"t": "28", "rh": "88", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T08:45:19", "temp": 27, "hum": 67, "co2": 34, "wx": {"t": "28", "rh": "87", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T09:00:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T09:15:21", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T09:30:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T09:45:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T10:00:24", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T10:15:25", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "86", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T10:30:27", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T10:45:27", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T11:00:28", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "77", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T11:15:29", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T11:30:30", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T11:45:31", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T12:00:32", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T12:15:33", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "77", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T12:30:34", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T12:45:35", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "80", "text": "阵雨", "rain": "0.0"}}
+{"ts": "2026-08-30T13:00:36", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "阵雨", "rain": "0.0"}}
+{"ts": "2026-08-30T13:15:59", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "78", "text": "阵雨", "rain": "0.0"}}
+{"ts": "2026-08-30T13:30:15", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T13:45:23", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T14:15:34", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T14:30:36", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T14:45:37", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "71", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T15:00:38", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "72", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T15:15:39", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T15:30:40", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "73", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T15:45:41", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T16:00:43", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T16:15:44", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "74", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-30T16:30:45", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "74", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T16:45:46", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T17:00:47", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T17:15:49", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "75", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T17:30:50", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "76", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T17:45:51", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "76", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-30T18:00:52", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "77", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T18:15:54", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "78", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T18:30:55", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T18:45:56", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T19:00:57", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T19:15:58", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T19:30:59", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T19:45:00", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T20:00:02", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T20:15:03", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T20:30:04", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T20:45:05", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T21:00:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T21:15:07", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T21:30:09", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T21:45:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T22:00:11", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T22:15:12", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T22:30:14", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T22:45:15", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T23:00:16", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T23:15:17", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T23:30:18", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-30T23:45:19", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T00:00:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T00:15:21", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T00:30:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T00:45:23", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T01:00:24", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T01:15:25", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T01:30:26", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T01:45:27", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T02:00:28", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T02:15:28", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T02:30:30", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T02:45:31", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T03:00:32", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T03:15:33", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T03:30:34", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T03:45:35", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T04:00:37", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T04:15:37", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T04:30:39", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T04:45:40", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T05:00:41", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T05:15:42", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T05:30:43", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T05:45:45", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T06:00:46", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "86", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T06:15:47", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "86", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T06:30:48", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T06:45:49", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T07:00:50", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T07:15:52", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T07:30:53", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T07:45:55", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "79", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T08:00:57", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T08:15:57", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T08:30:58", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T08:46:00", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "75", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T09:00:01", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "74", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T09:15:02", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "74", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T09:30:03", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "71", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T09:45:04", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T10:00:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T10:15:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T10:30:07", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "68", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T10:45:09", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "67", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T11:00:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "68", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T11:15:12", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "68", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T11:30:13", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "66", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T11:45:14", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T12:00:15", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T12:15:16", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T12:30:18", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "62", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T12:45:18", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T13:00:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "62", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T13:15:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T13:30:21", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "61", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T13:45:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "61", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T14:00:32", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "61", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T14:15:29", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "61", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T14:30:30", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "61", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T14:45:31", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "60", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T15:00:32", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "58", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T15:15:33", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "34", "rh": "59", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T15:30:34", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "62", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T15:45:35", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "62", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T16:00:36", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "33", "rh": "63", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T16:15:37", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "64", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T16:30:38", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "67", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T16:45:39", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "32", "rh": "66", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T17:00:40", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "68", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T17:15:41", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "68", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T17:30:42", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "71", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T17:45:43", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "72", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T18:00:44", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "74", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T18:15:45", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "74", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T18:30:46", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "76", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T18:45:47", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "77", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T19:00:48", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "79", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T19:15:49", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "80", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T19:30:50", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T19:45:51", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T20:00:52", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "81", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T20:15:53", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-08-31T20:30:56", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T20:45:57", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T21:00:58", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T21:15:59", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T21:31:00", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "82", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T21:45:01", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "83", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T22:00:02", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "83", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T22:15:03", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "83", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T22:30:04", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "83", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T22:45:05", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "89", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-08-31T23:00:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "88", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T23:15:07", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "88", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-08-31T23:30:08", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "87", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-08-31T23:45:09", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "87", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T00:00:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "88", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-09-01T00:15:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "87", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-09-01T00:30:13", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-09-01T00:45:12", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "晴", "rain": "0.0"}}
+{"ts": "2026-09-01T01:00:13", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T01:15:14", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T01:30:15", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T01:45:16", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T02:00:17", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T02:15:18", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T02:30:19", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T02:45:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T03:00:21", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T03:15:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T03:30:23", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T03:45:24", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T04:00:25", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T04:15:26", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T04:30:28", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T04:45:29", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T05:00:29", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "83", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T05:15:31", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T05:30:32", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T05:45:33", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "26", "rh": "86", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T06:00:34", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "26", "rh": "88", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T06:15:35", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "26", "rh": "87", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T06:30:36", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T06:45:37", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T07:00:38", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "27", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T07:15:39", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T07:30:40", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "76", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T07:45:41", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "73", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T08:00:42", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T08:15:43", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "76", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T08:30:45", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "77", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T08:45:46", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "73", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T09:00:47", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "75", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T09:15:48", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T09:30:49", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T09:45:50", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T10:00:51", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T10:15:52", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T10:30:53", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "72", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T10:45:57", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "72", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T11:00:58", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "70", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T11:15:59", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "70", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T11:31:00", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T11:45:01", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "70", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T12:00:02", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "70", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T12:15:03", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "71", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T12:30:04", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "70", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T12:45:05", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T13:00:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "71", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T13:15:07", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "72", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T13:30:08", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "67", "text": "小雨", "rain": "0.0"}}
+{"ts": "2026-09-01T13:45:09", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "68", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T14:00:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": null}
+{"ts": "2026-09-01T14:15:11", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "67", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T14:30:12", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "65", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T14:45:41", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "67", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T15:02:01", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "66", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T15:15:02", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "65", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T15:30:03", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "31", "rh": "63", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T15:45:04", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "65", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T16:00:05", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "66", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T16:15:06", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "30", "rh": "68", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T16:30:07", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "72", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T16:45:08", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "74", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T17:00:10", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "73", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T17:15:11", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "73", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T17:30:12", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "74", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T17:45:13", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "75", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T18:00:14", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T18:15:15", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "29", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T18:30:16", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "78", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T18:45:17", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T19:00:18", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T19:15:19", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "78", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T19:30:20", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "75", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T19:45:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "77", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:00:08", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:00:22", "err": "indoor:TypeError('the JSON object must be str, bytes or bytearray, not NoneType')", "wx": {"t": "28", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:12:16", "temp": 26.0, "hum": 56, "co2": 2, "wx": {"t": "28", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:15:23", "temp": 26.0, "hum": 57, "co2": 3, "wx": {"t": "28", "rh": "76", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:30:24", "temp": 27.0, "hum": 54, "co2": 1, "wx": {"t": "28", "rh": "78", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T20:45:25", "temp": 26.0, "hum": 55, "co2": 2, "wx": {"t": "28", "rh": "79", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T21:00:26", "temp": 27.0, "hum": 53, "co2": 2, "wx": {"t": "28", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T21:15:28", "temp": 26.0, "hum": 52, "co2": 3, "wx": {"t": "28", "rh": "80", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T21:30:29", "temp": 27.0, "hum": 50, "co2": 1, "wx": {"t": "27", "rh": "81", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T21:45:30", "temp": 27.0, "hum": 51, "co2": 4, "wx": {"t": "27", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T22:00:31", "temp": 26.0, "hum": 49, "co2": 4, "wx": {"t": "27", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T22:15:32", "temp": 27.0, "hum": 55, "co2": 2, "wx": {"t": "27", "rh": "82", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T22:30:33", "temp": 26.0, "hum": 52, "co2": 2, "wx": {"t": "27", "rh": "83", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T22:45:34", "temp": 26.0, "hum": 49, "co2": 3, "wx": {"t": "27", "rh": "84", "text": "多云", "rain": "0.0"}}
+{"ts": "2026-09-01T23:00:35", "temp": 26.0, "hum": 48, "co2": 4, "wx": {"t": "27", "rh": "84", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T23:15:37", "temp": 27.0, "hum": 51, "co2": 5, "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T23:30:39", "temp": 26.0, "hum": 47, "co2": 5, "wx": {"t": "27", "rh": "85", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-01T23:45:41", "temp": 26.0, "hum": 46, "co2": 4, "wx": {"t": "27", "rh": "86", "text": "阴", "rain": "0.0"}}
+{"ts": "2026-09-02T00:00:42", "temp": 26.0, "hum": 51, "co2": 4, "wx": {"t": "27", "rh": "86", "text": "阴", "rain": "0.0"}}

@@ -68,6 +68,18 @@ def load_watch_log():
         return ""
 
 
+def load_learned_offset():
+    """自学习偏移 temp_cooling_adj：长期钉在 ±边界 = 学习失效信号（v8.33 审计）。"""
+    p = os.path.join(BASE, "ac_learned.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        return d.get("adjusted_thresholds", {}).get("temp_cooling", 0)
+    except Exception:
+        return None
+
+
 def is_after_fix(cycle):
     """按 end_ts 判断周期是否属于 v8.12 修复后。"""
     ts = cycle.get("end_ts") or cycle.get("start_ts") or ""
@@ -247,12 +259,18 @@ def main():
         else:
             print("\n  → 结论：❌ 启停未下降，修复未达预期，需重查判据")
 
+    _adj = load_learned_offset()
+    if _adj is not None:
+        flag = "🔴 学习可能失效" if abs(_adj) >= 2 else ("🟡 学习中" if _adj else "✅ 中性")
+        print(f"\n自学习偏移 temp_cooling_adj = {_adj}（{flag}）")
+
     if "--snapshot" in sys.argv:
         snap = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "before": rows[0] if rows[0]["n"] else None,
             "after": rows[1] if rows[1]["n"] else None,
             "f1_off_total": f1_off,
+            "temp_cooling_adj": load_learned_offset(),
             "v821_before": r21[0] if r21[0]["n"] else None,
             "v821_after": r21[1] if r21[1]["n"] else None,
         }

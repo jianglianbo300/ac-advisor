@@ -1,5 +1,16 @@
 {
-  "manual_actions": [],
+  "manual_actions": [
+    {
+      "ts": "2026-08-31T13:47:04",
+      "action": "on",
+      "target": 25,
+      "context": {
+        "temp": 28.0,
+        "hum": 74,
+        "source": "user_command"
+      }
+    }
+  ],
   "learned_prefs": {
     "comfort_temp": 26,
     "max_humidity": 65,
