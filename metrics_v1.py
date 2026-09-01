@@ -47,6 +47,8 @@ def parse_line(line: str) -> Optional[Tuple[datetime, int, Optional[int]]]:
         companion_target = None
     else:
         companion_target = int(companion_t)
+        if companion_target == 0:
+            companion_target = None  # v8.42: miio 失败模式可返回 0；合法设定域 16-30，0 永非真值
     return ts, state_target, companion_target
 
 
