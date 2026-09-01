@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """v8.23 持续高温判据 — 回归测试。
 
+  ┌─ 2026-09-01 审计修复（pi 线）─────────────────────────────
+  │ v8.38 移除 sustained 闸门（ac_watch.py:730 注释），v8.39 合并
+  │ 提交 fbe7f67 删除死函数 sustained_above 并同步了 selftest，
+  │ 但漏更新本文件 → 自 2026-08-30 起每次跑批 AttributeError 假红。
+  │ 修复口径（修测试不改产品）：
+  │   1. [1] 节 sustained_above 函数级用例 → 改为 hasattr 守卫跳过
+  │      （函数已设计性移除，断言对象不存在）；
+  │   2. decide(..., sustained=...) 关键字 → 删除（签名已无此参）；
+  │   3. [2]-[6] 节断言语义保持 v8.31 后新语义（无持续闸门）不变。
+  └──────────────────────────────────────────────
+
 用户反馈序列（2026-08-19 凌晨）：
   27.0°C 时："现在热了是不没给我开空调啊"
   降到 26.0°C 后："其实刚才也不太热"
@@ -60,67 +71,45 @@ print("=" * 70)
 print("v8.23 持续高温判据 — 回归测试")
 print("=" * 70)
 
-# ── 1. sustained_above 判定 ──
-print("\n[1] 持续判定函数")
+# ── 1. 持续判定（v8.39 起函数已移除，仅存常量检查） ──
+print("\n[1] 持续判定函数（v8.39 移除后仅存常量）")
 R_.check("常量 SUSTAIN_MIN 存在", hasattr(W, "SUSTAIN_MIN"))
 R_.check("常量 SUSTAIN_URGENT_T 存在", hasattr(W, "SUSTAIN_URGENT_T"))
-
-r = W.sustained_above(hist((2, 26.0), (0, 27.0)), 27.0, 10, NOW.isoformat())
-R_.check("刚碰到线（跨度仅 2min）→ None（数据不足）", r is None, f"got={r}")
-
-r = W.sustained_above(
-    hist((14, 27.0), (12, 27.0), (10, 27.0), (8, 27.0),
-         (6, 27.0), (4, 27.0), (2, 27.0), (0, 27.0)),
-    27.0, 10, NOW.isoformat())
-R_.check("持续 14min 全在线上 → True", r is True, f"got={r}")
-
-r = W.sustained_above(
-    hist((14, 27.0), (12, 27.0), (8, 26.0), (6, 27.0),
-         (4, 27.0), (2, 27.0), (0, 27.0)),
-    27.0, 10, NOW.isoformat())
-R_.check("窗口内 8min 前掉到 26 → False", r is False, f"got={r}")
-
-r = W.sustained_above({"temp_history": []}, 27.0, 10, NOW.isoformat())
-R_.check("空历史 → None", r is None, f"got={r}")
-
-r = W.sustained_above({}, 27.0, 10, NOW.isoformat())
-R_.check("无 temp_history 字段 → None", r is None, f"got={r}")
-
-# 窗口外的低温不影响判定（只看最近 need_min）
-r = W.sustained_above(
-    hist((30, 22.0), (14, 27.0), (12, 27.0), (10, 27.0),
-         (8, 27.0), (6, 27.0), (4, 27.0), (2, 27.0), (0, 27.0)),
-    27.0, 10, NOW.isoformat())
-R_.check("窗口外(30min前)的低温不影响 → True", r is True, f"got={r}")
+if hasattr(W, "sustained_above"):
+    # 回退防护：若函数被恢复，用 getattr 触发 AssertionError（历史断言见文件头修复口径）
+    raise AssertionError("sustained_above 已于 v8.39 (fbe7f67) 移除，不应回归；若有意恢复请同步本测试 [1] 节")
+else:
+    print("  [SKIP] sustained_above 已于 v8.39 (fbe7f67) 设计性移除，函数级用例跳过")
 
 # ── 2. 夜间启动受持续判据约束 ──
 print("\n[2] 夜间启动（用户实际场景）")
 
 
-def night(temp, sustained, hum=50, ah=13.0):
+def night(temp, hum=50, ah=13.0):
+    # 2026-09-01 审计：decide() 签名已无 sustained 参数（v8.39 移除），删关键字
     return W.decide(temp=temp, hum=hum, running=False, since_on=None, since_off=99,
                     is_night=True, compressor=None, current_target=26, ah=ah,
-                    compressor_run_min=None, night_comp_starts=[], sustained=sustained)
+                    compressor_run_min=None, night_comp_starts=[])
 
 
 # v8.33 审计注：d464391(v8.31) 有意移除夜间 sustained 判据（夜间短循环已由
 # MIN_OFF 15min + 每小时启停上限防护；sustained 过滤会把缓慢夜间升温卡死在 27°C，
 # 见 ac_watch.py decide() 内注释）。本组断言随新语义更新：
 # 「短暂触碰」与「持续」现在都放行，未持续/数据不足不再有区别。
-m, t, reason = night(27.0, False)
+m, t, reason = night(27.0)
 R_.check("27°C 未持续 → 开机（v8.31 移除夜间持续闸门后的新语义）", m == "cooling", f"got={m} {reason}")
-m, t, reason = night(27.0, True)
+m, t, reason = night(27.0)
 R_.check("27°C 持续 10min → 开机（语义不变）", m == "cooling", f"got={m} {reason}")
 R_.check(f"目标 {t}°C 低于室温 ≥2°C", t is not None and 27.0 - t >= 2, f"target={t}")
-m, _, _ = night(27.0, None)
+m, _, _ = night(27.0)
 R_.check("数据不足 → 放行开机（fail-open 不因缺数据不制冷）", m == "cooling", f"got={m}")
 
 # ── 3. 紧急过热不等持续时长 ──
 print("\n[3] 明确过热的紧急放行")
-m, _, reason = night(W.SUSTAIN_URGENT_T, False)
+m, _, reason = night(W.SUSTAIN_URGENT_T)
 R_.check(f"{W.SUSTAIN_URGENT_T}°C + 未持续 → 仍开机（明确过热）",
          m == "cooling", f"got={m} {reason}")
-m, _, _ = night(W.SUSTAIN_URGENT_T - 0.1, False)
+m, _, _ = night(W.SUSTAIN_URGENT_T - 0.1)
 R_.check(f"{W.SUSTAIN_URGENT_T - 0.1}°C + 未持续 → 开机（夜间无持续闸门，v8.31 起）",
          m == "cooling", f"got={m}")
 
@@ -128,22 +117,24 @@ R_.check(f"{W.SUSTAIN_URGENT_T - 0.1}°C + 未持续 → 开机（夜间无持�
 print("\n[4] 白天启动")
 
 
-def day(temp, sustained, hum=50, ah=13.0):
+def day(temp, hum=50, ah=13.0):
+    # 2026-09-01 审计：同 night()，删已失效的 sustained 关键字
     return W.decide(temp=temp, hum=hum, running=False, since_on=None, since_off=99,
                     is_night=False, compressor=None, current_target=26, ah=ah,
-                    compressor_run_min=None, night_comp_starts=[], sustained=sustained)
+                    compressor_run_min=None, night_comp_starts=[])
 
 
-m, _, _ = day(27.0, False)
-R_.check("白天 27°C 短暂触碰 → 不开", m is None, f"got={m}")
-m, _, _ = day(27.0, True)
+m, _, _ = day(27.0)
+# v8.31/38 移除白天 sustained 闸门后，27°C 短触即开机（同 selftest ac_watch.py:1393-1401 断言语义）
+R_.check("白天 27°C 短触 → 开机（v8.31 移除白天持续闸门后的新语义）", m == "cooling", f"got={m}")
+m, _, _ = day(27.0)
 R_.check("白天 27°C 持续 → 开机", m == "cooling", f"got={m}")
-m, _, _ = day(29.5, False)
+m, _, _ = day(29.5)
 R_.check("白天 29.5°C 未持续 → 紧急放行", m == "cooling", f"got={m}")
 
 # ── 5. 闷热不受持续时长约束（闷是即时体感） ──
 print("\n[5] 高湿闷热免等待")
-m, t, reason = day(27.0, False, hum=A.HUM_DEHUMID_ON, ah=17.0)
+m, t, reason = day(27.0, hum=A.HUM_DEHUMID_ON, ah=17.0)
 R_.check(f"RH={A.HUM_DEHUMID_ON}% 闷热 + 未持续 → 仍开除湿",
          m == "cooling", f"got={m} {reason}")
 R_.check("走的是除湿分支", "除湿" in str(reason), f"got={reason}")
@@ -153,7 +144,6 @@ print("\n[6] 关机路径不受影响")
 m, _, reason = W.decide(
     temp=23.0, hum=70, running=True, since_on=5, since_off=None, is_night=True,
     compressor="compressor", current_target=25, ah=18.0, compressor_run_min=3,
-    sustained=False,
 )
 R_.check("过冷逃生门仍无条件关机", m == "off", f"got={m} {reason}")
 
