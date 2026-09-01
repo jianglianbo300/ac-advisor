@@ -60,7 +60,7 @@ def make_env(indoor, outdoor, mode=None, sensor_off_since=None):
     A.load_state = lambda: state
     A.save_state = lambda s: calls["saved"].append(dict(s))
     A.apply_and_commit = lambda m, t, s, ts, **kw: calls["apply"].append((m, t))
-    A.reconcile_state = lambda s, ts: None
+    A.reconcile_state = lambda s, ts, load_power=None: None  # v8.43: 签名加 load_power
     A.read_ac_power = lambda *a, **k: None
     A.ac_control_init = lambda *a, **k: None
 

@@ -625,8 +625,78 @@ def ac_apply(new_mode, target_temp=None):
             except Exception as e: return {"status": "failed", "action": "关机", "reason": f"power_off_failed: {e}"}
     return {"status": "action" if act else "no_action", "action": "，".join(act), "reason": ""}
 
-def reconcile_state(state, now_ts):
+def _anchor_oscillating(state, now_ts, window_min=20):
+    """v8.43b: 锚点震荡检测（幻象周期识别）。
+
+    判据：20 分钟内存在①幻象门控标记 _phantom_gate_at（功率门控静默翻
+    转时打）或②任一反向手动锚点 → 本次翻转判为幻象周期一环。
+    背景：功率断表（load_power=None）窗口会回退 v8.36 原语义打锚点，而
+    伴侣待机幻象翻转间隔实测 12-14 分钟（2026-09-01 全天 81+ 次）——真用户
+    不会每 12 分钟手动开关空调几小时。首个幻象翻转仍会打锚点（不可区分），
+    但周期后续翻转全部被静默，锚点量从 ~40/天降到每震荡簇 1 个。
+    """
+    try:
+        now = datetime.fromisoformat(now_ts) if isinstance(now_ts, str) else now_ts
+        for key in ("_phantom_gate_at", "manual_on_at", "manual_off_at"):
+            t = state.get(key)
+            if not t: continue
+            dt = datetime.fromisoformat(t) if isinstance(t, str) else t
+            if (now - dt).total_seconds() < window_min * 60:
+                return True
+        return False
+    except Exception:
+        return False
+
+def reconcile_state(state, now_ts, load_power=None):
+    """v8.43: 增加 load_power 门控参数（P0 修复：手动锚点震荡循环）。
+
+    背景（2026-09-01 审计实证）：空调伴侣 is_on 是它对空调状态的 IR 信念，
+    待机 1W 时随自身恒温循环/红外丢失自行翻转（当天 81+ 次）。reconcile
+    无条件把 socket 翻转当用户手动操作 → 打手动锚点 + 喂 _learn_from_manual
+    假样本 → comfort_weight 被推满 1.0、decide() 全天被锚点短路饥饿
+    （545/591 条日志），学习回路零进账。
+
+    门控原则：**夹钳功率 = 物理现实 > 伴侣 is_on = IR 信念**；
+    功率不可测时回退 v8.36 原语义（保守不误伤真手动）。
+
+    「关」翻转（socket=off 且 state 运行态）：
+    - load_power >50W → 幻象关机：维持运行态不动，等下一轮一致再判；
+    - 当前/上一 tick 均无压缩机级活动（≤50W/None）→ 信念漂移：静默对账
+      mode=off（空调确实没在制冷），不打 manual_off_at、不喂学习
+      （旧语义每次翻下压制自动启动 12 分钟 = 震荡主源）；
+    - 上一 tick 有压缩机活动（prev>50W）且当前功率不可测 → 真手动关机：
+      原语义打锚点+喂学习。
+    「开」翻转（socket=on 且 state 非运行态）：
+    - load_power ≤50W → 待机幻象/纯风扇级：**完全不动 state**（不翻 mode、
+      不打锚点、不喂学习）——翻 mode=cooling 反而挡住 H2 接管（H2 要求
+      state 非运行态）；真压缩机启动（>50W）后 H2 按双 tick 持久化正常接管；
+    - 功率不可测或 >50W → v8.36 原语义（真手动开机）。
+    """
+    # ── v8.43: 「关」翻转门控（功率为准，静默翻下不打锚点） ──
     if AC_SOCKET == "off" and state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
+        if load_power is not None and load_power > 50:
+            # 幻象关机：伴侣信念说关但夹钳实测仍在压缩机级（>50W）。
+            # 不翻 mode、不打锚点、不喂学习——维持运行态等下一轮再判。
+            state["_phantom_gate_at"] = now_ts
+            return
+        prev = state.get("_prev_power")
+        _activity = (prev is not None and prev > 50)
+        if not _activity:
+            # 静默翻下：当前无功率读数或 ≤50W，且上一 tick 也无压缩机活动
+            # → 这次「关」没有打断任何真实运行，是伴侣信念漂移（红外丢失
+            # 已知模式）。只对账 mode=off（物理现实），不打锚点不喂学习。
+            state["mode"] = "off"; state["last_off_at"] = now_ts; state["run_start"] = None
+            state.pop("_system_off_at", None)
+            state["_phantom_gate_at"] = now_ts
+            return
+        # 上一 tick 有压缩机活动而当前功率不可测 → 按真手动关机处理（原语义）
+        # v8.43b: 仅功率断表（None）时用震荡检测辅助判断；功率=1W 且上一 tick
+        # 有活动是真实关机转变（物理证据充分），直接原语义。
+        if load_power is None and _anchor_oscillating(state, now_ts):
+            state["mode"] = "off"; state["last_off_at"] = now_ts; state["run_start"] = None
+            state.pop("_system_off_at", None)
+            state["_phantom_gate_at"] = now_ts
+            return
         sys_off = state.get("_system_off_at"); is_system_off = False
         if sys_off:
             try:
@@ -647,7 +717,21 @@ def reconcile_state(state, now_ts):
             _learn_from_manual(state, now_ts)
         return
     if state.get("_system_off_at"): state.pop("_system_off_at", None)
+    # ── v8.43: 「开」翻转门控 ──
     if AC_SOCKET == "on" and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        if load_power is not None and load_power <= 50:
+            # 待机幻象：伴侣信念说开但夹钳实测 ≤50W（纯待机 1W 恒温循环翻上）。
+            # 完全不动 state：不翻 mode（翻了会挡 H2 接管）、不打锚点、不喂学习。
+            # 真压缩机启动（>50W）后 H2 按双 tick 持久化+幻影防护正常接管。
+            state["_phantom_gate_at"] = now_ts
+            return
+        # v8.43b: 仅功率断表（None）时用震荡检测辅助判断；功率>50W 是真运行的
+        # 物理铁证，永远原语义（真手动开机立即锚点，不被幻象历史误杀）。
+        if load_power is None and _anchor_oscillating(state, now_ts):
+            state["_phantom_gate_at"] = now_ts
+            return
+        # 功率不可测且无震荡迹象，或功率 >50W（真运行）→ v8.36 原语义：
+        # 打锚点 + 喂学习（真用户手动开机，尊重意图）。
         state["manual_on_at"] = now_ts; state["mode"] = "cooling"
         state["run_start"] = now_ts; state["_fake_run_count"] = 0
         _learn_from_manual(state, now_ts)
@@ -731,7 +815,9 @@ def read_ac_power(timeout=4.0):
         st = d.status(); AC_SOCKET = "on" if st.is_on else "off"; AC_MEASURED_W = None
         # v8.42: 顺手读伴侣设定温度（回声字段，仅镜像我方发射的命令；用户改温不更新——2026-08-29 实验证实）
         AC_COMPANION_TARGET = getattr(st, "target_temperature", None)
-        if st.is_on and st.load_power and st.load_power > 0:
+        # v8.43: 功率读数不再受 is_on 门控——待机 1W 也是幻象门控的判据输入。
+        # 旧逻辑 is_on=False 时 AC_MEASURED_W 恒 None，reconcile 功率门控会被架空回退旧语义。
+        if st.load_power and st.load_power > 0:
             AC_MEASURED_W = round(st.load_power); return AC_MEASURED_W
     except: pass
     return None

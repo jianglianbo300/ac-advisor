@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-空调自动监控 v8.42 — 每 2 分钟自动环（Hermes cron: */2 * * *）
+空调自动监控 v8.43 — 每 2 分钟自动环（Hermes cron: */2 * * *）
 
-v8.42:
- - companion_target 入日志（与功率同轮读，零开销；回声字段，仅镜像我方发射命令——2026-08-29 实验证实用户改温不更新）
- - 双指标注册：26 存活 v1.0（VI-down 判决）+ 回声偏差 v1.0（红外通道健康度）
- - H2: 第七用例（分歧消失清键，stale-key 防残留）+ 接管时采纳 companion_target
- - log_decision 加 reason 参数支持决策归因
+v8.43:
+ - P0 修复：reconcile_state 手动锚点震荡循环——伴侣 is_on 是 IR 信念非物理现实，
+   待机 1W 恒温循环全天翻转 81+ 次，旧语义每次翻转打手动锚点+喂假学习样本
+   → comfort_weight 被推满 1.0、decide() 全天饥饿（545/591 条日志实证）。
+   修法：夹钳功率门控（功率=物理现实 > is_on=IR信念），功率可测时静默对账
+   不打锚点不喂学习；功率不可测回退 v8.36 原语义。
+ - read_ac_power 不再受 is_on 门控（待机 1W 也作为门控判据输入，否则门控被架空）
+ - H2 _socket_on_flag 维持 socket or 功率 双信号（与门控同源），
+   待机幻象被 reconcile 静默处理后不再产生 manual_on_at 锚点干扰 H2。
 """
 
 import json
@@ -18,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.42"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.43"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -775,11 +779,13 @@ def main():
         log("[ERROR] 状态文件损坏，本次 tick fail-safe 跳过（不执行开/关）")
         print("ac_watch: 状态文件损坏，fail-safe 跳过（不执行开/关）")
         return
-    A.reconcile_state(state, now_ts)
+    A.reconcile_state(state, now_ts, load_power=load_power)  # v8.43: 功率门控防手动锚点震荡
 
     # ── v8.40 H2: 非托管运行接管（socket=on 而 state 无运行态）──
     _TAKEOVER_KEY = "_unmanaged_run_since"
-    _socket_on_flag = socket == "on" or (load_power is not None and load_power > FAN_ONLY_POWER_MAX)
+    # v8.43: 功率优先——伴侣 socket=is_on 是 IR 信念，待机 1W 时会幻象翻上，
+    # 裸 socket 信号会让 H2 吞下幻象接管（锚点震荡的 H2 翼）。真运行必 >50W。
+    _socket_on_flag = load_power is not None and load_power > FAN_ONLY_POWER_MAX
     _adopt, _clear = _should_adopt_unmanaged(state, _socket_on_flag, load_power, now_dt)
     if _clear:
         state.pop(_TAKEOVER_KEY, None)
