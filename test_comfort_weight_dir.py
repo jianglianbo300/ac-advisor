@@ -55,11 +55,15 @@ def run_manual(mode, pref_log_mode, start_cw):
     """
     with open(pref_path(), "w", encoding="utf-8") as f:
         json.dump({"comfort_weight": start_cw}, f, ensure_ascii=False)
-    log = [{"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": pref_log_mode}
-           for i in range(9)]
-    state = {"rh_history": [["2026-08-29T11:00:00", 62.0]],
-             "user_pref": {"manual_on_log": log},
-             "mode": mode}
+    log = [
+        {"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": pref_log_mode}
+        for i in range(9)
+    ]
+    state = {
+        "rh_history": [["2026-08-29T11:00:00", 62.0]],
+        "user_pref": {"manual_on_log": log},
+        "mode": mode,
+    }
     try:
         A._learn_from_manual(state, "2026-08-29T11:01:00")
     finally:
@@ -71,12 +75,18 @@ def run_manual(mode, pref_log_mode, start_cw):
 try:
     # ── 核心方向 ──
     got = run_manual("cooling", "cooling", 0.2)
-    R_.check("手动开≥3 → comfort_weight 上调（0.2→0.3，更舍得制冷）",
-             got == 0.3, f"got={got}")
+    R_.check(
+        "手动开≥3 → comfort_weight 上调（0.2→0.3，更舍得制冷）",
+        got == 0.3,
+        f"got={got}",
+    )
 
     got = run_manual("off", "off", 0.5)
-    R_.check("手动关≥3 → comfort_weight 下调（0.5→0.4，更省电优先）",
-             got == 0.4, f"got={got}")
+    R_.check(
+        "手动关≥3 → comfort_weight 下调（0.5→0.4，更省电优先）",
+        got == 0.4,
+        f"got={got}",
+    )
 
     # ── 钳位 ──
     got = run_manual("cooling", "cooling", 1.0)
@@ -95,34 +105,87 @@ try:
     # ── 阈值不足 3 条 → 不动 ──
     with open(pref_path(), "w", encoding="utf-8") as f:
         json.dump({"comfort_weight": 0.4}, f, ensure_ascii=False)
-    log = [{"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": "cooling"}
-           for i in range(1)]  # 只有 1 条 on
-    state = {"rh_history": [["2026-08-29T11:00:00", 62.0]],
-             "user_pref": {"manual_on_log": log}, "mode": "off"}
+    log = [
+        {"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": "cooling"}
+        for i in range(1)
+    ]  # 只有 1 条 on
+    state = {
+        "rh_history": [["2026-08-29T11:00:00", 62.0]],
+        "user_pref": {"manual_on_log": log},
+        "mode": "off",
+    }
     A._learn_from_manual(state, "2026-08-29T11:01:00")
     with open(pref_path(), encoding="utf-8") as f:
         got = json.load(f).get("comfort_weight")
     R_.check("on=1/off=1 都不足 3 条 → comfort_weight 不动", got == 0.4, f"got={got}")
 
     # ── 并列 ≥3：on 分支优先（if/elif 顺序，取更 comfort 侧）──
-    got = run_manual("cooling", "off", 0.4)   # 9 off + 1 cooling → on=1? 不成立
+    got = run_manual("cooling", "off", 0.4)  # 9 off + 1 cooling → on=1? 不成立
     # 上面这组实际 on=1 off=9 → 走 off 分支下调：
     R_.check("on=1/off=9 → 走 off 分支下调（0.4→0.3）", got == 0.3, f"got={got}")
 
-    # 真·并列：5 on + 5 off（log 9 条 off + 追加 1 条 cooling = 8/1... 构造 4 off + log 用 state 追加）
+    # 真·净优势：预填 4 off + 5 cooling（9 条），追加 1 条 cooling →
+    # recent10 = off=4, on=6，净差 +2 ≥ 2 → on 分支上调（v8.44 净差语义）。
+    # v8.45 fix: 原用例预填 5 off + 4 cooling，追加后 5/5 净差 0 →「不动」
+    # 才是 v8.44 正确行为，旧断言 0.4→0.5 是 v8.37 优先级语义残留，实为测试算错。
     with open(pref_path(), "w", encoding="utf-8") as f:
         json.dump({"comfort_weight": 0.4}, f, ensure_ascii=False)
-    log = [{"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": m}
-           for i, m in enumerate(["off", "cooling", "off", "cooling",
-                                  "off", "cooling", "off", "cooling", "off"])]
-    # log: off=5, on=4；追加 1 条 cooling → recent10 = off=4, on=6 → on 分支
-    state = {"rh_history": [["2026-08-29T11:00:00", 62.0]],
-             "user_pref": {"manual_on_log": log}, "mode": "cooling"}
+    log = [
+        {"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": m}
+        for i, m in enumerate(
+            [
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "cooling",
+            ]
+        )
+    ]
+    # log: off=4, on=5；追加 1 条 cooling → recent10 = off=4, on=6 → 净差+2 → on 分支
+    state = {
+        "rh_history": [["2026-08-29T11:00:00", 62.0]],
+        "user_pref": {"manual_on_log": log},
+        "mode": "cooling",
+    }
     A._learn_from_manual(state, "2026-08-29T11:01:00")
     with open(pref_path(), encoding="utf-8") as f:
         got = json.load(f).get("comfort_weight")
-    R_.check("on=6/off=4 并列超阈 → on 分支优先上调（0.4→0.5）",
-             got == 0.5, f"got={got}")
+    R_.check("on=6/off=4 净优势 → on 分支上调（0.4→0.5）", got == 0.5, f"got={got}")
+
+    # 真·平局：5 on + 5 off → 净差 0 → v8.44 语义「不动」
+    with open(pref_path(), "w", encoding="utf-8") as f:
+        json.dump({"comfort_weight": 0.4}, f, ensure_ascii=False)
+    log = [
+        {"ts": f"2026-08-29T10:{i:02d}:00", "rh": 62, "mode": m}
+        for i, m in enumerate(
+            [
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "off",
+                "cooling",
+                "off",
+            ]
+        )
+    ]
+    # log: off=5, on=4；追加 1 条 cooling → recent10 = off=5, on=5 → 净差0 → 不动
+    state = {
+        "rh_history": [["2026-08-29T11:00:00", 62.0]],
+        "user_pref": {"manual_on_log": log},
+        "mode": "cooling",
+    }
+    A._learn_from_manual(state, "2026-08-29T11:01:00")
+    with open(pref_path(), encoding="utf-8") as f:
+        got = json.load(f).get("comfort_weight")
+    R_.check("on=5/off=5 平局 → 净差0不动（v8.44 语义）", got == 0.4, f"got={got}")
 finally:
     A.SCRIPT_DIR = _orig_script_dir
 

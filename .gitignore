@@ -67,3 +67,6 @@ pa_rel.json
 _audit_plan_*.py
 _check_conn.py
 _ac_on_now.py
+
+# MiMo Code 本地工具状态（.cron-lock/node_modules，不入库）
+.mimocode/
