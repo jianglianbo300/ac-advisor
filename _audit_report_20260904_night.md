@@ -76,3 +76,15 @@ decide() 被 30 分钟锚点 TTL 短路的窗口有限；comfort_weight 上限 1
 **验证**：`_replay_v848.py` 25/25 分支重放全绿（含今晚 J/K/L 场景精确复刻：铁证锚点+kWh冻结→学习永不入账 / 真实功耗→入账 / 窗口内高功率翻转→震荡拦截）；快测套件 7 文件 156 用例 rc=0；selftest 通过（v8.48 横幅=断言全过）；py_compile ✅。
 **运行时处置**：21:20 复发污染再清（cw 0.6→0.5、清 2 条幻象样本、弹锚点）。**预期效果：comfort_weight 不再被幻象推高；decide() 饥饿只剩每 >35min 间隔的单次首翻（≤30min，假运行熔断 10min 自愈）**。
 **遗留**：观察拍不打 gate 后 `_phantom_gate_at` 仅由确证幻象/静默对账分支写入——审计口径以 `_on_flip_high_at`+`_phantom_gate_at` 两者并读。
+
+## 七、v8.49：H2 接管死代码修复（同夜第二发，commit d2e2172）
+
+**触发**：用户"看看Hermes现在在干嘛，弄的对吗"→ 巡检 21:44-21:54 日志发现真运行 1026W 六个 tick mode=off 无接管。
+
+**根因（git 全史考古）**：`_should_adopt_unmanaged` 纯函数首次目击返回 `(False, False)`（注释"只记录不接管"），**但 main() 自 v8.42 引入 H2 起就从未写 `_unmanaged_run_since` 键**——`_first_seen` 永远 None → 永远首次目击 → `H2 接管自诞生即死代码`。线上 state 无此键、全史 log 无一条"[接管]"佐证。
+
+**今晚实证链**：21:20 幻象锚点(v8.47 代码) → 21:34 翻下 mode=off → 21:44 用户真开空调（1026W，kWh 实涨 0.18）→ 锚点挡 H2（`_no_manual=False`）+ 我 21:46 清锚点后仍不接管（缺键）→ 21:56 关 → 22:00 DP decide() 直接开机（不经 H2）才恢复。损失：6 tick 真运行无周期记账/无监护（幸有 WATCH_MAX_RUN 兜底）。
+
+**修复**：main() 补首次目击写键（仅在 socket_on + state 非运行态 + 无锚点 + 键不存在时；与纯函数 (False,False) 语义精确对齐，不动 adopt 条件）。验证：端到端重放 5/5（R1-R3 复刻今晚 + S 锚点保护语义不变 + T 清键）+ 快测 7 文件 rc=0 + selftest v8.49。
+
+**推论**：v8.48 声明的"真运行 H2 接管兜底"此前实际不存在——本次修复后才真正具备。幻象防护依赖 _phantom_gate_at 双 tick 链 + since_off≥5min，与 H2 修复不冲突。
