@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.46"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.47"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -601,8 +601,15 @@ def decide(
     outdoor_rain=None,
     is_steady_state=False,
     predicted_cool_min=None,
+    sched_override_exempt=False,
 ):
-    """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。"""
+    """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
+
+    v8.47: sched_override_exempt — 调度 override（DP 预冷/谷电预除湿）启动的
+    运行周期在 TTL 内豁免夜间 AH 达标停机门（09-04 审计 P2①：预除湿周期
+    12 分钟即被 AH 门误杀，预除湿语义完全失效）。由 main() 依据
+    state["_override_run_at"] 与 run_start 的配对关系计算后传入。
+    """
 
     learned = A.load_learned()
     adj = learned.get("adjusted_thresholds", {}).get("temp_cooling", 0)
@@ -694,7 +701,16 @@ def decide(
             )
 
         if is_night:
-            if ah is not None and ah <= NIGHT_STOP_AH:
+            # v8.47 P2修复①: 调度 override（预除湿/DP预冷）运行期豁免 AH 停机门。
+            # 9-03 23:28 实录：谷电预湿开机 12 分钟后被本门关掉（AH=13.6 达标），
+            # 预除湿「提前把湿度打下来」的语义整个失效。豁免由 main() 按
+            # _override_run_at 与 run_start 配对计算，TTL 180min；WATCH_MAX_RUN
+            # 压缩机保护在本门之前，不受豁免影响。
+            if (
+                ah is not None
+                and ah <= NIGHT_STOP_AH
+                and not sched_override_exempt
+            ):
                 temp_reached = (
                     current_target is None
                     or temp <= current_target + DAY_TEMP_REACHED_SLACK
@@ -1089,7 +1105,9 @@ def main():
         return
 
     if wx_fallback_used:
-        log("传感器不可达但有天气预报兜底，继续控制（保留断连计时）")
+        log(
+            "传感器不可达但有天气预报兜底（兜底温度不开新cycle，运行中周期照常监护，保留断连计时）"
+        )
         if state.get("_sensor_off_since") is None:
             state["_sensor_off_since"] = now_ts
     else:
@@ -1414,6 +1432,27 @@ def main():
                     "target": _schedule_target,
                     "reason": _schedule_reason,
                 }
+    # v8.47 P2修复①: 调度 override 运行期豁免夜间 AH 停机门的配对计算——
+    # override 打开的周期（run_start ≈ _override_run_at）在 180min TTL 内豁免；
+    # 之后正常开的新周期（run_start 晚于标记）不豁免，AH 门照常生效。
+    _override_exempt = False
+    _ovr = state.get("_override_run_at")
+    if _ovr:
+        try:
+            _ovr_dt = (
+                datetime.fromisoformat(_ovr) if isinstance(_ovr, str) else _ovr
+            )
+            _rs = state.get("run_start")
+            _rs_dt = (
+                datetime.fromisoformat(_rs) if isinstance(_rs, str) else _rs
+            )
+            if (now_dt - _ovr_dt).total_seconds() < 180 * 60 and (
+                _rs_dt is None or _rs_dt <= _ovr_dt
+            ):
+                _override_exempt = True
+        except Exception:
+            pass
+
     new_mode, target, reason = decide(
         temp,
         hum,
@@ -1437,7 +1476,21 @@ def main():
         outdoor_rain=_outdoor_rain,
         is_steady_state=False,
         predicted_cool_min=_predicted_cool_min,
+        sched_override_exempt=_override_exempt,
     )
+
+    # v8.47 P2修复②(09-04审计): 室外兜底温度不开新 cycle。传感器离线期间
+    # temp=室外缓存恒定值（9-04 11:14/11:30 实录 30.53 恒定，开出 target=28
+    # 垃圾周期，压缩机 0 分钟数分钟即中止）。已在运行中的周期不受影响
+    # （假运行熔断/保守关机等安全网照常监护）。
+    if wx_fallback_used and not running:
+        log(
+            f"无动作·兜底温度不开新cycle（传感器离线，室外缓存T={temp}°C不作开机依据）"
+        )
+        print("ac_watch: 兜底温度不开新cycle · 保持现状")
+        A.save_state(state)
+        evaluate(state, now_ts)
+        return
 
     # v8.29 谷电预除湿：用预报湿度判断是否需要预除湿
     _dehumidify = False
@@ -1493,6 +1546,9 @@ def main():
         # v8.28 最优调度覆盖
         if _schedule_override:
             new_mode, target, reason = "cooling", _schedule_target, _schedule_reason
+            # v8.47: 打 override 运行标记——夜间 AH 停机门豁免的配对依据
+            # （TTL 180min，run_start 晚于本标记的正常周期不受豁免）
+            state["_override_run_at"] = now_ts
             log(f"执行最优调度预冷：target={target}°C")
         else:
             log(
