@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.48"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.49"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -1043,6 +1043,19 @@ def main():
     _adopt, _clear = _should_adopt_unmanaged(state, _socket_on_flag, load_power, now_dt)
     if _clear:
         state.pop(_TAKEOVER_KEY, None)
+    elif (
+        not _adopt
+        and _socket_on_flag
+        and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert")
+        and state.get("manual_on_at") is None
+        and _TAKEOVER_KEY not in state
+    ):
+        # v8.49 fix: 首次目击记录分支缺失——自 v8.42 起纯函数返回
+        # (False, False) 意图"只记录不接管"，但 main() 从未写键 →
+        # _first_seen 永远 None → 永远首次目击 → H2 接管自诞生即死代码。
+        # 实证 2026-09-04 21:48-21:54：真运行 1026W 六个 tick 无接管，
+        # 因 21:20 幻象锚点挡住后（锚点清除）仍因缺键不接管。
+        state[_TAKEOVER_KEY] = now_ts
     if _adopt:
         # v8.42: 接管时采纳 companion_target（回声字段，≤2min 前的最新命令，严格优于陈旧 state 值）
         _adopted_target = A.AC_COMPANION_TARGET or state.get("target_temp")
