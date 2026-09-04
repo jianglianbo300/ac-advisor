@@ -1030,9 +1030,16 @@ def reconcile_state(state, now_ts, load_power=None):
       state 非运行态）；真压缩机启动（>50W）后 H2 按双 tick 持久化正常接管；
     - v8.46: 打锚点前要求**压缩机级负载证据**——连续两个 tick >50W（≤7min
       间隔）或本 tick >300W；仅一次 50W<p≤300W 先观察一拍（打
-      _phantom_gate_at，不动 state），下一 tick 复核；
+      _on_flip_high_at，不动 state），下一 tick 复核；
     - 功率不可测（None）→ v8.36 原语义打锚点，但学习喂入**延迟 10 分钟**
       做 kWh 功耗验证（v8.46 修复③：幻象锚点零功耗，不入账）。
+    - v8.48（09-04 晚审计 P0 三发）：①学习喂入统一延迟验证——功率铁证
+      路径不再立即入账，与断表路径一律走 _pending_manual_on_learn
+      （10min kWh ≥0.005 核验）；②震荡检测扩容到全部路径——伴侣
+      load_power 与 is_on 同源（IR信念/瞬时读数），幻象翻转窗口能拿到
+      高功率瞬时值穿透 v8.46「铁证」（实证：kWh今冻结仍打出4锚点+4次
+      立即学习，comfort_weight 0.5→0.8）；③观察一拍不再打
+      _phantom_gate_at（避免自设标记误拦双tick证据链）。
     """
     # ── v8.46 修复③: 延迟学习验证——断表窗口的手动开锚点 10 分钟后核对
     # kWh 增量：<0.005 = 幻象锚点（压缩机零出力）不入账；≥0.005 或电量
@@ -1168,13 +1175,15 @@ def reconcile_state(state, now_ts, load_power=None):
             if _strong_pair:
                 state.pop("_on_flip_high_at", None)  # 证据链已消费
             else:
+                # v8.48 修复③: 观察一拍只打 _on_flip_high_at，不再打
+                # _phantom_gate_at——后者是 _anchor_oscillating 的标记，
+                # 观察拍自设标记会误拦下一 tick 的双tick证据链。
                 state["_on_flip_high_at"] = now_ts
-                state["_phantom_gate_at"] = now_ts
                 return
-        # v8.43b: 仅功率断表（None）时用震荡检测辅助判断（v8.46 修复②: 窗口
-        # 20→35min，覆盖实测 12-24 分钟幻象周期）；>300W 或连续两 tick>50W
-        # 是真运行的物理铁证，直接走下方锚点。
-        if load_power is None and _anchor_oscillating(state, now_ts):
+        # v8.48 修复②: 震荡检测扩容到全部路径（原仅 None 路径）。
+        # 幻象带功率读数时 v8.46 的「铁证」判据会被穿透，震荡窗口
+        # （35min）内任何来源的开翻转一律静默；真运行由 H2 接管兜底。
+        if _anchor_oscillating(state, now_ts):
             state.pop("_on_flip_high_at", None)
             state["_phantom_gate_at"] = now_ts
             return
@@ -1183,16 +1192,14 @@ def reconcile_state(state, now_ts, load_power=None):
         state["mode"] = "cooling"
         state["run_start"] = now_ts
         state["_fake_run_count"] = 0
-        if load_power is None:
-            # v8.46 修复③: 断表窗口打的锚点学习喂入延迟 10 分钟做 kWh 功耗
-            # 验证（幻象锚点零功耗不入账）；锚点与 state 对账照常，正确性由
-            # H2 接管/假运行熔断兜底。有功率铁证时保持立即学习（旧行为）。
-            state["_pending_manual_on_learn"] = {
-                "ts": now_ts,
-                "kwh": state.get("estimated_kwh"),
-            }
-        else:
-            _learn_from_manual(state, now_ts)
+        # v8.48 修复①: 学习喂入统一延迟验证——功率铁证路径不再立即入账。
+        # 幻象功率读数与 is_on 同源，可穿透 v8.46「铁证」（09-04 晚实证:
+        # kWh今冻结仍 4 锚点+4 次立即学习，comfort_weight 0.5→0.8）；
+        # 唯一不可伪造的物理现实是 kWh 增量，真压缩机 10min 必过 0.005 闸。
+        state["_pending_manual_on_learn"] = {
+            "ts": now_ts,
+            "kwh": state.get("estimated_kwh"),
+        }
 
 
 def verify_socket():
