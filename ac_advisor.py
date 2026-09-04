@@ -979,15 +979,17 @@ def ac_apply(new_mode, target_temp=None):
     }
 
 
-def _anchor_oscillating(state, now_ts, window_min=20):
-    """v8.43b: 锚点震荡检测（幻象周期识别）。
+def _anchor_oscillating(state, now_ts, window_min=35):
+    """v8.43b: 锚点震荡检测（幻象周期识别）。v8.46: 窗口 20→35min。
 
-    判据：20 分钟内存在①幻象门控标记 _phantom_gate_at（功率门控静默翻
+    判据：35 分钟内存在①幻象门控标记 _phantom_gate_at（功率门控静默翻
     转时打）或②任一反向手动锚点 → 本次翻转判为幻象周期一环。
     背景：功率断表（load_power=None）窗口会回退 v8.36 原语义打锚点，而
-    伴侣待机幻象翻转间隔实测 12-14 分钟（2026-09-01 全天 81+ 次）——真用户
-    不会每 12 分钟手动开关空调几小时。首个幻象翻转仍会打锚点（不可区分），
-    但周期后续翻转全部被静默，锚点量从 ~40/天降到每震荡簇 1 个。
+    伴侣待机幻象翻转间隔实测 12-14 分钟（2026-09-01 全天 81+ 次）；2026-09-04
+    审计再证：翻转间隔拉长到 16-24 分钟即可漏过 20min 窗口（今晨 9 次幻象
+    「手动开」全部入账，comfort_weight 被再次推满 1.0）——35min 覆盖实测
+    12-24 分钟幻象周期。真用户不会每十几分钟手动开关空调几小时。首个幻象
+    翻转仍可能打锚点（不可区分），但周期后续翻转全部被静默。
     """
     try:
         now = datetime.fromisoformat(now_ts) if isinstance(now_ts, str) else now_ts
@@ -1026,8 +1028,37 @@ def reconcile_state(state, now_ts, load_power=None):
     - load_power ≤50W → 待机幻象/纯风扇级：**完全不动 state**（不翻 mode、
       不打锚点、不喂学习）——翻 mode=cooling 反而挡住 H2 接管（H2 要求
       state 非运行态）；真压缩机启动（>50W）后 H2 按双 tick 持久化正常接管；
-    - 功率不可测或 >50W → v8.36 原语义（真手动开机）。
+    - v8.46: 打锚点前要求**压缩机级负载证据**——连续两个 tick >50W（≤7min
+      间隔）或本 tick >300W；仅一次 50W<p≤300W 先观察一拍（打
+      _phantom_gate_at，不动 state），下一 tick 复核；
+    - 功率不可测（None）→ v8.36 原语义打锚点，但学习喂入**延迟 10 分钟**
+      做 kWh 功耗验证（v8.46 修复③：幻象锚点零功耗，不入账）。
     """
+    # ── v8.46 修复③: 延迟学习验证——断表窗口的手动开锚点 10 分钟后核对
+    # kWh 增量：<0.005 = 幻象锚点（压缩机零出力）不入账；≥0.005 或电量
+    # 不可测（None）时保守入账（保留旧行为，不误伤真手动）。
+    _pml = state.get("_pending_manual_on_learn")
+    if _pml:
+        try:
+            _pt = (
+                datetime.fromisoformat(_pml["ts"])
+                if isinstance(_pml["ts"], str)
+                else _pml["ts"]
+            )
+            _now = (
+                datetime.fromisoformat(now_ts)
+                if isinstance(now_ts, str)
+                else now_ts
+            )
+            _due = (_now - _pt).total_seconds() >= 600
+        except Exception:
+            _due = True
+        if _due:
+            state.pop("_pending_manual_on_learn", None)
+            _k0 = _pml.get("kwh")
+            _k1 = state.get("estimated_kwh")
+            if _k0 is None or _k1 is None or (_k1 - _k0) >= 0.005:
+                _learn_from_manual(state, _pml["ts"])
     # ── v8.43: 「关」翻转门控（功率为准，静默翻下不打锚点） ──
     if AC_SOCKET == "off" and state.get("mode") in (
         "cooling",
@@ -1096,7 +1127,7 @@ def reconcile_state(state, now_ts, load_power=None):
         return
     if state.get("_system_off_at"):
         state.pop("_system_off_at", None)
-    # ── v8.43: 「开」翻转门控 ──
+    # ── v8.43→v8.46: 「开」翻转门控 ──
     if AC_SOCKET == "on" and state.get("mode") not in (
         "cooling",
         "dehumid",
@@ -1106,20 +1137,62 @@ def reconcile_state(state, now_ts, load_power=None):
             # 待机幻象：伴侣信念说开但夹钳实测 ≤50W（纯待机 1W 恒温循环翻上）。
             # 完全不动 state：不翻 mode（翻了会挡 H2 接管）、不打锚点、不喂学习。
             # 真压缩机启动（>50W）后 H2 按双 tick 持久化+幻影防护正常接管。
+            # v8.46: 低功率读数同时打断「连续两 tick 高功率」证据链。
+            state.pop("_on_flip_high_at", None)
             state["_phantom_gate_at"] = now_ts
             return
-        # v8.43b: 仅功率断表（None）时用震荡检测辅助判断；功率>50W 是真运行的
-        # 物理铁证，永远原语义（真手动开机立即锚点，不被幻象历史误杀）。
+        # v8.46 修复①（2026-09-04 审计）: 打锚点前要求**压缩机级负载证据**——
+        # 连续两个 tick >50W（≤7min 间隔，容忍丢一拍）或本 tick >300W（压缩机
+        # 级单帧铁证）。仅一次 50W<p≤300W → 打 _phantom_gate_at 观察一拍、
+        # 不动 state，下一 tick 复核。背景：今晨幻象翻转以 16-24 分钟间隔拿到
+        # 单帧 >50W/None 读数即入账，comfort_weight 再次被推满 1.0。
+        if load_power is not None and load_power <= 300:
+            _strong_pair = False
+            _prev_high = state.get("_on_flip_high_at")
+            if _prev_high:
+                try:
+                    _ph = (
+                        datetime.fromisoformat(_prev_high)
+                        if isinstance(_prev_high, str)
+                        else _prev_high
+                    )
+                    _now_dt = (
+                        datetime.fromisoformat(now_ts)
+                        if isinstance(now_ts, str)
+                        else now_ts
+                    )
+                    if 0 < (_now_dt - _ph).total_seconds() <= 7 * 60:
+                        _strong_pair = True
+                except Exception:
+                    pass
+            if _strong_pair:
+                state.pop("_on_flip_high_at", None)  # 证据链已消费
+            else:
+                state["_on_flip_high_at"] = now_ts
+                state["_phantom_gate_at"] = now_ts
+                return
+        # v8.43b: 仅功率断表（None）时用震荡检测辅助判断（v8.46 修复②: 窗口
+        # 20→35min，覆盖实测 12-24 分钟幻象周期）；>300W 或连续两 tick>50W
+        # 是真运行的物理铁证，直接走下方锚点。
         if load_power is None and _anchor_oscillating(state, now_ts):
+            state.pop("_on_flip_high_at", None)
             state["_phantom_gate_at"] = now_ts
             return
-        # 功率不可测且无震荡迹象，或功率 >50W（真运行）→ v8.36 原语义：
-        # 打锚点 + 喂学习（真用户手动开机，尊重意图）。
+        # 打锚点：真手动开机（尊重意图，state 立即对账）。
         state["manual_on_at"] = now_ts
         state["mode"] = "cooling"
         state["run_start"] = now_ts
         state["_fake_run_count"] = 0
-        _learn_from_manual(state, now_ts)
+        if load_power is None:
+            # v8.46 修复③: 断表窗口打的锚点学习喂入延迟 10 分钟做 kWh 功耗
+            # 验证（幻象锚点零功耗不入账）；锚点与 state 对账照常，正确性由
+            # H2 接管/假运行熔断兜底。有功率铁证时保持立即学习（旧行为）。
+            state["_pending_manual_on_learn"] = {
+                "ts": now_ts,
+                "kwh": state.get("estimated_kwh"),
+            }
+        else:
+            _learn_from_manual(state, now_ts)
 
 
 def verify_socket():
