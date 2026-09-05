@@ -112,7 +112,11 @@ s = base_state(); log = s['user_pref']['manual_on_log']
 s['estimated_kwh'] = None
 A.reconcile_state(s, '2026-09-04T09:00:00', load_power=None)
 A.reconcile_state(s, '2026-09-04T09:10:00', load_power=None)
-check('G 电量缺失→保守入账', len(log) == 1)
+# v8.50d 口径变更 (Astra验收三#2/#4): 电量缺失 = 无法核验 = 不喂样本（宁缺毋滥）。
+# 原 v8.46 语义「电量不可测保守入账」与 v8.48 确立的「kWh 是唯一不可伪造量」
+# 矛盾——电量缺失直接通过会把幻象样本放进学习。真手动事件在电量恢复后由
+# 后续事件继续学习，损失有限。本条取代 v848 原 G 断言。
+check('G 电量缺失→不入账 (v8.50d)', len(log) == 0)
 
 # ── v8.46 回归: 场景H 低功率打断证据链 ──
 s = base_state()

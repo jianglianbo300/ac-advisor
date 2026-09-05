@@ -1114,13 +1114,20 @@ def reconcile_state(state, now_ts, load_power=None):
             _k1 = state.get("estimated_kwh")
             # v8.50c (Astra验收二#12): 锚点时刻 rh 快照缺失（rh_history 当时为空）
             # → 不得回退到 10 分钟后的当前湿度学习（会把事件环境张冠李戴）。
-            # 事件无环境快照 = 学习资格降级，仅 kWh 核验通过即结束，不喂样本。
+            # v8.50d (Astra验收三#12): 只跳过学习，**不得 return 退出整个
+            # reconcile_state**——原实现把 pending 消费提前 return，后续
+            # 关翻转对账（socket off + 运行态）被整体跳过，幻象关翻转失去
+            # 门控。改为仅记录"学习资格降级"标记，继续走下方对账。
             if _pml.get("rh") is None:
                 if _k0 is not None and _k1 is not None and (_k1 - _k0) >= 0.005:
-                    pass  # 电量佐证成立但环境快照缺失 → 跳过学习
-                return
-            if _k0 is None or _k1 is None or (_k1 - _k0) >= 0.005:
-                # 快照核验通过才入账：rh/mode 用锚点时刻值，不用当前 state
+                    state["_manual_learn_skipped_rh"] = True  # 电量佐证成立但缺环境快照
+                # 快照缺失一律不喂样本；继续对账
+            elif _k0 is not None and _k1 is not None and (_k1 - _k0) >= 0.005:
+                # v8.50d (Astra验收三#2/#4): 电量证据缺失时也**不学习**——
+                # 原条件 `_k0 is None or _k1 is None or ...` 让"缺电量"直接
+                # 通过，与 v8.48 确立的「kWh 是唯一不可伪造量」矛盾（电量不可
+                # 测 = 无法核验 = 不喂样本，宁缺毋滥；真手动事件在电量恢复后
+                # 由后续事件继续学习）。证据不足时保持对账、不 return。
                 _learn_from_manual(
                     state, _pml["ts"], rh=_pml.get("rh"), mode=_pml.get("mode")
                 )

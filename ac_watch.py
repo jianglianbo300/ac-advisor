@@ -620,8 +620,12 @@ def _starts_in_last_hour():
             except Exception:
                 continue
             if _et < _now - timedelta(minutes=60):
-                # 窗口外：只消费最近一条已执行记录作为初态，不再计数
-                if e.get("executed") is not False and _prev_act is None:
+                # v8.50c→v8.50d (Astra验收三#8): 窗口外必须持续更新初态——
+                # 取窗口前**最后一条**已执行记录，不是遍历中第一条（原实现
+                # `_prev_act is None` 锁死最早记录：-120min off → -61min
+                # cooling 时会误把承接运行当启动；-120min cooling → -61min
+                # off 时误把真实启动当承接）。窗口外只消费初态，不计数。
+                if e.get("executed") is not False:
                     _prev_act = e.get("action")
                 continue
             if e.get("executed") is False:

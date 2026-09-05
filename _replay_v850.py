@@ -242,6 +242,45 @@ check('V29 缺kwh快照标不可评价且偏移不动',
       _dl29[0].get('eval_note') == 'insufficient_evidence_no_kwh'
       and A.load_learned()['adjusted_thresholds']['temp_cooling'] == 1.0)
 
+# ── V30: 窗口外初态取最后一条已执行记录（v8.50d，Astra验收三#8）──
+# 反例1: -120min off → -61min cooling → 窗口内 -5min cooling, 应为 0 次启动(承接)
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': ts_ago(120), 'action': 'off', 'executed': True},
+    {'time': ts_ago(61), 'action': 'cooling', 'executed': True},
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V30 窗口前末态cooling承接不算启动', W._starts_in_last_hour() == 0)
+# 反例2: -120min cooling → -61min off → 窗口内 -5min cooling, 应为 1 次(真实启动)
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': ts_ago(120), 'action': 'cooling', 'executed': True},
+    {'time': ts_ago(61), 'action': 'off', 'executed': True},
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V30b 窗口前末态off后启动计1次', W._starts_in_last_hour() == 1)
+
+# ── V31: pending缺rh只跳学习, 不退出对账（v8.50d，Astra验收三#12回归）──
+# 复现场景: 09:00 on锚点(无rh_history) → 09:10 pending到期(缺rh) + 插座off
+A.AC_SOCKET = 'on'
+s = base_state(); log = s['user_pref']['manual_on_log']
+s['rh_history'] = []  # 锚点无rh快照
+s['estimated_kwh'] = 6.19
+A.reconcile_state(s, '2026-09-05T09:00:00', load_power=1050)
+s['estimated_kwh'] = 6.39  # 电量佐证成立
+A.AC_SOCKET = 'off'
+s['_prev_power'] = 1050
+A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1)  # 关翻转紧随其后
+check('V31 缺rh不阻塞后续关翻转对账', s.get('mode') == 'off')
+check('V31b 缺rh不喂样本', len(log) == 0)
+
+# ── V32: 电量缺失 → 不学但保留对账（v8.50d，Astra验收三#2/#4）──
+A.AC_SOCKET = 'on'
+s = base_state(); log = s['user_pref']['manual_on_log']
+s['rh_history'] = [['2026-09-05T09:00:00', 55]]
+s['estimated_kwh'] = None  # 电量不可测
+A.reconcile_state(s, '2026-09-05T09:00:00', load_power=1050)
+A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1050)
+check('V32 电量缺失不入账', len(log) == 0)
+
 # ── V24: log_decision executed 标记（pass1#6/#8）──
 try:
     A.save_learned({'adjusted_thresholds': {}, 'decision_log': []})
