@@ -191,10 +191,17 @@ def compute_optimal_schedule(
 
 
 def find_pre_cool_window(schedule, current_hour):
+    # v8.50 fix (Astra外审 pass2#1): 生产端 compute_optimal_schedule 自 v8.29 起
+    # append 四元组 (h, action, cost, t_current)，原实现按三元组解包 →
+    # 任何非空 schedule 传入即 ValueError（潜伏地雷，无调用点未炸）。
+    # 且 h 是 local_times 的数组索引（相对当前小时的偏移 0..23，v8.36 注释
+    # 已明确），原实现当绝对小时判 6<=h<=21 → 语义错误。改为
+    # 绝对小时 = (current_hour + h) % 24，current_hour 参数从此真正被使用。
     hot_start = None
-    for i, (h, action, cost) in enumerate(schedule):
-        if action == "cool" and 6 <= h <= 21:
-            hot_start = h
+    for i, (h, action, cost, _t) in enumerate(schedule):
+        h_abs = (current_hour + h) % 24
+        if action == "cool" and 6 <= h_abs <= 21:
+            hot_start = h_abs
             break
     if hot_start is None:
         return None
@@ -223,17 +230,23 @@ def predict_dehumidify_need(wx, current_hum, current_temp):
     for i, t in enumerate(times):
         try:
             t_dt = datetime.fromisoformat(t)
-            hours_ahead = (t_dt - datetime.now()).total_seconds() / 3600
+            # v8.50 fix (Astra外审 pass2#6): 天气接口可能返回带时区偏移的 ISO
+            # 时间（+08:00）→ aware datetime 减 naive datetime.now() 抛 TypeError，
+            # 被 except:continue 吞掉 → future_rh 永远空 → 预除湿预测静默失效。
+            # 统一为同"时区感知"基准比较。
+            ref_now = datetime.now(t_dt.tzinfo) if t_dt.tzinfo else datetime.now()
+            hours_ahead = (t_dt - ref_now).total_seconds() / 3600
             if 6 <= hours_ahead <= 30:
                 future_rh.append(hums[i] if i < len(hums) else None)
         except:
             continue
-    if not future_rh:
+    # v8.50 fix (Astra外审 pass2#6): 窗口内湿度全为 None 时旧代码 max() 对空
+    # 生成器抛 ValueError——应正常返回"数据不足"，而不是崩。
+    valid_rh = [r for r in future_rh if r is not None]
+    if not valid_rh:
         return False, None, None
-    max_future_rh = max(r for r in future_rh if r is not None)
-    avg_future_rh = sum(r for r in future_rh if r is not None) / len(
-        [r for r in future_rh if r is not None]
-    )
+    max_future_rh = max(valid_rh)
+    avg_future_rh = sum(valid_rh) / len(valid_rh)
     if max_future_rh > 70 or avg_future_rh > 65:
         if current_hum and current_hum > 55:
             return (
@@ -280,6 +293,11 @@ def evaluate_and_learn(state, now_ts):
         ts = entry.get("time", "")
         if entry.get("evaluated"):
             continue
+        # v8.50 fix (Astra外审 pass1#6/#8): 未执行决策（dry/vent拦截/控制失败）
+        # 不参与回评学习——旧代码用"计划"当"效果"学习，假样本污染偏移。
+        if entry.get("executed") is False:
+            entry["evaluated"] = True
+            continue
         if ts > cutoff:
             continue
         if ts < stale:
@@ -295,8 +313,15 @@ def evaluate_and_learn(state, now_ts):
             continue
         success = True
         if action in ("cooling", "dehumid"):
-            comp_running = (entry.get("power_at_decision") or 0) > 300
-            if comp_running:
+            # v8.50 fix (Astra外审 pass2#5): 决策时单帧功率 >300W 不再是成功铁证
+            # ——幻象功率读数与 is_on 同源，可穿透旧判据（09-04 实证：kWh 冻结仍
+            # 打出高功率幻象帧）。改为「决策后 kWh 增量 ≥0.005」佐证（真压缩机
+            # 30-120min 必远超此值）；决策时无功率帧但温湿度无改善才算失败。
+            _kd0 = entry.get("kwh_at_decision")
+            _kd1 = state.get("estimated_kwh")
+            if _kd0 is not None and _kd1 is not None:
+                success = (_kd1 - _kd0) >= 0.005
+            elif (entry.get("power_at_decision") or 0) > 300:
                 success = True
             elif (pre_temp - cur_temp) < 0.3 and ((pre_hum or 0) - (cur_hum or 0)) < 3:
                 success = False
@@ -358,10 +383,31 @@ def evaluate_and_learn(state, now_ts):
     _peak_kwh = _wh.get("peak", 0.0)
     _valley_kwh = _wh.get("valley", 0.0)
     _has_band = (_peak_kwh + _valley_kwh) > 0
+    # v8.50 fix (Astra外审 pass2#3): 预算上调与护栏在**同一次调用**内互相抵消
+    # （超预算 +0.5 → 护栏 -0.5 → 偏移锁死在当前值，注释承诺的"高温自愈"永不
+    # 发生）。改为护栏优先：护栏触发轮禁止预算上调，保证净回落；预算上调按
+    # 小时窗口去重（main 一轮调 evaluate 两次，无去重则同一超支事实重复加码）。
+    _guardrail_fired = False
+    if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
+        if (state.get("last_temp") or 0) >= TEMP_COOLING:
+            _off_min = minutes_since(state.get("last_off_at"))
+            if _off_min is not None and _off_min > 20:
+                _guardrail_fired = True
+                adjusted["temp_cooling"] = round(
+                    max(0, adjusted.get("temp_cooling", 0) - 0.5), 2
+                )
+    _bump_ok = not _guardrail_fired
+    if _bump_ok:
+        _last_bump = state.get("_budget_bump_ts")
+        if _last_bump is not None:
+            _bump_min = minutes_since(_last_bump)
+            if _bump_min is not None and _bump_min < 60:
+                _bump_ok = False
     if not _has_band:
         # 回退口径：无峰谷分时数据时按原始 kWh 判断
-        if daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
+        if _bump_ok and daily_kwh > daily_budget and adjusted.get("temp_cooling", 0) < 3:
             adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
+            state["_budget_bump_ts"] = now_ts
         elif daily_kwh < daily_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0:
             adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
     # v8.31 峰谷套利：预算按"加权电价成本"而非 kWh 判断。
@@ -380,28 +426,15 @@ def evaluate_and_learn(state, now_ts):
                 * (ELECTRIC_PEAK + ELECTRIC_VALLEY)
                 / 2,
             )
-            if daily_cost > _cost_budget and adjusted.get("temp_cooling", 0) < 3:
+            if _bump_ok and daily_cost > _cost_budget and adjusted.get("temp_cooling", 0) < 3:
                 adjusted["temp_cooling"] = min(3, adjusted.get("temp_cooling", 0) + 0.5)
+                state["_budget_bump_ts"] = now_ts
             elif (
                 daily_cost < _cost_budget * 0.5 and adjusted.get("temp_cooling", 0) > 0
             ):
                 adjusted["temp_cooling"] = max(0, adjusted.get("temp_cooling", 0) - 0.5)
         except Exception:
             pass
-    # 偏移健康护栏：白天(8-21点)若室温≥启动线-0.5 且空调未运行超过20分钟，
-    # 说明启动线过高，强制回落 0.5（自愈，防止再次出现 30°C 不开机）
-    if adjusted.get("temp_cooling", 0) > 0 and 8 <= datetime.now().hour < 21:
-        # v8.36 fix (hy4审计#5): 原条件 `last_temp >= TEMP_COOLING + adj - 0.5` 自指
-        # ——触发门槛随偏移一起被抬高，形成死锁：adj=2 时启动线 29°C、护栏却要求
-        # last_temp >= 28.5°C；adj=3 时启动线 30°C、要求 >= 29.5°C。启动线越高越
-        # 难开机，室温越涨不到门槛，护栏越不触发 → 温和天气下永久顶死。
-        # 改为对绝对启动线 TEMP_COOLING 判定，任何正偏移在高温下都能自愈。
-        if (state.get("last_temp") or 0) >= TEMP_COOLING:
-            _off_min = minutes_since(state.get("last_off_at"))
-            if _off_min is not None and _off_min > 20:
-                adjusted["temp_cooling"] = round(
-                    max(0, adjusted.get("temp_cooling", 0) - 0.5), 2
-                )
     # 每日用电预算预测
     _budget_pred = state.get("_budget_prediction", {})
     _today = datetime.now().strftime("%Y-%m-%d")
@@ -465,8 +498,11 @@ def evaluate_and_learn(state, now_ts):
 
 
 def log_decision(
-    state, action, pre_temp, pre_hum, now_ts, reason=None
+    state, action, pre_temp, pre_hum, now_ts, reason=None, executed=True
 ):  # v8.39: 加 reason 参数，支持决策归因
+    # v8.50 fix (Astra外审 pass1#6/#8): 加 executed 参数——dry/vent拦截/控制失败
+    # 的「计划」此前也写入决策日志并计入启动次数与回评学习，污染两处消费方。
+    # 现在由 main() 按 apply 结果标注；decide 的启动限次只认 executed=True。
     learned = load_learned()
     log = learned.get("decision_log", [])
     power_at_decision = state.get("_prev_power") or state.get("measured_w")
@@ -477,7 +513,9 @@ def log_decision(
             "pre_temp": pre_temp,
             "pre_hum": pre_hum,
             "evaluated": False,
+            "executed": executed,
             "power_at_decision": power_at_decision,
+            "kwh_at_decision": state.get("estimated_kwh"),  # v8.50: 回评 kWh 佐证
             "reason": reason,
         }
     )  # v8.39: 决策原因，支持 grep 归因
@@ -1044,6 +1082,11 @@ def reconcile_state(state, now_ts, load_power=None):
     # ── v8.46 修复③: 延迟学习验证——断表窗口的手动开锚点 10 分钟后核对
     # kWh 增量：<0.005 = 幻象锚点（压缩机零出力）不入账；≥0.005 或电量
     # 不可测（None）时保守入账（保留旧行为，不误伤真手动）。
+    # v8.50 fix (Astra外审 pass2#4): 延迟验证到期时旧代码取**当前** state 的
+    # rh_history 尾值和 mode——若 10 分钟窗口内用户已关机（真实场景），原本的
+    # "手动开机"记录会被写成 mode=off、湿度取错时点 → 两条关机样本、丢掉开机
+    # 样本，舒适权重系统性偏低。改为创建待验证事件时保存不可变快照，核验只
+    # 决定是否接纳该快照，不再从当前状态重新推断。
     _pml = state.get("_pending_manual_on_learn")
     if _pml:
         try:
@@ -1065,7 +1108,10 @@ def reconcile_state(state, now_ts, load_power=None):
             _k0 = _pml.get("kwh")
             _k1 = state.get("estimated_kwh")
             if _k0 is None or _k1 is None or (_k1 - _k0) >= 0.005:
-                _learn_from_manual(state, _pml["ts"])
+                # 快照核验通过才入账：rh/mode 用锚点时刻值，不用当前 state
+                _learn_from_manual(
+                    state, _pml["ts"], rh=_pml.get("rh"), mode=_pml.get("mode")
+                )
     # ── v8.43: 「关」翻转门控（功率为准，静默翻下不打锚点） ──
     if AC_SOCKET == "off" and state.get("mode") in (
         "cooling",
@@ -1099,6 +1145,21 @@ def reconcile_state(state, now_ts, load_power=None):
             state.pop("_system_off_at", None)
             state["_phantom_gate_at"] = now_ts
             return
+        # v8.50 fix (Astra外审 pass2#2): 手动关机学习此前直接入账、无 kWh 验证
+        # ——幻象「on 锚点建立运行态 → 下一拍 off+1W」的关机样本仍会绕过验证
+        # （v8.48 只堵了开机路径，kWh 冻结时关机学习照常入账，可反复把舒适
+        # 权重拉向"用户倾向关机"）。统一要求：被中断的运行阶段确有电量消耗
+        # （_run_start_kwh 起点），零功耗运行 = 幻象配对，静默对账不学习。
+        _rs_kwh = state.get("_run_start_kwh")
+        if _rs_kwh is not None and state.get("estimated_kwh") is not None:
+            if state["estimated_kwh"] - _rs_kwh < 0.005:
+                state["mode"] = "off"
+                state["last_off_at"] = now_ts
+                state["run_start"] = None
+                state.pop("_system_off_at", None)
+                state.pop("_run_start_kwh", None)
+                state["_phantom_gate_at"] = now_ts
+                return
         sys_off = state.get("_system_off_at")
         is_system_off = False
         if sys_off:
@@ -1191,14 +1252,21 @@ def reconcile_state(state, now_ts, load_power=None):
         state["manual_on_at"] = now_ts
         state["mode"] = "cooling"
         state["run_start"] = now_ts
+        state["_run_start_kwh"] = state.get("estimated_kwh")  # v8.50: 关机学习 kWh 佐证起点
         state["_fake_run_count"] = 0
         # v8.48 修复①: 学习喂入统一延迟验证——功率铁证路径不再立即入账。
         # 幻象功率读数与 is_on 同源，可穿透 v8.46「铁证」（09-04 晚实证:
         # kWh今冻结仍 4 锚点+4 次立即学习，comfort_weight 0.5→0.8）；
         # 唯一不可伪造的物理现实是 kWh 增量，真压缩机 10min 必过 0.005 闸。
+        # v8.50 fix (Astra外审 pass2#4): pending 快照存 rh/mode——延迟 10min
+        # 核验到期时若用户已关机，旧代码用当前 state 会把开机事件学成关机。
+        _rh_hist = state.get("rh_history") or []
+        _snap_rh = _rh_hist[-1][1] if _rh_hist else None
         state["_pending_manual_on_learn"] = {
             "ts": now_ts,
             "kwh": state.get("estimated_kwh"),
+            "rh": _snap_rh,
+            "mode": "cooling",
         }
 
 
@@ -1338,21 +1406,32 @@ NIGHT_HOURS = 6
 DAYS_PER_MONTH = 30
 
 
-def _learn_from_manual(state, now_ts):
+def _learn_from_manual(state, now_ts, rh=None, mode=None):
+    # v8.50 fix (Astra外审 pass2#4/#7): 增加 rh/mode 覆盖参数——延迟核验到期时
+    # 由调用方传入锚点时刻快照，避免取到 10 分钟后的当前 state（开机事件被学
+    # 成关机）。low_rh_manual 增加 mode 过滤：手动**关机**样本（mode=off）不得
+    # 压低除湿阈值——用户"停止除湿"被解释为"希望更早除湿"是方向反转（v8.50
+    # 实证：关翻转样本与开翻转样本同入 manual_on_log，≥3 条即可改写阈值）。
     try:
         rh_hist = state.get("rh_history", [])
         if not rh_hist:
             return
-        last_rh = rh_hist[-1][1] if rh_hist else None
+        last_rh = rh if rh is not None else (rh_hist[-1][1] if rh_hist else None)
         if last_rh is None:
             return
         pref = state.get("user_pref", {})
         manual_log = pref.get("manual_on_log", [])
-        manual_log.append({"ts": now_ts, "rh": last_rh, "mode": state.get("mode")})
+        manual_log.append(
+            {"ts": now_ts, "rh": last_rh, "mode": mode or state.get("mode")}
+        )
         if len(manual_log) > 20:
             manual_log = manual_log[-20:]
         pref["manual_on_log"] = manual_log
-        low_rh_manual = [m for m in manual_log if 60 <= m.get("rh", 0) < 65]
+        low_rh_manual = [
+            m
+            for m in manual_log
+            if m.get("mode") == "cooling" and 60 <= m.get("rh", 0) < 65
+        ]
         if len(low_rh_manual) >= 3:
             pref["hum_threshold"] = 60
         else:

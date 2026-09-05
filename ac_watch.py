@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.49"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.50"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -374,7 +374,15 @@ def is_temp_stable(state, target, slack, window_min):
 
 
 def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
+    # v8.50 fix (Astra外审 pass1#4): 旧实现只比较露点差，高温制冷需求会被
+    # 无限拦截（室外热而干时 dp_out 仍可满足门限，却完全不能给室内降温）。
+    # ①降雨否决：下雨天通风=引湿，露点差无意义；②高温硬豁免：室温已到制冷
+    # 启动线（TEMP_COOLING=27）说明确有制冷需求，不拿"免费除湿"赌用户舒适。
     if dp_out is None or dp_in is None:
+        return False
+    if rain:
+        return False
+    if temp is not None and temp >= A.TEMP_COOLING:
         return False
     return dp_out <= dp_in - VENT_GATE_DP_DIFF
 
@@ -578,6 +586,69 @@ def handle_cycle_after_action(
     return False
 
 
+def _mark_last_unexecuted():
+    """v8.50 (Astra外审 pass1#6/#8): 将 decision_log 最后一条标记为未执行
+    （dry 预览/vent 拦截/控制失败路径用）。消费方（启动限次、回评学习）
+    只认 executed=True 的条目。"""
+    try:
+        learned = A.load_learned()
+        log = learned.get("decision_log", [])
+        if log:
+            log[-1]["executed"] = False
+            learned["decision_log"] = log
+            A.save_learned(learned)
+    except Exception:
+        pass
+
+
+def _starts_in_last_hour():
+    """v8.50 (Astra外审 pass1#6/#8): 最近 60 分钟真实启动次数——只统计
+    executed=True 的 cooling/dehumid 决策（真启动 = 已执行且前一条非运行态）。
+    缺失 executed 字段的旧日志按已执行计（兼容）。dry/vent拦截/控制失败的计划
+    不再消耗小时启动额度。"""
+    try:
+        _dl = A.load_learned().get("decision_log", [])
+        _now = datetime.now()
+        _starts_1h, _prev_act = 0, None
+        for e in _dl:
+            try:
+                if datetime.fromisoformat(e["time"]) < _now - timedelta(minutes=60):
+                    continue
+            except Exception:
+                continue
+            if e.get("executed") is False:
+                _prev_act = e.get("action")
+                continue
+            _act = e.get("action")
+            if _act in ("cooling", "dehumid") and _prev_act not in (
+                "cooling",
+                "dehumid",
+            ):
+                _starts_1h += 1
+            _prev_act = _act
+        return _starts_1h
+    except Exception:
+        return 0
+
+
+def _effective_running(state, socket, load_power):
+    """v8.50 (Astra外审 pass1#3): 统一有效运行判定——对账层（reconcile_state）
+    已按事实等级（kWh > 功率 > is_on）输出 mode，主循环不得再用原始
+    `socket == "on"` 重建 running 架空对账结论。新语义：
+    - state.mode 在对账后已是可信运行态（对账内部已过滤幻象翻转）；
+    - socket=on 且功率 >50W 的 H2 接管窗口（非托管真运行）也算运行；
+    - 仅 socket=on 而功率 ≤50W/不可测 → 幻象（伴侣 IR 信念），不判运行。
+    场景：伴侣报 on（1W 待机幻象）且对账已把 mode 翻为 off → 旧代码
+    `socket=="on" or ...` 判 running=True → DP/预除湿/开机路径全被短路，
+    室内闷热却不开机。"""
+    mode = state.get("mode")
+    if mode in ("cooling", "dehumid", "dehumid_alert"):
+        return True
+    if socket == "on" and load_power is not None and load_power > FAN_ONLY_POWER_MAX:
+        return True
+    return False
+
+
 def decide(
     temp,
     hum,
@@ -622,6 +693,15 @@ def decide(
     if running:
         # v8.32 最小有效运行闸门：开机 N 分钟压缩机从未启动（一直仅风扇/未知）
         # → 纯风扇空转，止损关机。放最前面，白天/夜间/除湿路径统一生效。
+        # v8.50 fix (Astra外审 pass1#2): 绝对温度下限前移到 fan_only 分支之前——
+        # 原 fan_only 分支（下方）在逃生门检查之前 return，低温+高湿时会绕过
+        # 「无条件关机」继续请求重启压缩机（决定"降温"目标 24 度）。统一逃生门。
+        if temp < A.TEMP_ABSOLUTE_FLOOR:
+            return (
+                "off",
+                None,
+                f"温度{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门无条件关机",
+            )
         if (
             (compressor_run_min or 0) <= 0
             and compressor != "compressor"
@@ -895,25 +975,11 @@ def decide(
     # v8.29 audit2 fix: 统计"真启动"= cooling决策且前一条decision非cooling
     # （运行中的降1度加强除湿等target调整也是cooling条目，不能算启停）
     # v8.29 audit3 fix: 移到 is_night 分支之前，夜间启动同样受每小时次数上限约束
-    try:
-        _dl = A.load_learned().get("decision_log", [])
-        _now = datetime.now()
-        _starts_1h, _prev_act = 0, None
-        for e in _dl:
-            try:
-                if datetime.fromisoformat(e["time"]) < _now - timedelta(minutes=60):
-                    continue
-            except Exception:
-                continue
-            _act = e.get("action")
-            if _act in ("cooling", "dehumid") and _prev_act not in (
-                "cooling",
-                "dehumid",
-            ):
-                _starts_1h += 1
-            _prev_act = _act
-    except Exception:
-        _starts_1h = 0
+    # v8.50 fix (Astra外审 pass1#6/#8): 只统计**已执行**决策——dry/vent拦截/控制
+    # 失败的开机计划此前也计入启动次数（log_decision 先于执行调用），白白消耗
+    # 小时额度。executed 字段由 main() 在 apply 结果后回填，缺失字段按已执行计
+    # （兼容历史日志）。
+    _starts_1h = _starts_in_last_hour()
     _cap = NIGHT_MAX_STARTS_PER_H if is_night else DAY_MAX_STARTS_PER_H
     if _starts_1h >= _cap and temp < DAY_STARTS_OVERRIDE_T:
         return (None, None, None)
@@ -1059,6 +1125,11 @@ def main():
     if _adopt:
         # v8.42: 接管时采纳 companion_target（回声字段，≤2min 前的最新命令，严格优于陈旧 state 值）
         _adopted_target = A.AC_COMPANION_TARGET or state.get("target_temp")
+        # v8.50 fix (Astra外审 pass1#7 旧版): 旧代码只把 _adopted_target 用于
+        # log 文案，从未写回 state——接管后 target_temp 仍是陈旧值，decide()
+        # 拿旧目标控温，"继承 target" 是空话。写回并夹在合法域。
+        if _adopted_target is not None and 16 <= _adopted_target <= 30:
+            state["target_temp"] = _adopted_target
         A.open_cycle(
             state,
             now_ts,
@@ -1104,14 +1175,24 @@ def main():
             sensor_off_min = A.minutes_since(sensor_off_since)
             if sensor_off_min is not None and sensor_off_min >= SENSOR_TIMEOUT_ESCALATE:
                 if state.get("mode") in ("cooling", "dehumid", "dehumid_alert"):
-                    log(f"传感器断连{sensor_off_min:.0f}分钟，空调运行中，保守关机")
-                    print(
-                        f"ac_watch: 传感器断连{sensor_off_min:.0f}分钟，空调运行中，执行保守关机"
-                    )
-                    A.apply_and_commit("off", None, state, now_ts)
-                    state.pop("_sensor_off_since", None)
-                    A.save_state(state)
-                    return
+                    if dry:
+                        # v8.50 fix (Astra外审 pass1#4): dry 模式不得真实关机——
+                        # 原代码此路径绕过 dry 检查直接 apply_and_commit。
+                        log(
+                            f"[dry] 传感器断连{sensor_off_min:.0f}分钟，拟保守关机，dry 不执行"
+                        )
+                        print(
+                            f"ac_watch [dry]: 传感器断连{sensor_off_min:.0f}分钟，拟保守关机"
+                        )
+                    else:
+                        log(f"传感器断连{sensor_off_min:.0f}分钟，空调运行中，保守关机")
+                        print(
+                            f"ac_watch: 传感器断连{sensor_off_min:.0f}分钟，空调运行中，执行保守关机"
+                        )
+                        A.apply_and_commit("off", None, state, now_ts)
+                        state.pop("_sensor_off_since", None)
+                        A.save_state(state)
+                        return
         log(f"传感器不可达且无天气兜底，跳过 socket={socket}")
         print("ac_watch: 室内传感器不可达且无天气兜底，本次跳过")
         A.save_state(state)
@@ -1123,6 +1204,37 @@ def main():
         )
         if state.get("_sensor_off_since") is None:
             state["_sensor_off_since"] = now_ts
+        # v8.50 fix (Astra外审 pass1#1): 天气兜底成功时旧代码永不执行断连超时
+        # 保守关机——SENSOR_TIMEOUT_ESCALATE 检查在 `temp/hum 任一 None` 分支内，
+        # 兜底把 temp/hum 补齐后该分支不可达，只剩"只记时不检查"的 wx_fallback
+        # 分支。结果：空调运行中 + 传感器永久离线 + 天气可用 → 兜底温度无限期
+        # 冒充室内温度继续控机。修复：兜底分支同样检查断连计时（dry 模式仅
+        # 预告不执行，Astra pass1#4 同步修复：dry 此前会真实关机）。
+        else:
+            _foff_min = A.minutes_since(state["_sensor_off_since"])
+            if (
+                _foff_min is not None
+                and _foff_min >= SENSOR_TIMEOUT_ESCALATE
+                and state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+            ):
+                if dry:
+                    log(
+                        f"[dry] 传感器断连{_foff_min:.0f}分钟（兜底中），拟保守关机，dry 不执行"
+                    )
+                    print(
+                        f"ac_watch [dry]: 传感器断连{_foff_min:.0f}分钟（兜底中），拟保守关机"
+                    )
+                else:
+                    log(
+                        f"传感器断连{_foff_min:.0f}分钟（兜底中），空调运行中，保守关机"
+                    )
+                    print(
+                        f"ac_watch: 传感器断连{_foff_min:.0f}分钟（兜底中），执行保守关机"
+                    )
+                    A.apply_and_commit("off", None, state, now_ts)
+                    state.pop("_sensor_off_since", None)
+                    A.save_state(state)
+                    return
     else:
         if state.get("_temp_src") != "indoor":
             log(f"室内传感器恢复（T={temp}°C RH={hum}%），清除 outdoor_fallback 标记")
@@ -1214,11 +1326,12 @@ def main():
     if socket is None:
         running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
     else:
-        running = socket == "on" or state.get("mode") in (
-            "cooling",
-            "dehumid",
-            "dehumid_alert",
-        )
+        # v8.50 fix (Astra外审 pass1#3): 由对账层输出统一有效运行状态——
+        # 旧代码 `socket == "on" or mode...` 用 reconcile 之前的原始 socket
+        # 重建 running，幻象 on（待机1W）+ 对账判 off 时仍判运行，DP/预除湿/
+        # 开机路径全被短路（闷热不开机）。改用 _effective_running：mode 为
+        # 对账结论，socket 仅在功率佐证（>50W，H2 接管窗口）时兜底。
+        running = _effective_running(state, socket, load_power)
     since_on = A.minutes_since(state.get("run_start"))
     since_off = A.minutes_since(state.get("last_off_at"))
 
@@ -1295,6 +1408,15 @@ def main():
         state["_daily_kwh"] = 0.0
         state["_daily_kwh_date"] = _today
 
+    # v8.50 fix (Astra外审 pass1#7): 本轮先更新电量，再计算并入账本轮增量。
+    # 旧顺序：先 daily_increment 入账（用的是上一轮更新出的 estimated_kwh），
+    # 最后才 update_kwh() 更新本轮 —— 本轮耗电要下一轮才入账，且按下一轮的
+    # 日期/峰谷时段归属。跨午夜/06:00/22:00 边界系统性错记。前移后：本轮
+    # update_kwh 先落地 estimated_kwh，increment 即本轮增量、按本轮时段入账。
+    # （跨边界精确拆分按积分区间仍属理想化，2min tick 粒度下误差 ≤1 tick，
+    # 由 update_kwh 的 prev_ts 锚点兜底，不再整体滞后一轮。）
+    update_kwh(state, now_ts, load_power)
+
     daily_increment = state.get("estimated_kwh", 0) - state.get("_prev_kwh", 0)
     if daily_increment > 0:
         state["_daily_kwh"] = state.get("_daily_kwh", 0) + daily_increment
@@ -1309,7 +1431,6 @@ def main():
         _by_band[_band] = round(_by_band.get(_band, 0.0) + daily_increment, 4)
     state["_prev_kwh"] = state.get("estimated_kwh", 0)
 
-    update_kwh(state, now_ts, load_power)
     # v8.39 fix (N2): fallback 假 RH=50 不入 rh_history，防污染 delta_rh 窗口（修复后滞留 60min）
     if state.get("_hum_src") == "indoor":
         update_rh_history(state, now_ts, hum)
@@ -1558,6 +1679,20 @@ def main():
                 _schedule_reason = None
         # v8.28 最优调度覆盖
         if _schedule_override:
+            # v8.50 fix (Astra外审 pass1#5): 调度 override 此前只重查 MIN_OFF，
+            # 可绕过每小时启动次数上限——decide() 因 _starts_1h ≥ cap 返回
+            # (None,None,None) 时，override 仍直接发启动（高温豁免与 decide
+            # 同口径：temp ≥ DAY_STARTS_OVERRIDE_T 不拦截）。
+            _override_cap = NIGHT_MAX_STARTS_PER_H if is_night else DAY_MAX_STARTS_PER_H
+            if (
+                _starts_in_last_hour() >= _override_cap
+                and temp < DAY_STARTS_OVERRIDE_T
+            ):
+                _schedule_override = False
+                _schedule_target = None
+                _schedule_reason = None
+                log(f"调度override被每小时启动次数上限拦截（{_starts_in_last_hour()}次/h）")
+        if _schedule_override:
             new_mode, target, reason = "cooling", _schedule_target, _schedule_reason
             # v8.47: 打 override 运行标记——夜间 AH 停机门豁免的配对依据
             # （TTL 180min，run_start 晚于本标记的正常周期不受豁免）
@@ -1579,6 +1714,9 @@ def main():
     if dry:
         print(f"ac_watch [dry]: 将执行 {new_mode} target={target} · {meta}")
         log(f"[dry] 将执行 {new_mode} target={target} · {meta}")
+        # v8.50 fix (Astra外审 pass1#6/#8): 刚才写入的条目标记未执行——
+        # dry 只是计划预览，不得计入启动次数/回评学习。
+        _mark_last_unexecuted()
         evaluate(state, now_ts)
         return
 
@@ -1594,6 +1732,9 @@ def main():
             now_dt.hour, hum, temp, wx and wx.get("rain"), dp_out, dp
         ):
             log(f"vent_gate 拦截开机（室外干爽可免费除湿）· {meta}")
+            # v8.50 fix (Astra外审 pass1#6/#8): vent 拦截 = 未执行，标记防止
+            # 计入启动次数/回评学习。
+            _mark_last_unexecuted()
             A.save_state(state)
             evaluate(state, now_ts)  # v8.38: 补上学习调用，与其他路径一致
             return
@@ -1656,8 +1797,12 @@ def main():
                 tts_speak(f"已自动关空调，{reason}")
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
     elif ctrl["status"] == "no_action":
+        # v8.50 fix (Astra外审 pass1#6/#8): no_action/失败 = 未实际执行，
+        # 不计入启动次数与回评学习（避免把"控制失败"当"决策成功"）。
+        _mark_last_unexecuted()
         print(f"ac_watch: 已处目标状态无需动作 · {meta}")
     else:
+        _mark_last_unexecuted()
         print(f"ac_watch: 自动控制失败（{ctrl['reason']}）——建议人工确认空调状态")
 
     evaluate(state, now_ts)
