@@ -204,6 +204,44 @@ A._learn_from_manual(s, '2026-09-05T11:00:00', rh=62, mode='cooling')
 log26 = s['user_pref']['manual_on_log']
 check('V26 空历史+显式快照仍入账', len(log26) == 1 and log26[0]['rh'] == 62 and log26[0]['mode'] == 'cooling')
 
+# ── V27: 窗口前已运行 → 窗口内首个cooling不算新启动（v8.50c，Astra验收二#8 P2）──
+t_far = ts_ago(90)  # 窗口外
+t_60 = ts_ago(55)   # 窗口内
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': t_far, 'action': 'cooling', 'executed': True},   # 90min前已运行
+    {'time': t_60, 'action': 'cooling', 'executed': True},    # 窗口内继续运行(承接)
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V27 窗口前已运行不误计启动', W._starts_in_last_hour() == 0)
+# 窗口前已运行 → off → cooling: 计 1
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': t_far, 'action': 'cooling', 'executed': True},
+    {'time': t_60, 'action': 'off', 'executed': True},
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V27b 窗口前运行+关+开=1次', W._starts_in_last_hour() == 1)
+
+# ── V28: pending rh快照缺失 → 跳过学习（v8.50c，Astra验收二#12）──
+A.AC_SOCKET = 'on'
+s = base_state(); log = s['user_pref']['manual_on_log']
+s['rh_history'] = []   # 锚点时刻无rh快照
+s['estimated_kwh'] = 6.19
+A.reconcile_state(s, '2026-09-05T09:00:00', load_power=1050)
+s['estimated_kwh'] = 6.39  # 电量佐证成立
+A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1050)
+check('V28 缺rh快照不喂样本', len(log) == 0)
+
+# ── V29: 无kwh快照的旧日志条目+单帧高功率 → 不可评价（v8.50c，Astra验收二#13）──
+A.save_learned({'adjusted_thresholds': {'temp_cooling': 1.0}, 'decision_log': [
+    {'time': t0, 'action': 'cooling', 'pre_temp': 28.0, 'pre_hum': 65.0,
+     'evaluated': False, 'power_at_decision': 1050}  # 无kwh_at_decision字段(旧条目)
+]})
+A.evaluate_and_learn(eval_state(9.0), '2026-09-05T12:00:00')
+_dl29 = A.load_learned()['decision_log']
+check('V29 缺kwh快照标不可评价且偏移不动',
+      _dl29[0].get('eval_note') == 'insufficient_evidence_no_kwh'
+      and A.load_learned()['adjusted_thresholds']['temp_cooling'] == 1.0)
+
 # ── V24: log_decision executed 标记（pass1#6/#8）──
 try:
     A.save_learned({'adjusted_thresholds': {}, 'decision_log': []})

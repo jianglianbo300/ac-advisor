@@ -605,16 +605,24 @@ def _starts_in_last_hour():
     """v8.50 (Astra外审 pass1#6/#8): 最近 60 分钟真实启动次数——只统计
     executed=True 的 cooling/dehumid 决策（真启动 = 已执行且前一条非运行态）。
     缺失 executed 字段的旧日志按已执行计（兼容）。dry/vent拦截/控制失败的计划
-    不再消耗小时启动额度。"""
+    不再消耗小时启动额度。
+    v8.50c (Astra验收二#8 P2): 窗口初态——先用窗口前最后一条已执行记录初始化
+    运行态，窗口内第一条 cooling 若承接窗口前已运行则不算新启动（原实现窗口
+    边界前的运行态未知，61 分钟前已运行的场景会把窗口内首个 cooling 误计为
+    启动）。"""
     try:
         _dl = A.load_learned().get("decision_log", [])
         _now = datetime.now()
         _starts_1h, _prev_act = 0, None
         for e in _dl:
             try:
-                if datetime.fromisoformat(e["time"]) < _now - timedelta(minutes=60):
-                    continue
+                _et = datetime.fromisoformat(e["time"])
             except Exception:
+                continue
+            if _et < _now - timedelta(minutes=60):
+                # 窗口外：只消费最近一条已执行记录作为初态，不再计数
+                if e.get("executed") is not False and _prev_act is None:
+                    _prev_act = e.get("action")
                 continue
             if e.get("executed") is False:
                 # v8.50b (Astra验收#8): 未执行条目不进入状态机——旧实现

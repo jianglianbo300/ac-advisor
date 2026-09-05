@@ -317,12 +317,17 @@ def evaluate_and_learn(state, now_ts):
             # ——幻象功率读数与 is_on 同源，可穿透旧判据（09-04 实证：kWh 冻结仍
             # 打出高功率幻象帧）。改为「决策后 kWh 增量 ≥0.005」佐证（真压缩机
             # 30-120min 必远超此值）；决策时无功率帧但温湿度无改善才算失败。
+            # v8.50c (Astra验收二#13): 无 kwh_at_decision 快照（v8.50 之前的旧
+            # 日志条目）且只有单帧高功率 → 证据不足，标记"不可评价"跳过——
+            # 不判成功也不判失败（缺证据时不得用高功率帧代替电量佐证）。
             _kd0 = entry.get("kwh_at_decision")
             _kd1 = state.get("estimated_kwh")
             if _kd0 is not None and _kd1 is not None:
                 success = (_kd1 - _kd0) >= 0.005
             elif (entry.get("power_at_decision") or 0) > 300:
-                success = True
+                entry["evaluated"] = True
+                entry["eval_note"] = "insufficient_evidence_no_kwh"
+                continue
             elif (pre_temp - cur_temp) < 0.3 and ((pre_hum or 0) - (cur_hum or 0)) < 3:
                 success = False
         elif action in ("off", "fan"):
@@ -1107,6 +1112,13 @@ def reconcile_state(state, now_ts, load_power=None):
             state.pop("_pending_manual_on_learn", None)
             _k0 = _pml.get("kwh")
             _k1 = state.get("estimated_kwh")
+            # v8.50c (Astra验收二#12): 锚点时刻 rh 快照缺失（rh_history 当时为空）
+            # → 不得回退到 10 分钟后的当前湿度学习（会把事件环境张冠李戴）。
+            # 事件无环境快照 = 学习资格降级，仅 kWh 核验通过即结束，不喂样本。
+            if _pml.get("rh") is None:
+                if _k0 is not None and _k1 is not None and (_k1 - _k0) >= 0.005:
+                    pass  # 电量佐证成立但环境快照缺失 → 跳过学习
+                return
             if _k0 is None or _k1 is None or (_k1 - _k0) >= 0.005:
                 # 快照核验通过才入账：rh/mode 用锚点时刻值，不用当前 state
                 _learn_from_manual(
