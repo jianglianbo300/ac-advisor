@@ -1210,7 +1210,21 @@ def reconcile_state(state, now_ts, load_power=None):
         # comfort_weight 只能单调下降、永不回升：用户嫌冷手动关机，系统永远学不会
         # 把舒适度权重调回去。这里在 mode 置 "off" 之后补调，使 off 样本得以入账。
         if not is_system_off and not never_ran:
-            _learn_from_manual(state, now_ts)
+            # v8.50e (Astra验收五#2 ❌): 关机学习同样要求电量正准入证——上方的
+            # _run_start_kwh 门控只拦"零功耗运行"，但电量缺失（_run_start_kwh 或
+            # estimated_kwh 为 None）时直接落入这里照常学习，幻象配对仍可绕过。
+            # 与 pending 开机路径对齐：两端电量非空且增量 ≥0.005 才入样本；
+            # 电量缺失完成对账（mode=off/manual_off_at 已置），但不喂学习。
+            _rs_k2 = state.get("_run_start_kwh")
+            _k2 = state.get("estimated_kwh")
+            if (
+                _rs_k2 is not None
+                and _k2 is not None
+                and (_k2 - _rs_k2) >= 0.005
+            ):
+                _learn_from_manual(state, now_ts)
+            else:
+                state["_manual_learn_skipped_kwh"] = True
         return
     if state.get("_system_off_at"):
         state.pop("_system_off_at", None)

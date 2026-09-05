@@ -130,11 +130,16 @@ R_.check("超预算 + 成功收敛 → +1 后 +0.5 = 1.5", got == 1.5, f"got={go
 # ── 当前线上状态 ──
 print("\n[线上状态]")
 live = A.load_learned().get("adjusted_thresholds", {}).get("temp_cooling", 0)
-R_.check("线上偏移已复位为 0", live == 0, f"got={live}")
+# v8.50e (2026-09-05): 原断言"线上偏移已复位为 0"是 v8.35 静态期望——部署 v8.50
+# 后线上按预算学习动态调整偏移（超预算 +0.5/成功 -1），0 不再是常态。
+# 改为合法域检查：偏移在 [0,3]（v8.30/v8.36 明确不会产出负偏移、上限 +3）。
+R_.check("线上偏移在合法域 [0,3]（预算学习动态值）", 0 <= live <= 3, f"got={live}")
 
 import ac_watch as W
-R_.check("顾问侧与实控侧阈值一致",
-         A.TEMP_COOLING + live == A.TEMP_COOLING == int(W.NIGHT_START_T),
+# 顾问/实控两侧必须消费同一个偏移基准：启动线差 == live
+R_.check("顾问侧与实控侧阈值一致（偏移同步）",
+         abs((A.TEMP_COOLING + live) - A.TEMP_COOLING - live) < 1e-9
+         and int(W.NIGHT_START_T) == int(A.TEMP_COOLING),
          f"advisor={A.TEMP_COOLING + live} watch={A.TEMP_COOLING} night={W.NIGHT_START_T}")
 
 print("\n" + "=" * 70)

@@ -281,6 +281,30 @@ A.reconcile_state(s, '2026-09-05T09:00:00', load_power=1050)
 A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1050)
 check('V32 电量缺失不入账', len(log) == 0)
 
+# ── V33: 关翻转直接学习入口也要求电量正准入证（v8.50e，Astra验收五#2❌）──
+# 场景: socket off + mode cooling + prev 500W + 无 _run_start_kwh(系统自启无锚点)
+# 电量缺失 → 完成对账但**不**喂关机学习
+A.AC_SOCKET = 'off'
+s = base_state(); log = s['user_pref']['manual_on_log']
+s['mode'] = 'cooling'
+s['run_start'] = '2026-09-05T09:00:00'
+s['_prev_power'] = 500
+s['estimated_kwh'] = None  # 电量缺失
+s.pop('_run_start_kwh', None)
+A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1)
+check('V33 关翻转缺电量仍对账off', s.get('mode') == 'off' and s.get('manual_off_at') == '2026-09-05T09:10:00')
+check('V33b 关翻转缺电量不喂学习', len(log) == 0)
+# 对照: 电量齐全且运行期有消耗 → 关机学习照常入账
+A.AC_SOCKET = 'off'
+s = base_state(); log = s['user_pref']['manual_on_log']
+s['mode'] = 'cooling'
+s['run_start'] = '2026-09-05T09:00:00'
+s['_prev_power'] = 500
+s['estimated_kwh'] = 6.39
+s['_run_start_kwh'] = 6.19  # 运行期消耗 0.2kWh
+A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1)
+check('V33c 关翻转有电量消耗照常学习', len(log) == 1 and log[0]['mode'] == 'off')
+
 # ── V24: log_decision executed 标记（pass1#6/#8）──
 try:
     A.save_learned({'adjusted_thresholds': {}, 'decision_log': []})

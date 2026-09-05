@@ -1374,6 +1374,8 @@ def main():
         # 重建 running，幻象 on（待机1W）+ 对账判 off 时仍判运行，DP/预除湿/
         # 开机路径全被短路（闷热不开机）。改用 _effective_running：mode 为
         # 对账结论，socket 仅在功率佐证（>50W，H2 接管窗口）时兜底。
+        # v8.50e: socket=None 分支也统一走 _effective_running（原分支语义
+        # 相同：socket=None 不参与，仅 mode 判——等价，收敛为单出口）。
         running = _effective_running(state, socket, load_power)
     since_on = A.minutes_since(state.get("run_start"))
     since_off = A.minutes_since(state.get("last_off_at"))
