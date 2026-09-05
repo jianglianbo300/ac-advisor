@@ -167,15 +167,42 @@ try:
 except AttributeError as e:
     check('V20 未执行决策不计启动数', False, str(e))
 
-# ── V21-V23: _effective_running（pass1#3）──
+# ── V21-V23: _effective_running（pass1#3 + v8.50b H2门控）──
 try:
     check('V21 幻象socket on+1W不判运行', W._effective_running({'mode': 'off'}, 'on', 1) is False)
-    check('V22 H2窗口高功率判运行', W._effective_running({'mode': 'off'}, 'on', 1050) is True)
+    # v8.50b: 高功率兜底需 H2 确认（_unmanaged_run_since 存在）——孤立幻象高功率帧
+    # 不再判运行；H2 双 tick 确认后才算。
+    check('V22a 孤立高功率帧不判运行(无H2确认)', W._effective_running({'mode': 'off'}, 'on', 1050) is False)
+    check('V22b H2确认窗口高功率判运行', W._effective_running({'mode': 'off', '_unmanaged_run_since': '2026-09-05T09:00:00'}, 'on', 1050) is True)
     check('V23 mode=cooling判运行', W._effective_running({'mode': 'cooling'}, 'off', 1) is True)
 except AttributeError as e:
     check('V21 幻象socket不判运行', False, str(e))
     check('V22 H2窗口判运行', False, str(e))
     check('V23 mode判运行', False, str(e))
+
+# ── V25: 未执行条目不污染启动状态机（v8.50b，Astra验收#8）──
+# 场景①漏计复现: cooling-False → cooling-True, 应为 1 次启动
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': ts_ago(10), 'action': 'cooling', 'executed': False},
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V25a 未执行前置不吞真实启动', W._starts_in_last_hour() == 1)
+# 场景②多计复现: cooling-True → off-False → cooling-True, 应为 1 次
+A.save_learned({'adjusted_thresholds': {}, 'decision_log': [
+    {'time': ts_ago(15), 'action': 'cooling', 'executed': True},
+    {'time': ts_ago(10), 'action': 'off', 'executed': False},
+    {'time': ts_ago(5), 'action': 'cooling', 'executed': True},
+]})
+check('V25b 未执行关机不产生假启动', W._starts_in_last_hour() == 1)
+
+# ── V26: 快照rh不依赖当前rh_history（v8.50b，Astra验收#12）──
+s = base_state()
+s['user_pref']['manual_on_log'] = []
+s['rh_history'] = []  # 当前历史为空
+s['user_pref'] = {'manual_on_log': []}
+A._learn_from_manual(s, '2026-09-05T11:00:00', rh=62, mode='cooling')
+log26 = s['user_pref']['manual_on_log']
+check('V26 空历史+显式快照仍入账', len(log26) == 1 and log26[0]['rh'] == 62 and log26[0]['mode'] == 'cooling')
 
 # ── V24: log_decision executed 标记（pass1#6/#8）──
 try:

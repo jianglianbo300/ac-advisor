@@ -617,7 +617,11 @@ def _starts_in_last_hour():
             except Exception:
                 continue
             if e.get("executed") is False:
-                _prev_act = e.get("action")
+                # v8.50b (Astra验收#8): 未执行条目不进入状态机——旧实现
+                # `_prev_act = e.get("action"); continue` 让失败/拦截的计划
+                # 污染真实运行态：①漏计(cooling-False→cooling-True 第二条
+                # 因 prev=cooling 不计数) ②多计(cooling-True→off-False→
+                # cooling-True 被计两次启动)。完全跳过，状态机只认已执行。
                 continue
             _act = e.get("action")
             if _act in ("cooling", "dehumid") and _prev_act not in (
@@ -640,11 +644,21 @@ def _effective_running(state, socket, load_power):
     - 仅 socket=on 而功率 ≤50W/不可测 → 幻象（伴侣 IR 信念），不判运行。
     场景：伴侣报 on（1W 待机幻象）且对账已把 mode 翻为 off → 旧代码
     `socket=="on" or ...` 判 running=True → DP/预除湿/开机路径全被短路，
-    室内闷热却不开机。"""
+    室内闷热却不开机。
+    v8.50b (Astra验收#3): 高功率兜底路径加 H2 门控——孤立的高功率幻象帧
+    （kWh 冻结）此前仅凭 socket=on+功率>50W 即判运行，可架空对账的
+    mode=off 结论（遗留项 B：H2 幻象高功率）。要求 _unmanaged_run_since
+    存在（H2 已按双 tick 持久化确认非托管运行），单帧高功率不再单独判运行。
+    """
     mode = state.get("mode")
     if mode in ("cooling", "dehumid", "dehumid_alert"):
         return True
-    if socket == "on" and load_power is not None and load_power > FAN_ONLY_POWER_MAX:
+    if (
+        socket == "on"
+        and load_power is not None
+        and load_power > FAN_ONLY_POWER_MAX
+        and state.get("_unmanaged_run_since")
+    ):
         return True
     return False
 
@@ -1189,8 +1203,18 @@ def main():
                         print(
                             f"ac_watch: 传感器断连{sensor_off_min:.0f}分钟，空调运行中，执行保守关机"
                         )
-                        A.apply_and_commit("off", None, state, now_ts)
-                        state.pop("_sensor_off_since", None)
+                        ctrl = A.apply_and_commit("off", None, state, now_ts)
+                        # v8.50b: 兼容测试 mock 返回 None 的契约（视为未确认执行）
+                        if ctrl is not None and ctrl.get("status") == "action":
+                            # v8.50b (Astra验收#1): 关机**执行成功**才清断连计时
+                            # ——旧代码无条件 pop，若 verify 失败/指令失败，计时被
+                            # 清掉后下一轮不再尝试保守关机，保护永久失效。
+                            state.pop("_sensor_off_since", None)
+                            A.save_state(state)
+                            return
+                        log(
+                            f"[WARN] 保守关机未执行成功（{ctrl.get('status') if ctrl else 'mock'}），保留断连计时下轮再试"
+                        )
                         A.save_state(state)
                         return
         log(f"传感器不可达且无天气兜底，跳过 socket={socket}")
@@ -1231,8 +1255,15 @@ def main():
                     print(
                         f"ac_watch: 传感器断连{_foff_min:.0f}分钟（兜底中），执行保守关机"
                     )
-                    A.apply_and_commit("off", None, state, now_ts)
-                    state.pop("_sensor_off_since", None)
+                    ctrl = A.apply_and_commit("off", None, state, now_ts)
+                    if ctrl is not None and ctrl.get("status") == "action":
+                        # v8.50b (Astra验收#1): 同无兜底分支——执行成功才清计时
+                        state.pop("_sensor_off_since", None)
+                        A.save_state(state)
+                        return
+                    log(
+                        f"[WARN] 保守关机未执行成功（{ctrl.get('status') if ctrl else 'mock'}），保留断连计时下轮再试"
+                    )
                     A.save_state(state)
                     return
     else:

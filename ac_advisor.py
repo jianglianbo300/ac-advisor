@@ -1414,9 +1414,16 @@ def _learn_from_manual(state, now_ts, rh=None, mode=None):
     # 实证：关翻转样本与开翻转样本同入 manual_on_log，≥3 条即可改写阈值）。
     try:
         rh_hist = state.get("rh_history", [])
-        if not rh_hist:
-            return
-        last_rh = rh if rh is not None else (rh_hist[-1][1] if rh_hist else None)
+        # v8.50b (Astra验收#12): 显式快照 rh 不得再依赖当前 rh_history——
+        # 旧代码先 `if not rh_hist: return`，锚点快照传入时若当前历史为空
+        # 直接退出；且 rh=None 回退当前值时会把 10 分钟后湿度当事件湿度。
+        # 快照与历史分离：rh 由调用方提供就用快照，否则才回退当前历史。
+        if rh is None:
+            if not rh_hist:
+                return
+            last_rh = rh_hist[-1][1]
+        else:
+            last_rh = rh
         if last_rh is None:
             return
         pref = state.get("user_pref", {})
