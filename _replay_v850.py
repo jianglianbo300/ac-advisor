@@ -305,7 +305,16 @@ s['_run_start_kwh'] = 6.19  # 运行期消耗 0.2kWh
 A.reconcile_state(s, '2026-09-05T09:10:00', load_power=1)
 check('V33c 关翻转有电量消耗照常学习', len(log) == 1 and log[0]['mode'] == 'off')
 
-# ── V24: log_decision executed 标记（pass1#6/#8）──
+# ── V34: _effective_running socket=None 单出口等价性（v8.50f，Astra验收六#3）──
+check('V34 socket=None+mode=cooling判运行', W._effective_running({'mode': 'cooling'}, None, 1) is True)
+check('V34b socket=None+mode=off不判运行', W._effective_running({'mode': 'off'}, None, 1050) is False)
+check('V34c socket=None+mode=off+无H2标记不判运行', W._effective_running({'mode': 'off'}, None, None) is False)
+# 单出口源码级验证: main 中不得再出现裸 mode 重建 running 的双路径
+import inspect
+_main_src = inspect.getsource(W.main)
+check('V34d main统一走_effective_running单出口',
+      '_effective_running(state, socket, load_power)' in _main_src
+      and 'running = state.get("mode") in' not in _main_src)
 try:
     A.save_learned({'adjusted_thresholds': {}, 'decision_log': []})
     A.log_decision({}, 'cooling', 27, 60, ts_ago(1), reason='t', executed=False)

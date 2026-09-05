@@ -1366,17 +1366,16 @@ def main():
         except Exception:
             pass
 
-    if socket is None:
-        running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
-    else:
-        # v8.50 fix (Astra外审 pass1#3): 由对账层输出统一有效运行状态——
-        # 旧代码 `socket == "on" or mode...` 用 reconcile 之前的原始 socket
-        # 重建 running，幻象 on（待机1W）+ 对账判 off 时仍判运行，DP/预除湿/
-        # 开机路径全被短路（闷热不开机）。改用 _effective_running：mode 为
-        # 对账结论，socket 仅在功率佐证（>50W，H2 接管窗口）时兜底。
-        # v8.50e: socket=None 分支也统一走 _effective_running（原分支语义
-        # 相同：socket=None 不参与，仅 mode 判——等价，收敛为单出口）。
-        running = _effective_running(state, socket, load_power)
+    # v8.50 fix (Astra外审 pass1#3): 由对账层输出统一有效运行状态——
+    # 旧代码 `socket == "on" or mode...` 用 reconcile 之前的原始 socket
+    # 重建 running，幻象 on（待机1W）+ 对账判 off 时仍判运行，DP/预除湿/
+    # 开机路径全被短路（闷热不开机）。改用 _effective_running：mode 为
+    # 对账结论，socket 仅在功率佐证（>50W，H2 接管窗口）时兜底。
+    # v8.50f (Astra验收六#3 拒签): 删除 if/else 双路径——v8.50e 只改了 else
+    # 分支注释、if 分支仍走裸 mode 判断，与"单出口收敛"矛盾。统一单出口：
+    # socket=None 时 _effective_running 内 socket=="on" 为 False，仅 mode 判
+    # 定，与原 if 分支语义完全等价。
+    running = _effective_running(state, socket, load_power)
     since_on = A.minutes_since(state.get("run_start"))
     since_off = A.minutes_since(state.get("last_off_at"))
 
