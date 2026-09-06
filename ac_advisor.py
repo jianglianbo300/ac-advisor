@@ -7,6 +7,7 @@ RC 热模型 + DP 最优调度 + 自学习闭环 + TTS 语音
 import json
 import math
 import os
+import subprocess
 import sys
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,9 @@ COOL_DUTY = 0.70
 # night_cost_lines() 内仍引用 → 该函数一被调用就 NameError（潜伏 6 个版本）。
 # 恢复 v10.0 原值 40（对齐「压轮 24°C 40~60min」早报文案）。
 COOL_BURST_MIN = 40
+
+# v8.51 audit 2026-09-06: 空调控制连续失败告警（status_read_failed 曾静默重试 2.5h 无提醒）
+CTRL_FAIL_ALERT_THRESHOLD = 8  # 连续失败≥8次(≈16min@2min tick)触发告警
 
 
 class ACState(Enum):
@@ -711,6 +715,7 @@ def cost_est(kwh):
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "ac_state.json")
+ALERTS_FILE = os.path.join(SCRIPT_DIR, "ac_data", "ac_alerts.jsonl")
 LAT, LON = 31.11, 121.38
 
 
@@ -950,6 +955,43 @@ def ac_control_init():
             AC_CTRL = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
     except:
         AC_CTRL = None
+
+
+def _notify_toast(title, text):
+    """Windows toast, best-effort (never raises)."""
+    try:
+        ps = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+            "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+            "$text = $t.GetElementsByTagName('text');"
+            "$text.Item(0).AppendChild($t.CreateTextNode('{0}')) > $null;"
+            "$text.Item(1).AppendChild($t.CreateTextNode('{1}')) > $null;"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($t);"
+            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('PiAgent').Show($toast)"
+        ).format(title, text.replace("'", "").replace('"', ''))
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=10, capture_output=True)
+    except Exception:
+        pass
+
+
+def _alert_ctrl_failure(state, ctrl, streak):
+    """v8.51: 空调控制持续失败告警 —— 写告警日志 + Windows toast + stdout 标记。
+    由 hermes_cron/ac_alert_wrapper.py 每 10 分钟去重投递微信。"""
+    try:
+        os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "streak": int(streak),
+            "action": ctrl.get("action", ""),
+            "reason": (ctrl.get("reason") or "")[:300],
+            "mode": state.get("mode"),
+        }
+        with open(ALERTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _notify_toast("空调控制异常", f"连续 {streak} 次控制失败（{rec['reason']}）")
+        print(f"[ALERT] 空调控制持续失败 {streak} 次: {rec['reason']}")
+    except Exception:
+        pass
 
 
 def ac_apply(new_mode, target_temp=None):
@@ -1363,7 +1405,12 @@ def apply_and_commit(
         now_ts = datetime.now().isoformat(timespec="seconds")
     ctrl = ac_apply(new_mode, target_temp)
     if ctrl["status"] == "failed":
+        # v8.51: 连续失败计数，阈值触发告警（曾静默重试 2.5h 无提醒）
+        streak = int(state.get("_ctrl_fail_streak", 0)) + 1
+        state["_ctrl_fail_streak"] = streak
         save_state(state)
+        if streak >= CTRL_FAIL_ALERT_THRESHOLD:
+            _alert_ctrl_failure(state, ctrl, streak)
         return ctrl
     real = verify_socket()
     if real is None:
@@ -1397,6 +1444,7 @@ def apply_and_commit(
             state["_target_drift"] = {"want": target_temp, "got": _real_t}
         else:
             state.pop("_target_drift", None)
+    state.pop("_ctrl_fail_streak", None)  # v8.51: 控制成功即清零连续失败计数
     save_state(state)
     if tts_reason and not contradict:
         try:
