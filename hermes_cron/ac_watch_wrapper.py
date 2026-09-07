@@ -10,9 +10,17 @@ v8.29 静默版：ac_watch 每轮都打印一行（无需动作/手动保护等�
 import os, subprocess, re, subprocess, sys
 
 REAL = r"D:\work\ac-advisor\ac_watch.py"
+# 闪窗根治（2026-09-07）：sys.executable 可能是 uv venv launcher（45KB 壳），
+# re-exec 真解释器时即使 CREATE_NO_WINDOW 也会闪黑窗（Hermes scheduler 注释同款坑）。
+# 显式用 sys._base_executable（真解释器）+ venv site-packages overlay，绕开 launcher。
+_VENV_SP = r"D:\Hermes_Data\.hermes\hermes-agent\venv\Lib\site-packages"
+_BASE = getattr(sys, "_base_executable", sys.executable)
+_env = dict(os.environ)
+if os.path.isdir(_VENV_SP):
+    _env["PYTHONPATH"] = _VENV_SP + (os.pathsep + _env["PYTHONPATH"] if _env.get("PYTHONPATH") else "")
 os.chdir(os.path.dirname(REAL))
-r = subprocess.run([sys.executable, REAL] + sys.argv[1:],
-                   capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+r = subprocess.run([_BASE, REAL] + sys.argv[1:],
+                   capture_output=True, text=True, encoding="utf-8", errors="replace", env=_env, creationflags=subprocess.CREATE_NO_WINDOW)
 
 # 有异常退出 → 透传错误现场（cron 会推错误告警）
 if r.returncode != 0:

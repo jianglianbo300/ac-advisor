@@ -969,7 +969,7 @@ def _notify_toast(title, text):
             "$toast = [Windows.UI.Notifications.ToastNotification]::new($t);"
             "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('PiAgent').Show($toast)"
         ).format(title, text.replace("'", "").replace('"', ''))
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=10, capture_output=True)
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=10, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception:
         pass
 
