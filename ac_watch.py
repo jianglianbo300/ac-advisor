@@ -1354,15 +1354,6 @@ def main():
                     f"手动开锚点已过期（{int(mins)}分钟 > {MANUAL_ANCHOR_TTL}），清除后恢复自动逻辑"
                 )
                 state.pop("manual_on_at", None)
-            elif 0 <= mins < 30 and state.get("mode") in (
-                "cooling",
-                "dehumid",
-                "dehumid_alert",
-            ):
-                log(f"手动开后{int(mins)}分钟，暂不自动关（保护用户意图）")
-                print(f"ac_watch: 手动开后{int(mins)}分钟，暂不自动关")
-                A.save_state(state)
-                return
         except Exception:
             pass
 

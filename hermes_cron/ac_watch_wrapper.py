@@ -7,12 +7,12 @@ v8.29 静默版：ac_watch 每轮都打印一行（无需动作/手动保护等�
 这里改为只透传【真实开关动作/控制失败/传感器故障】的行，其余吞掉。
 空输出时 cron 不推送（no_agent 语义：empty stdout = silent）。
 """
-import os, re, subprocess, sys
+import os, subprocess, re, subprocess, sys
 
 REAL = r"D:\work\ac-advisor\ac_watch.py"
 os.chdir(os.path.dirname(REAL))
 r = subprocess.run([sys.executable, REAL] + sys.argv[1:],
-                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                   capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
 
 # 有异常退出 → 透传错误现场（cron 会推错误告警）
 if r.returncode != 0:

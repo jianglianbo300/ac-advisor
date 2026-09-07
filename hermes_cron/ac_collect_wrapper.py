@@ -3,8 +3,8 @@
 # Hermes cron wrapper -- real code in D:/work/ac-advisor/ac_collect.py (read-only collect)
 # micloud only installed on Python312 (C:/Users/Administrator/AppData/Local/Programs/Python/Python312/python.exe)
 # so use fixed interpreter, NOT sys.executable (cron env is uv 3.11, no micloud).
-import os, subprocess
+import os, subprocess, subprocess
 REAL = r"D:\work\ac-advisor\ac_collect.py"
 PY = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe"
 os.chdir(os.path.dirname(REAL))
-subprocess.run([PY, REAL] + os.sys.argv[1:], check=True)
+subprocess.run([PY, REAL] + os.sys.argv[1:], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
