@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.51"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.52"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -856,6 +856,31 @@ def decide(
                 "off",
                 None,
                 f"温度{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门无条件关机",
+            )
+
+        # v8.52: 晚间时段(20-23)温度达标关机——原晚间运行中所有关机分支(含水量
+        # 达标/湿度达标/热模型提前关/除湿停滞)均带 `not evening` 被跳过，导致晚间
+        # 空调降到 target 后仍空转到 WATCH_MAX_RUN=90min 才被压缩机保护强制关机
+        # (2026-09-07 实录：21:46 室温已到 25°C 达标，却继续跑到 22:32，空转
+        # 45+ 分钟、电耗 1.76→2.23 度)。补晚间专属关机：温度已到 target(+slack)
+        # 且湿度不偏高(AH/RH 达标)时正常关机，语义与白天 L861 含水量达标关机对齐，
+        # 不再空转与过冷。湿度偏高时仍继续制冷兼除湿，防止晚间反复启停抖振。
+        if (
+            evening
+            and not is_night
+            and comp_min is not None
+            and comp_min >= A.MIN_RUN
+            and temp
+            <= (current_target if current_target is not None else EVENING_TARGET)
+            + DAY_TEMP_REACHED_SLACK
+            and hum is not None
+            and hum <= DAY_EXIT_RH_MAX
+            and (ah is None or ah <= DAY_STOP_AH)
+        ):
+            return (
+                "off",
+                None,
+                f"晚间温度已达标（{temp:.0f}°C≤目标{int(round(current_target))}），湿度正常关机",
             )
 
         if (
@@ -2165,7 +2190,11 @@ def _selftest():
         15,
     )[:2] != ("off", None)
 
-    # v8.18 晚间巡航豁免
+    # v8.18 晚间巡航豁免 (v8.52 语义更新)：原断言期望晚间跑满100min(超WATCH_MAX_RUN=90)
+    # 也不关机，是旧晚间语义(开了就一直跑)的守护者。v8.52 新增晚间温度达标关机：
+    # 温度已到 target+slack 且湿度正常即关，不再空转。故此处改为——晚间温度达标
+    # (25 ≤ 26+0.5) 应关机；未达标(27)不应关。WATCH_MAX_RUN 90min 保护仅在温度未达标
+    # 时作为兜底(晚间豁免保留)。
     r = decide(
         25,
         60,
@@ -2184,7 +2213,26 @@ def _selftest():
         None,
         evening=True,
     )
-    assert r[0] != "off", f"evening cruise should not stop at 100min, got {r}"
+    assert r[0] == "off", f"evening reached target should stop, got {r}"
+    r = decide(
+        27,
+        60,
+        True,
+        100,
+        90,
+        False,
+        "compressor",
+        None,
+        None,
+        26,
+        None,
+        None,
+        None,
+        None,
+        None,
+        evening=True,
+    )
+    assert r[0] != "off", f"evening not reached target should not stop, got {r}"
 
     # v8.21 启停次数上限 — v8.29 audit4: 旧断言测的是死参数night_comp_starts,
     # 新逻辑读load_learned()的decision_log。改为mock注入1小时内2次真启动来验证。
