@@ -46,7 +46,11 @@ def _cloud_set(did, props):
 class CloudACCtrl:
     """云端空调伴侣控制对象 —— 接口对齐 miio AirConditioningCompanionMcn02：
     send_command(name, [args]) / status()（is_on / mode.value / target_temperature / load_power）。
+    _last_set 记录最近一次电源命令，供 verify 按期望等待物理状态到位（绕开云端属性缓存延迟）。
     """
+
+    def __init__(self):
+        self._last_set = None
 
     def status(self):
         vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
@@ -60,6 +64,7 @@ class CloudACCtrl:
     def send_command(self, cmd, args):
         if cmd == "set_power":
             _cloud_set(DID_AC_PARTNER, [(2, 1, args[0] == "on")])
+            self._last_set = ("power", args[0])
         elif cmd == "set_mode":
             _cloud_set(DID_AC_PARTNER, [(2, 2, MODE_STR2INT[args[0]])])
         elif cmd == "set_tar_temp":
@@ -100,13 +105,23 @@ def cloud_control_init():
 
 
 def cloud_verify_socket():
-    """云端回读 socket 状态（带重试，容忍云端属性缓存延迟——实测最长 ~12s，留 30s 余量）。"""
-    for _ in range(6):
+    """云端回读 socket 状态 —— 功率物理裁决（>50W=真运行），按期望命令等待状态到位。
+    绕开云端属性缓存延迟（实测 (2,1) 与功率属性更新不同步，最长 ~12s+）。"""
+    want = getattr(A.AC_CTRL, "_last_set", None)
+    for _ in range(12):
         try:
             s = A.AC_CTRL.status()
-            v = "on" if s.is_on else "off"
-            if v in ("on", "off"):
-                return v
+            w = s.load_power
+            if want and want[0] == "power":
+                if want[1] == "on" and (s.is_on is True or (w or 0) > 50):
+                    return "on"
+                if want[1] == "off" and s.is_on is False and (w or 999) <= 50:
+                    return "off"
+            # 无期望命令：功率物理裁决，读不到功率用开关位兜底
+            if w is not None:
+                return "on" if w > 50 else "off"
+            if s.is_on is not None:
+                return "on" if s.is_on else "off"
         except Exception:
             pass
         time.sleep(5)
