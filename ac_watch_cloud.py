@@ -100,8 +100,8 @@ def cloud_control_init():
 
 
 def cloud_verify_socket():
-    """云端回读 socket 状态（带重试，容忍云端属性缓存延迟 ~5s）。"""
-    for _ in range(4):
+    """云端回读 socket 状态（带重试，容忍云端属性缓存延迟——实测最长 ~12s，留 30s 余量）。"""
+    for _ in range(6):
         try:
             s = A.AC_CTRL.status()
             v = "on" if s.is_on else "off"
@@ -109,7 +109,7 @@ def cloud_verify_socket():
                 return v
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(5)
     return None
 
 
