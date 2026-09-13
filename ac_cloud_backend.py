@@ -185,6 +185,13 @@ def cmd_props(did):
     _run(f())
 
 
+def _chk_write_blocked(r):
+    """检测云端写被拒（-704042011 疑似风控/限流），给用户明确提示。"""
+    if any(c == -704042011 for c in r):
+        print("⚠️ 云端写被拒 code=-704042011（疑似风控/限流）：本次下发未生效，读操作正常；"
+              "30 分钟内自动决策会跳过下发，通常数小时后自动解除，或需重新扫码登录")
+
+
 def cmd_ac(args):
     # 控制命令三重防线：目标必须=上海空调伴侣（白名单+禁控名单+型号校验）
     if not _guard_target(DID_AC_PARTNER, need_control=True):
@@ -199,9 +206,11 @@ def cmd_ac(args):
         if act == "on":
             r = await svc.miot_set_props(DID_AC_PARTNER, [(2, 1, True)])
             print("✅ 下发开机 code=%s（空调开关 siid=2/piid=1；verify 待阶段4）" % r)
+            _chk_write_blocked(r)
         elif act == "off":
             r = await svc.miot_set_props(DID_AC_PARTNER, [(2, 1, False)])
             print("✅ 下发关机 code=%s（空调开关 siid=2/piid=1；verify 待阶段4）" % r)
+            _chk_write_blocked(r)
         elif act == "temp" and len(args) > 1:
             n = int(args[1])
             if not 16 <= n <= 30:
@@ -209,6 +218,7 @@ def cmd_ac(args):
                 return
             r = await svc.miot_set_props(DID_AC_PARTNER, [(2, 3, n)])
             print("✅ 下发目标温度 %d°C code=%s" % (n, r))
+            _chk_write_blocked(r)
         elif act == "mode" and len(args) > 1:
             m = {"auto": 0, "cool": 1, "dry": 2, "heat": 3, "fan": 4}.get(args[1].lower())
             if m is None:
@@ -216,6 +226,7 @@ def cmd_ac(args):
                 return
             r = await svc.miot_set_props(DID_AC_PARTNER, [(2, 2, m)])
             print("✅ 下发模式 %s code=%s" % (args[1].lower(), r))
+            _chk_write_blocked(r)
         else:
             print("未知指令:", act)
     _run(f())

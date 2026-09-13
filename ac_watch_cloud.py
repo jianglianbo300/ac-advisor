@@ -17,6 +17,7 @@ import asyncio
 import sys
 import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,6 +30,37 @@ from ac_cloud_backend import _get_service, DID_PURIFIER, DID_AC_PARTNER
 MODE_INT2STR = {0: "auto", 1: "cool", 2: "dry", 3: "heat", 4: "fan"}
 MODE_STR2INT = {"auto": 0, "cool": 1, "dry": 2, "heat": 3, "fan": 4}
 
+# 云端写风控（米家 prop/set 拒绝码 -704042011，读不受影响）：窗口内跳过下发防再触发
+CLOUD_WRITE_BLOCKED = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cloud_write_blocked")
+CLOUD_WRITE_BLOCK_WINDOW = 1800  # 秒，30 分钟自动恢复
+
+
+def _mark_write_blocked():
+    try:
+        with open(CLOUD_WRITE_BLOCKED, "w") as f:
+            f.write(datetime.now().isoformat(timespec="seconds"))
+    except Exception:
+        pass
+
+
+def cloud_write_blocked():
+    """云端写被拒（风控/限流）状态：窗口内返回 True（跳过下发），超时自动恢复。"""
+    try:
+        with open(CLOUD_WRITE_BLOCKED) as f:
+            ts = f.read().strip()
+        t0 = datetime.fromisoformat(ts)
+        return (datetime.now() - t0).total_seconds() < CLOUD_WRITE_BLOCK_WINDOW
+    except Exception:
+        return False
+
+
+def cloud_clear_write_blocked():
+    try:
+        if os.path.exists(CLOUD_WRITE_BLOCKED):
+            os.remove(CLOUD_WRITE_BLOCKED)
+    except Exception:
+        pass
+
 
 def _cloud_get(did, iids):
     svc = _get_service()
@@ -36,11 +68,15 @@ def _cloud_get(did, iids):
 
 
 def _cloud_set(did, props):
-    """云端下发，props=[(siid,piid,value),...]。code 非 0 或异常抛错（对齐 miio 版）。"""
+    """云端下发，props=[(siid,piid,value),...]。code 非 0 或异常抛错（对齐 miio 版）。
+    -704042011 = 云端写被拒（疑似风控/限流），打标记供决策前跳过下发。"""
     svc = _get_service()
     codes = asyncio.run(svc.miot_set_props(did, props))
     if any(c != 0 for c in codes):
+        if any(c == -704042011 for c in codes):
+            _mark_write_blocked()
         raise RuntimeError("miot set code=%s" % codes)
+    cloud_clear_write_blocked()
 
 
 class CloudACCtrl:
@@ -156,6 +192,16 @@ if __name__ == "__main__":
             time.sleep(3)
     if _offline:
         print("ac_watch: 空调伴侣离线（可能开窗拔电），跳过本轮决策与控制")
+        sys.exit(0)
+
+    # ── 云端写风控检查：prop/set 被拒（-704042011）窗口内跳过下发，防再触发更严风控 ──
+    if cloud_write_blocked():
+        try:
+            with open(CLOUD_WRITE_BLOCKED) as f:
+                _t = f.read().strip()
+        except Exception:
+            _t = "?"
+        print("ac_watch: 云端写被拒（疑似风控/限流，%s 起 30 分钟内跳过下发），本轮维持现状" % _t)
         sys.exit(0)
 
     args = ["ac_watch"] + ([] if real else ["--dry"])
