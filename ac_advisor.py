@@ -1456,6 +1456,109 @@ def apply_and_commit(
     return ctrl
 
 
+# ── v8.54（2026-09-13）：伴侣失联可观测 + IP 漂移自愈 ──────────────────
+# 背景：空调伴侣被路由器重新分配 IP（192.168.71.43 → 192.168.71.2）后，
+#   read_ac_power 的 `except: pass` 把异常静默吞掉 —— 日志 4 天毫无异常，
+#   但策略既读不到状态、也发不出控制（ac_control_init 用的是同一个设备），
+#   空调实际满负荷运行 1037W 而策略记为 unknown，属于典型的"带病运行"。
+# 对策：① 任何失败都写 ac_error.log，不再静默；
+#      ② 连不上时自动广播扫描 + 用原 token 验证找新 IP 并回写配置
+#         （miio token 绑设备、不绑 IP，所以换 IP 后仍能验明正身）。
+_WARN_LOG = os.path.join(SCRIPT_DIR, "ac_error.log")
+_HEAL_STATE = os.path.join(SCRIPT_DIR, ".partner_heal.json")
+HEAL_MIN_INTERVAL_SEC = 1800  # 自愈扫描限流：30 分钟一次（巡检是每 2 分钟一轮）
+
+
+def ac_warn(msg):
+    """v8.54: 设备读写失败不再静默吞掉，统一落 ac_error.log。"""
+    try:
+        with open(_WARN_LOG, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def miio_discover(timeout=6):
+    """广播扫描局域网 miio 设备，返回 IP 列表（UDP 54321 握手）。"""
+    import socket
+    import time
+
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.settimeout(timeout)
+        s.sendto(b"\x21\x31\x00\x20" + b"\xff" * 28, ("255.255.255.255", 54321))
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                _data, addr = s.recvfrom(1024)
+                if addr[0] not in ips:
+                    ips.append(addr[0])
+            except Exception:
+                break
+        s.close()
+    except Exception:
+        pass
+    return ips
+
+
+def heal_partner_ip(token):
+    """伴侣 IP 漂移自愈：广播扫描 + 原 token 逐个验证，命中则回写 CONFIG_FILE。
+
+    返回新 IP；未找到、或在限流窗口内则返回 None。
+    """
+    # 限流：避免每 2 分钟一轮的巡检反复做 6 秒广播扫描
+    try:
+        with open(_HEAL_STATE) as f:
+            last = json.load(f).get("ts")
+        if last and (datetime.now() - datetime.fromisoformat(last)).total_seconds() < HEAL_MIN_INTERVAL_SEC:
+            return None
+    except Exception:
+        pass
+    try:
+        with open(_HEAL_STATE, "w") as f:
+            json.dump({"ts": datetime.now().isoformat(timespec="seconds")}, f)
+    except Exception:
+        pass
+
+    from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
+
+    candidates = miio_discover()
+    for ip in candidates:
+        try:
+            st = AirConditioningCompanionMcn02(ip, token).status()
+            # 伴侣的特征：能读到 load_power（净化器等设备没有这个属性）
+            if getattr(st, "load_power", None) is None:
+                continue
+        except Exception:
+            continue
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            old = (cfg.get("ac_partner") or {}).get("ip")
+            if old != ip:
+                cfg.setdefault("ac_partner", {})["ip"] = ip
+                cfg["ac_partner"]["_ip_history"] = (
+                    "%s 自动自愈：%s -> %s（伴侣 IP 被路由器重新分配；"
+                    "根治需在路由器做 DHCP 静态绑定）"
+                    % (datetime.now().strftime("%Y-%m-%d %H:%M"), old, ip)
+                )
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                ac_warn("伴侣 IP 自愈成功：%s -> %s（已回写 miio_config.json）" % (old, ip))
+        except Exception as e:
+            ac_warn("伴侣 IP 自愈：命中 %s 但回写配置失败 %s" % (ip, type(e).__name__))
+        return ip
+
+    ac_warn(
+        "伴侣 IP 自愈：扫描 %d 台设备，未找到匹配伴侣（可能真离线/断电，需人工排查）"
+        % len(candidates)
+    )
+    return None
+
+
 def read_ac_power(timeout=4.0):
     global AC_MEASURED_W, AC_SOCKET, AC_COMPANION_TARGET
     AC_SOCKET = None
@@ -1464,11 +1567,24 @@ def read_ac_power(timeout=4.0):
             cfg = json.load(f)
         ap = cfg.get("ac_partner") or {}
         if not ap.get("ip") or not ap.get("token"):
+            ac_warn("read_ac_power: miio_config.json 缺 ac_partner.ip/token")
             return None
         from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
 
-        d = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
-        st = d.status()
+        ip = ap["ip"]
+        try:
+            st = AirConditioningCompanionMcn02(ip, ap["token"]).status()
+        except Exception as e:
+            # v8.54: 连不上不再静默 —— 记日志，并尝试 IP 漂移自愈
+            ac_warn(
+                "read_ac_power: %s 连接失败（%s: %s），触发 IP 自愈扫描"
+                % (ip, type(e).__name__, str(e)[:80])
+            )
+            new_ip = heal_partner_ip(ap["token"])
+            if not new_ip:
+                return None
+            ip = new_ip
+            st = AirConditioningCompanionMcn02(ip, ap["token"]).status()
         AC_SOCKET = "on" if st.is_on else "off"
         AC_MEASURED_W = None
         # v8.42: 顺手读伴侣设定温度（回声字段，仅镜像我方发射的命令；用户改温不更新——2026-08-29 实验证实）
@@ -1478,8 +1594,9 @@ def read_ac_power(timeout=4.0):
         if st.load_power and st.load_power > 0:
             AC_MEASURED_W = round(st.load_power)
             return AC_MEASURED_W
-    except:
-        pass
+    except Exception as e:
+        # v8.54: 原为 `except: pass` —— 静默吞异常导致伴侣掉线 4 天无人察觉
+        ac_warn("read_ac_power 异常: %s: %s" % (type(e).__name__, str(e)[:120]))
     return None
 
 
