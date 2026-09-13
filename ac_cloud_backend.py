@@ -143,8 +143,8 @@ def cmd_status():
         svc = _get_service()
         # 净化器温湿度
         pur = await svc.miot_get_props(DID_PURIFIER, [(3, 7), (3, 1)])
-        # 空调伴侣：开关(2.1) 模式(2.2) 目标温度(2.3) 功率(5.1)
-        ac = await svc.miot_get_props(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+        # 空调伴侣：开关(2.1) 目标温度(2.3) 功率(5.1) —— (2.2)模式云端偶发读不到已移除
+        ac = await svc.miot_get_props(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
         modes = {0: "自动", 1: "制冷", 2: "除湿", 3: "制热", 4: "送风"}
         print("=== 净化器 4 Lite (%s) ===" % DID_PURIFIER)
         if pur and pur[0] is not None:
@@ -155,10 +155,10 @@ def cmd_status():
         if ac is None:
             print("  读取失败")
             return
-        power, mode, target, watt = ac[0], ac[1], ac[2], ac[3]
-        print("  空调: %s | 模式: %s | 目标: %s°C | 功率: %s W" % (
+        power, target, watt = ac[0], ac[1], ac[2]
+        print("  空调: %s | 模式: ? | 目标: %s°C | 功率: %s W" % (
             "开" if power is True else ("关" if power is False else "?"),
-            modes.get(mode, "?"), target, "%.0f" % watt if watt is not None else "?"))
+            target, "%.0f" % watt if watt is not None else "?"))
     _run(f())
 
 

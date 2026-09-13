@@ -53,12 +53,12 @@ class CloudACCtrl:
         self._last_set = None
 
     def status(self):
-        vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+        vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
         return SimpleNamespace(
             is_on=vals[0] is True,
-            mode=SimpleNamespace(value=MODE_INT2STR.get(vals[1])),
-            target_temperature=vals[2],
-            load_power=vals[3],
+            mode=None,  # (2,2) 模式云端读写均不可用，返回 None 让 ac_apply 跳过 set_mode
+            target_temperature=vals[1],
+            load_power=vals[2],
         )
 
     def send_command(self, cmd, args):
@@ -76,12 +76,12 @@ class CloudACCtrl:
 def cloud_read_ac_power(timeout=4.0):
     """云端读空调伴侣。语义对齐 miio 版：设置 AC_SOCKET/AC_MEASURED_W/AC_COMPANION_TARGET。"""
     try:
-        vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+        vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
         A.AC_SOCKET = "on" if vals[0] is True else ("off" if vals[0] is False else None)
         A.AC_MEASURED_W = None
-        A.AC_COMPANION_TARGET = vals[2]
-        if vals[3]:
-            A.AC_MEASURED_W = round(vals[3])
+        A.AC_COMPANION_TARGET = vals[1]
+        if vals[2]:
+            A.AC_MEASURED_W = round(vals[2])
             return A.AC_MEASURED_W
     except Exception as e:
         A.ac_warn("cloud read_ac_power fail: %s: %s" % (type(e).__name__, str(e)[:120]))
@@ -144,7 +144,7 @@ if __name__ == "__main__":
     _offline = False
     for _try in range(3):
         try:
-            _vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+            _vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
             if _vals is None or all(v is None for v in _vals):
                 _offline = True
                 time.sleep(3)

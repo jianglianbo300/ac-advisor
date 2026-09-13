@@ -79,13 +79,13 @@ def main():
             out["purifier_offline"] = True
         # 空调伴侣状态（全 None = 伴侣离线，如拔电开窗）
         try:
-            vals = await svc.miot_get_props(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+            vals = await svc.miot_get_props(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
             offline = vals is None or all(v is None for v in vals)
             out["ac"] = {
                 "ac_on": vals[0] if vals else None,
-                "ac_mode": MODES.get(vals[1], vals[1]) if vals else None,
-                "ac_target": vals[2] if vals else None,
-                "ac_watt": vals[3] if vals else None,
+                "ac_mode": None,  # (2,2) 模式云端偶发读不到，已从读取列表移除
+                "ac_target": vals[1] if vals else None,
+                "ac_watt": vals[2] if vals else None,
             }
             out["ac_offline"] = offline
         except Exception as e:
