@@ -46,12 +46,12 @@ def read_weather():
         host = "https://" + host
     try:
         import requests
-        url = "%s/v7/weather/now?location=101020100&key=%s" % (host, key)
+        url = "%s/v7/weather/now?location=121.4,31.1&key=%s" % (host, key)  # 上海闵行
         r = requests.get(url, timeout=8)
         d = r.json()
         now = d.get("now", {})
         return {"t": now.get("temp"), "rh": now.get("humidity"),
-                "text": now.get("text"), "rain": now.get("precip")}
+                "text": now.get("text"), "rain": now.get("precip"), "loc": "minhang"}
     except Exception as e:
         print("  [warn] weather fail: %s: %s" % (type(e).__name__, str(e)[:120]))
         return None
@@ -66,25 +66,32 @@ def main():
 
     async def _collect():
         out = {}
-        # 净化器温湿度
+        # 净化器温湿度（全 None = 设备离线，如断电/断网）
         try:
             vals = await svc.miot_get_props(DID_PURIFIER, [(3, 7), (3, 1)])
-            out["indoor"] = {"temp": vals[0], "hum": vals[1]}
+            offline = vals is None or all(v is None for v in vals)
+            out["indoor"] = {"temp": vals[0] if vals else None,
+                             "hum": vals[1] if vals else None}
+            out["purifier_offline"] = offline
         except Exception as e:
             print("  [warn] indoor cloud fail: %s: %s" % (type(e).__name__, str(e)[:120]))
             out["indoor"] = {"temp": None, "hum": None}
-        # 空调伴侣状态
+            out["purifier_offline"] = True
+        # 空调伴侣状态（全 None = 伴侣离线，如拔电开窗）
         try:
             vals = await svc.miot_get_props(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+            offline = vals is None or all(v is None for v in vals)
             out["ac"] = {
-                "ac_on": vals[0],
-                "ac_mode": MODES.get(vals[1], vals[1]),
-                "ac_target": vals[2],
-                "ac_watt": vals[3],
+                "ac_on": vals[0] if vals else None,
+                "ac_mode": MODES.get(vals[1], vals[1]) if vals else None,
+                "ac_target": vals[2] if vals else None,
+                "ac_watt": vals[3] if vals else None,
             }
+            out["ac_offline"] = offline
         except Exception as e:
             print("  [warn] ac cloud fail: %s: %s" % (type(e).__name__, str(e)[:120]))
             out["ac"] = {"ac_on": None, "ac_mode": None, "ac_target": None, "ac_watt": None}
+            out["ac_offline"] = True
         return out
 
     rec.update(asyncio.run(_collect()))
@@ -92,10 +99,16 @@ def main():
 
     with open(DATA_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print("t=%s rh=%s ac_on=%s ac_watt=%s wx_t=%s" % (
+    off_tags = []
+    if rec.get("ac_offline"):
+        off_tags.append("⚠️伴侣离线(可能开窗拔电)")
+    if rec.get("purifier_offline"):
+        off_tags.append("⚠️净化器离线")
+    print("t=%s rh=%s ac_on=%s ac_watt=%s wx_t=%s%s" % (
         rec["indoor"]["temp"], rec["indoor"]["hum"],
         rec["ac"]["ac_on"], rec["ac"]["ac_watt"],
-        (rec["wx"] or {}).get("t")))
+        (rec["wx"] or {}).get("t"),
+        (" " + " ".join(off_tags)) if off_tags else ""))
 
 
 if __name__ == "__main__":

@@ -121,6 +121,28 @@ A.verify_socket = cloud_verify_socket
 
 if __name__ == "__main__":
     real = "--real" in sys.argv
+    # ── 预检：空调伴侣离线（拔电/断电）时跳过本轮决策与控制 ──
+    # 全 None = 设备离线（实测：不存在 DID 返回 [None,...]，伴侣在线时
+    # 开关位必有 True/False）。离线通常=用户开窗拔掉伴侣，策略不应
+    # 尝试控制（会下发失败/误告警），只提示不动作。
+    # 注意：云端属性缓存延迟 ~5s，需带重试，避免单 prop 撞旧值误判在线。
+    _offline = False
+    for _try in range(3):
+        try:
+            _vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 2), (2, 3), (5, 1)])
+            if _vals is None or all(v is None for v in _vals):
+                _offline = True
+                time.sleep(3)
+                continue
+            _offline = False  # 开关位有值 → 在线
+            break
+        except Exception as e:
+            _offline = True
+            time.sleep(3)
+    if _offline:
+        print("ac_watch: 空调伴侣离线（可能开窗拔电），跳过本轮决策与控制")
+        sys.exit(0)
+
     args = ["ac_watch"] + ([] if real else ["--dry"])
     sys.argv = args
     ac_watch.main()
