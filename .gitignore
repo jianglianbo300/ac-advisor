@@ -70,3 +70,8 @@ _ac_on_now.py
 
 # MiMo Code 本地工具状态（.cron-lock/node_modules，不入库）
 .mimocode/
+
+# 云化改造：二维码登录会话图片（含登录信息，不入库）
+qr_login.png
+qr_login_url.png
+qr2ascii.py
