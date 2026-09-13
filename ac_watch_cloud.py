@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ac_advisor as A
 import ac_watch
+from ac_watch import COMPRESSOR_POWER_THRESHOLD, FAN_ONLY_POWER_MAX
 from ac_cloud_backend import _get_service, DID_PURIFIER, DID_AC_PARTNER
 
 # miot 模式映射（siid=2/piid=2）
@@ -164,11 +165,33 @@ def cloud_verify_socket():
     return None
 
 
+def cloud_compressor_state(load_power):
+    """云端压缩机状态判定（monkey-patch A.compressor_state）。
+
+    本地 miio 伴侣有真实压缩机状态属性；云端读不到，只能靠功率。
+    实测语义：关=2W、低载制冷=97W（变频维持 25°C）、启动=157→1038W。
+    50-300W 低载段判 compressor——避免 97W 判 unknown 导致
+    compressor_on_min 永不累计、cycle_comp_total 残留，误触发
+    WATCH_MAX_RUN=90min 保护强行关机（2026-09-14 01:47 实录：残留
+    101.4min 被当连续运行，T=27 时判 off 强制关机）。"""
+    if load_power is None:
+        return "unknown"
+    if load_power > COMPRESSOR_POWER_THRESHOLD:
+        return "compressor"
+    if load_power > FAN_ONLY_POWER_MAX:
+        return "compressor"  # 云端低载段：变频压缩机低载制冷 > 纯风扇
+    if load_power > 5:
+        return "fan_only"
+    return "off"
+
+
 # ---- monkey-patch 数据源与控制 ----
 A.read_ac_power = cloud_read_ac_power
 A.read_indoor = cloud_read_indoor
 A.ac_control_init = cloud_control_init
 A.verify_socket = cloud_verify_socket
+ac_watch.compressor_state = cloud_compressor_state  # 定义在 ac_watch 模块内，须 patch ac_watch
+A.compressor_state = cloud_compressor_state
 
 if __name__ == "__main__":
     real = "--real" in sys.argv
