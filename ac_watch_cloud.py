@@ -111,13 +111,16 @@ class CloudACCtrl:
 
 
 def cloud_read_ac_power(timeout=4.0):
-    """云端读空调伴侣。语义对齐 miio 版：设置 AC_SOCKET/AC_MEASURED_W/AC_COMPANION_TARGET。"""
+    """云端读空调伴侣。语义对齐 miio 版：设置 AC_SOCKET/AC_MEASURED_W/AC_COMPANION_TARGET。
+    注意：(5,1) 功率属性实测会卡死（2026-09-14 从 00:52 起恒定 97.27W 13 小时），
+    只有开关位 (2,1) 准确。开关=off 时功率按 None 处理（不可信），避免假压缩机
+    时长累计触发 WATCH_MAX_RUN 误关机。"""
     try:
         vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
         A.AC_SOCKET = "on" if vals[0] is True else ("off" if vals[0] is False else None)
         A.AC_MEASURED_W = None
         A.AC_COMPANION_TARGET = vals[1]
-        if vals[2]:
+        if A.AC_SOCKET == "on" and vals[2]:
             A.AC_MEASURED_W = round(vals[2])
             return A.AC_MEASURED_W
     except Exception as e:
@@ -142,23 +145,22 @@ def cloud_control_init():
 
 
 def cloud_verify_socket():
-    """云端回读 socket 状态 —— 功率物理裁决（>50W=真运行），按期望命令等待状态到位。
-    绕开云端属性缓存延迟（实测 (2,1) 与功率属性更新不同步，最长 ~12s+）。"""
+    """云端回读 socket 状态 —— 以开关位 (2,1) 为准（实测准确），功率 (5,1) 仅辅助
+    （2026-09-14 起 (5,1) 卡死恒定 97.27W 不可信，不能再用功率物理裁决）。"""
     want = getattr(A.AC_CTRL, "_last_set", None)
     for _ in range(12):
         try:
             s = A.AC_CTRL.status()
-            w = s.load_power
             if want and want[0] == "power":
-                if want[1] == "on" and (s.is_on is True or (w or 0) > 50):
+                if want[1] == "on" and s.is_on is True:
                     return "on"
-                if want[1] == "off" and s.is_on is False and (w or 999) <= 50:
+                if want[1] == "off" and s.is_on is False:
                     return "off"
-            # 无期望命令：功率物理裁决，读不到功率用开关位兜底
-            if w is not None:
-                return "on" if w > 50 else "off"
+            # 无期望命令：以开关位为准，读不到再用功率兜底
             if s.is_on is not None:
                 return "on" if s.is_on else "off"
+            if s.load_power is not None:
+                return "on" if s.load_power > 50 else "off"
         except Exception:
             pass
         time.sleep(5)
