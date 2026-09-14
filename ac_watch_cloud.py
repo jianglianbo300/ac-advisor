@@ -112,12 +112,18 @@ class CloudACCtrl:
 
 def cloud_read_ac_power(timeout=4.0):
     """云端读空调伴侣。语义对齐 miio 版：设置 AC_SOCKET/AC_MEASURED_W/AC_COMPANION_TARGET。
-    注意：(5,1) 功率属性实测会卡死（2026-09-14 从 00:52 起恒定 97.27W 13 小时），
-    只有开关位 (2,1) 准确。开关=off 时功率按 None 处理（不可信），避免假压缩机
-    时长累计触发 WATCH_MAX_RUN 误关机。"""
+    坑位记录（2026-09-14）：
+    - (5,1) 功率曾卡死恒定 97.27W（00:52-15:1x）→ 关机态功率按 None 处理
+    - (2,1) 开关位下发后缓存滞后 60-120s（17:2x 实测读到 False 但功率 1011W 在制冷）
+    → 交叉校验：开关位=off 但功率>300W 明显矛盾（关了不可能 300W+），判缓存滞后按 on 处理；
+      97W 卡死值/39W 启动值均 <300W 不会误判。"""
     try:
         vals = _cloud_get(DID_AC_PARTNER, [(2, 1), (2, 3), (5, 1)])
-        A.AC_SOCKET = "on" if vals[0] is True else ("off" if vals[0] is False else None)
+        switch = vals[0]
+        if switch is False and vals[2] and vals[2] > 300:
+            A.ac_warn("cloud read_ac_power: (2,1)=off 但功率 %.0fW>300W，判缓存滞后按 on 处理" % vals[2])
+            switch = True
+        A.AC_SOCKET = "on" if switch is True else ("off" if switch is False else None)
         A.AC_MEASURED_W = None
         A.AC_COMPANION_TARGET = vals[1]
         if A.AC_SOCKET == "on" and vals[2]:
@@ -158,6 +164,8 @@ def cloud_verify_socket():
                     return "on"
                 if want[1] == "off" and s.is_on is False:
                     return "off"
+                # 期望命令未到位（下发后属性缓存滞后）：继续等待收敛，不落 no-want 分支
+                continue
             # 无期望命令：以开关位为准，读不到再用功率兜底
             if s.is_on is not None:
                 return "on" if s.is_on else "off"
