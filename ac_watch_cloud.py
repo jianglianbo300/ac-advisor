@@ -146,9 +146,11 @@ def cloud_control_init():
 
 def cloud_verify_socket():
     """云端回读 socket 状态 —— 以开关位 (2,1) 为准（实测准确），功率 (5,1) 仅辅助
-    （2026-09-14 起 (5,1) 卡死恒定 97.27W 不可信，不能再用功率物理裁决）。"""
+    （2026-09-14 起 (5,1) 卡死恒定 97.27W 不可信，不能再用功率物理裁决）。
+    注意：(2,1) 属性下发后缓存滞后实测可达 60-120s，等待窗口取 15×8s=120s；
+    超时返回 None（无法确认，不误报 on/off，避免污染 state/manual 锚点）。"""
     want = getattr(A.AC_CTRL, "_last_set", None)
-    for _ in range(12):
+    for _ in range(15):
         try:
             s = A.AC_CTRL.status()
             if want and want[0] == "power":
@@ -163,7 +165,7 @@ def cloud_verify_socket():
                 return "on" if s.load_power > 50 else "off"
         except Exception:
             pass
-        time.sleep(5)
+        time.sleep(8)
     return None
 
 

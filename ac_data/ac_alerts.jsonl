@@ -136,3 +136,17 @@
 {"ts": "2026-09-10T02:28:31", "streak": 12, "action": "", "reason": "status_read_failed: Unable to discover the device 192.168.71.43", "mode": "cooling"}
 {"ts": "2026-09-10T07:59:00", "streak": 13, "action": "", "reason": "status_read_failed: Unable to discover the device 192.168.71.43", "mode": "cooling"}
 {"ts": "2026-09-10T23:10:23", "streak": 14, "action": "", "reason": "status_read_failed: Unable to discover the device 192.168.71.43", "mode": "cooling"}
+{"ts": "2026-09-14T06:06:02", "streak": 8, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T06:48:10", "streak": 9, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T07:30:52", "streak": 10, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T08:15:20", "streak": 11, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T08:45:24", "streak": 12, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T09:35:58", "streak": 13, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T10:08:35", "streak": 14, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T10:59:14", "streak": 15, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T11:33:03", "streak": 16, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T12:08:16", "streak": 17, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T12:39:32", "streak": 18, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T13:21:44", "streak": 19, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T14:15:46", "streak": 20, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
+{"ts": "2026-09-14T14:53:29", "streak": 21, "action": "关机", "reason": "power_off_failed: miot set code=[-704042011]", "mode": "cooling"}
