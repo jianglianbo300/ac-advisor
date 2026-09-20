@@ -18,11 +18,12 @@ import math
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.54"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.55"  # 单一版本戳：docstring/print/selftest 全引用此处（云端v8.54+K3 v8.55 融合）
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -237,6 +238,9 @@ def _rotate_if_big(path, max_bytes=10 * 1024 * 1024):  # v8.40: N1 日志轮转�
             os.replace(path, path + ".old")
     except Exception:
         pass
+
+
+_PAUSED_LOG_LAST = {"ts": 0.0}  # v8.55: 暂停期日志节流（模块级，进程内 1h 一条）
 
 
 def log(msg):
@@ -1180,6 +1184,64 @@ def main():
     A.reconcile_state(
         state, now_ts, load_power=load_power
     )  # v8.43: 功率门控防手动锚点震荡
+
+    # ── v8.55: 软开关暂停（ac_control=false）的干净语义 ──────────────
+    # 审计实证（2026-09-20，streak=678 / ac_alerts 671条 / decision_log 数百条
+    # evaluated 垃圾）：用户暂停只关 ac_control 软开关、cron 保留（采集不断链，
+    # 09-19 用户指令原话），但主循环每 2 分钟照常决策 → apply_and_commit 空转
+    # 报 control_unavailable → 累计告警 streak + 写告警日志 + 记 decision_log
+    # （executed=false 被 evaluate 回评）——大脑想动手被绑，全天刷垃圾数据。
+    # 本块把暂停语义改为：保留观察/记账/自学习（reconcile/kwh/rh_history/
+    # evaluate 照常跑，采集链不断），仅跳过决策与执行（不产生 decision_log、
+    # 不告警）。运行中周期不早退：继续监护（MIN_RUN/90min 上限/达标记录），
+    # 但不新发 off 指令（暂停=不动手）。
+    if A.AC_CONTROL_PAUSED and state.get("mode") not in ("cooling", "dehumid", "dehumid_alert"):
+        # 一次性清理暂停前/旧版本残留的内部字段（不碰 manual_on_at/manual_off_at
+        # 等用户意图锚点）。_ctrl_fail_streak 不清零、冻结保留，避免暂停期每轮
+        # 重建 1/2/3… 的计数噪音；恢复后首个真实失败从冻结值继续。
+        for _k in (
+            "_phantom_gate_at",
+            "_override_run_at",
+            "_unmanaged_run_since",
+            "_on_flip_high_at",
+            "_pending_manual_on_learn",
+        ):
+            state.pop(_k, None)
+        state["compressor_state"] = comp_idle = (
+            "compressor" if (load_power or 0) > 300 else "off"
+        )
+        # kWh 日账/峰谷账与历史序列照常记账（复用主流程同一套函数，防双写漂移）
+        _today0 = now_ts[:10]
+        if state.get("_daily_kwh_date") != _today0:
+            state["_daily_kwh"] = 0.0
+            state["_daily_kwh_date"] = _today0
+        update_kwh(state, now_ts, load_power)
+        _inc = state.get("estimated_kwh", 0) - state.get("_prev_kwh", 0)
+        if _inc > 0:
+            state["_daily_kwh"] = state.get("_daily_kwh", 0) + _inc
+            _band0 = "valley" if (now_dt.hour >= 22 or now_dt.hour < 6) else "peak"
+            _bb = state.setdefault(
+                "_kwh_by_price_band", {"peak": 0.0, "valley": 0.0, "date": _today0}
+            )
+            if _bb.get("date") != _today0:
+                _bb = {"peak": 0.0, "valley": 0.0, "date": _today0}
+                state["_kwh_by_price_band"] = _bb
+            _bb[_band0] = round(_bb.get(_band0, 0.0) + _inc, 4)
+        state["_prev_kwh"] = state.get("estimated_kwh", 0)
+        if state.get("_hum_src") == "indoor":
+            update_rh_history(state, now_ts, hum)
+        update_temp_history(state, now_ts, temp)
+        A.save_state(state)
+        evaluate(state, now_ts)  # 学习闭环照常（回评旧决策），但不产生新决策
+        _pt = time.time()
+        if _pt - _PAUSED_LOG_LAST["ts"] >= 3600:
+            _PAUSED_LOG_LAST["ts"] = _pt
+            log(
+                f"[暂停期] ac_control=false，仅采集不决策（T={temp} RH={hum}% "
+                f"power={load_power}W）"
+            )
+        return
+    # ── v8.55 结束 ───────────────────────────────────────────────────
 
     # ── v8.40 H2: 非托管运行接管（socket=on 而 state 无运行态）──
     _TAKEOVER_KEY = "_unmanaged_run_since"
