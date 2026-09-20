@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.52"  # 单一版本戳：docstring/print/selftest 全引用此处
+VERSION = "v8.54"  # 单一版本戳：docstring/print/selftest 全引用此处
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -196,6 +196,7 @@ KWH_MAX_GAP_MIN = 10
 VENT_GATE_DP_DIFF = 1.5
 VENT_GATE_MAX_RH = 69
 VENT_GATE_HOURS = (8, 22)
+VENT_STUFFY_RH = 60.0  # v8.54 室外闷热湿度阈值：≥60% 无风高湿，通风无效，直接判开空调
 VENT_WX_TTL_MIN = 30
 
 EVENING = (20, 23)
@@ -373,14 +374,22 @@ def is_temp_stable(state, target, slack, window_min):
     return all(abs(t - target) <= slack for t in in_window)
 
 
-def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in):
+def vent_gate_decision(hour, hum, temp, rain, dp_out, dp_in, outdoor_rh=None):
     # v8.50 fix (Astra外审 pass1#4): 旧实现只比较露点差，高温制冷需求会被
     # 无限拦截（室外热而干时 dp_out 仍可满足门限，却完全不能给室内降温）。
     # ①降雨否决：下雨天通风=引湿，露点差无意义；②高温硬豁免：室温已到制冷
     # 启动线（TEMP_COOLING=27）说明确有制冷需求，不拿"免费除湿"赌用户舒适。
+    # v8.54 fix (用户 9-16 实录): 室外高湿(≥VENT_STUFFY_RH)无风闷热天，开窗=
+    # 引湿且空气不对流，室内温度根本降不下来（外 23°C/63% 时开窗屋内仍 27°C），
+    # 此时不得以"免费除湿"拦截开机 → 直接判开空调；同时补上 VENT_GATE_HOURS
+    # 时间窗口（8-22 点外不拦截，避免夜间睡眠时段拦截制冷）。
     if dp_out is None or dp_in is None:
         return False
     if rain:
+        return False
+    if outdoor_rh is not None and outdoor_rh >= VENT_STUFFY_RH:
+        return False
+    if not (VENT_GATE_HOURS[0] <= hour < VENT_GATE_HOURS[1]):
         return False
     if temp is not None and temp >= A.TEMP_COOLING:
         return False
@@ -696,6 +705,7 @@ def decide(
     evening=False,
     outdoor_temp=None,
     outdoor_rain=None,
+    outdoor_rh=None,
     is_steady_state=False,
     predicted_cool_min=None,
     sched_override_exempt=False,
@@ -717,6 +727,13 @@ def decide(
     if running is None:
         return (None, None, None)
     if running:
+        # v8.54 带载豁免（修正 v8.53）：只豁免 WATCH_MAX_RUN 保护门。
+        # 9-16 实录复盘：999W 制冷中空调被"已自动关机"，经审计实为 WATCH_MAX_RUN
+        # 90min 门 + comp_min 残留虚高误触发（9-14 01:47 同款实录），27°C 时所有
+        # 省电门（均带"温度已达标"前置）本就不触发。故：压缩机真正带载制冷时
+        # 不得以"运行超时"强制关机（用户开着就是要制冷；到温压缩机自己降频/停，
+        # 不存在真空转 90 分钟）；省电门恢复原语义（温度达标/湿度达标才关）。
+        _comp_loaded = compressor == "compressor"
         # v8.32 最小有效运行闸门：开机 N 分钟压缩机从未启动（一直仅风扇/未知）
         # → 纯风扇空转，止损关机。放最前面，白天/夜间/除湿路径统一生效。
         # v8.50 fix (Astra外审 pass1#2): 绝对温度下限前移到 fan_only 分支之前——
@@ -799,7 +816,12 @@ def decide(
 
         comp_min = compressor_run_min if compressor_run_min is not None else since_on
 
-        if comp_min is not None and comp_min >= WATCH_MAX_RUN and not evening:
+        if (
+            comp_min is not None
+            and comp_min >= WATCH_MAX_RUN
+            and not evening
+            and not _comp_loaded
+        ):
             return (
                 "off",
                 None,
@@ -1065,6 +1087,13 @@ def decide(
             )
         return (None, None, None)
 
+    # v8.54 室外闷热修正：室外高湿(≥60%)无风 → 通风无效，启动线降 1°C（26 也开）。
+    # 防抖振说明：26 开/25 关周期 30-60 分钟，远长于 v8.30 关注的 25开/26关
+    # 20 分钟短循环；且 v8.53 带载豁免保证 26°C 开机后不被湿度门立刻关掉。
+    _stuffy_out = outdoor_rh is not None and outdoor_rh >= VENT_STUFFY_RH
+    if _stuffy_out:
+        temp_cooling = min(temp_cooling, 26.0)
+
     # 峰谷电：峰电提高阈值（晚开省电）
     is_peak = A.current_price() >= A.ELECTRIC_PEAK
     # v8.37 fix: 峰电推迟对"闷热"豁免。上海居民分时确为峰 6-22 时/谷 22-6 时（已核实
@@ -1073,7 +1102,7 @@ def decide(
     # "峰电推迟"名存实亡。08-29 实测 27.0°C/RH67% 判无动作，用户 15:18 与 16:00
     # 两次手动开机（近 10 条 manual_on=6）→ 该阈值下用户不认可。
     # 改为：湿度已达代码自身定义的"闷"阈值 HUM_DEHUMID_ON(65) 时不推迟；干热仍省电。
-    muggy = hum is not None and hum >= A.HUM_DEHUMID_ON
+    muggy = (hum is not None and hum >= A.HUM_DEHUMID_ON) or _stuffy_out  # v8.54 室外闷热同样不推迟
     temp_threshold = temp_cooling + (
         0.0 if muggy else (PEAK_START_DEFERRAL if is_peak else 0.0)
     )
@@ -1668,6 +1697,7 @@ def main():
         evening=evening,
         outdoor_temp=_outdoor_t,
         outdoor_rain=_outdoor_rain,
+        outdoor_rh=_wx.get("rh") if _wx else None,
         is_steady_state=False,
         predicted_cool_min=_predicted_cool_min,
         sched_override_exempt=_override_exempt,
@@ -1789,7 +1819,13 @@ def main():
         wx = cached_outdoor(state, now_dt)
         dp_out = dew_point(wx["t"], wx["rh"]) if wx else None
         if vent_gate_decision(
-            now_dt.hour, hum, temp, wx and wx.get("rain"), dp_out, dp
+            now_dt.hour,
+            hum,
+            temp,
+            wx and wx.get("rain"),
+            dp_out,
+            dp,
+            wx and wx.get("rh"),
         ):
             log(f"vent_gate 拦截开机（室外干爽可免费除湿）· {meta}")
             # v8.50 fix (Astra外审 pass1#6/#8): vent 拦截 = 未执行，标记防止
@@ -1968,6 +2004,10 @@ def _selftest():
     assert vent_gate_decision(15, 66, 26, 10, None, 21.0) is False
     assert vent_gate_decision(15, 66, 26, 80, None, 19.0) is False
     assert vent_gate_decision(15, 66, 26, 10, None, None) is False
+    # v8.54：室外高湿无风 → 通风无效，不拦截（判开空调）；室外干爽仍按原逻辑拦截
+    assert vent_gate_decision(15, 66, 26, 0, 18.0, 21.0, outdoor_rh=63) is False
+    assert vent_gate_decision(15, 66, 26, 0, 18.0, 21.0, outdoor_rh=50) is True
+    assert vent_gate_decision(23, 66, 26, 0, 18.0, 21.0, outdoor_rh=50) is False  # 夜间窗口外不拦截
 
     # ── kWh 积分 ──
     st = {}
