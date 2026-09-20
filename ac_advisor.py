@@ -942,14 +942,27 @@ AC_SOCKET = None
 AC_COMPANION_TARGET = None  # v8.42: 伴侣设定温度（回声字段，仅镜像我方发射命令）
 
 
+AC_CONTROL_PAUSED = False  # v8.55: 软开关暂停语义（用户意图），本轮配置快照
+
+
 def ac_control_init():
-    global AC_CTRL
+    global AC_CTRL, AC_CONTROL_PAUSED
     AC_CTRL = None
+    AC_CONTROL_PAUSED = False
     try:
         with open(CONFIG_FILE) as f:
             cfg = json.load(f)
+        # v8.55: 显式区分「用户暂停」（ac_control=false，用户意图，静默跳过决策）
+        # 与「控制不可用」（ac_control=true 但伴侣掉线/初始化失败，是真故障，
+        # 需照常走到 apply_and_commit 产生 streak/告警）。旧代码两者都只有
+        # AC_CTRL=None 一个信号，无法区分（v8.55 早退块曾用 AC_CTRL is None
+        # 判定 → test_sensor_fallback 19 例全灭：测试 stub 后 AC_CTRL=None
+        # 被误当暂停；真实伴侣掉线也会被误静默——正是 v8.51 修的告警盲区）。
+        if not cfg.get("ac_control", True):
+            AC_CONTROL_PAUSED = True
+            return
         ap = cfg.get("ac_partner") or {}
-        if ap.get("ip") and ap.get("token") and cfg.get("ac_control", True):
+        if ap.get("ip") and ap.get("token"):
             from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
 
             AC_CTRL = AirConditioningCompanionMcn02(ap["ip"], ap["token"])
@@ -1405,12 +1418,19 @@ def apply_and_commit(
         now_ts = datetime.now().isoformat(timespec="seconds")
     ctrl = ac_apply(new_mode, target_temp)
     if ctrl["status"] == "failed":
-        # v8.51: 连续失败计数，阈值触发告警（曾静默重试 2.5h 无提醒）
-        streak = int(state.get("_ctrl_fail_streak", 0)) + 1
-        state["_ctrl_fail_streak"] = streak
-        save_state(state)
-        if streak >= CTRL_FAIL_ALERT_THRESHOLD:
-            _alert_ctrl_failure(state, ctrl, streak)
+        # v8.55: 暂停期（ac_control=false → AC_CTRL=None）产生的 control_unavailable
+        # 不累计连续失败、不触发告警——09-19 用户只关软开关、保留 cron（采集不断链），
+        # 决策引擎每 2 分钟空转，streak 一天刷到 678、ac_alerts.jsonl 671 条垃圾、
+        # 且微信投递 cron 已禁用（无人收件）。软开关暂停是用户意图不是故障。
+        if ctrl.get("reason") != "control_unavailable":
+            # v8.51: 连续失败计数，阈值触发告警（曾静默重试 2.5h 无提醒）
+            streak = int(state.get("_ctrl_fail_streak", 0)) + 1
+            state["_ctrl_fail_streak"] = streak
+            save_state(state)
+            if streak >= CTRL_FAIL_ALERT_THRESHOLD:
+                _alert_ctrl_failure(state, ctrl, streak)
+        else:
+            save_state(state)
         return ctrl
     real = verify_socket()
     if real is None:
@@ -1419,7 +1439,13 @@ def apply_and_commit(
             "action": ctrl.get("action", ""),
             "reason": "verify_unreachable",
         }
+        # v8.55: verify 失败同口径计入连续失败计数（旧代码此处直接 return，
+        # 指令发出但验证不可达的失败永不计 streak → 告警盲区）
+        streak = int(state.get("_ctrl_fail_streak", 0)) + 1
+        state["_ctrl_fail_streak"] = streak
         save_state(state)
+        if streak >= CTRL_FAIL_ALERT_THRESHOLD:
+            _alert_ctrl_failure(state, ctrl, streak)
         return ctrl
     contradict = apply_state_from_verify(state, new_mode, real, now_ts)
     if contradict:
@@ -1428,6 +1454,12 @@ def apply_and_commit(
             "action": ctrl.get("action", ""),
             "reason": "verify_on_after_off" if real == "on" else "verify_off_after_on",
         }
+        # v8.55: 矛盾回读同样是控制失败，计入 streak（旧代码跌进 success 路径，
+        # 下方 state.pop("_ctrl_fail_streak") 反而把计数清零 → 反复矛盾永不告警）
+        streak = int(state.get("_ctrl_fail_streak", 0)) + 1
+        state["_ctrl_fail_streak"] = streak
+        if streak >= CTRL_FAIL_ALERT_THRESHOLD:
+            _alert_ctrl_failure(state, ctrl, streak)
     if meta and not contradict:
         for k, v in meta.items():
             state[k] = v
