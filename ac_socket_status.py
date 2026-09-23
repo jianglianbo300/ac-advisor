@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.environ["USERPROFILE"], "homeassistant-venv",
 from micloud import MiCloud
 
 AUTH = json.load(open(os.path.join(os.environ["USERPROFILE"], "xiaomi_auth.json")))
-mc = MiCloud("13125554911", "Bo7812700874")
+mc = MiCloud(os.environ["MI_USER"], os.environ["MI_PASSWORD"])
 mc.service_token = AUTH["serviceToken"]
 mc.user_id = AUTH["userId"]
 mc.ssecurity = AUTH["ssecurity"]

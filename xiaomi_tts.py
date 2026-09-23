@@ -26,8 +26,8 @@ AUTH_FILE = r"C:\Users\Administrator\xiaomi_auth.json"
 TOKEN_FILE = r"C:\Users\Administrator\.mi.token"
 SOUND_DID = "501560617"          # Xiaomi Sound (miotDID)
 SOUND_NAME_HINT = ("sound", "speaker", "小爱")
-_USER = "13125554911"
-_PASS = "Bo7812700874"
+_USER = os.environ.get("MI_USER", "")
+_PASS = os.environ.get("MI_PASSWORD", "")
 _device_id_cache = None          # 解析出的 Xiaomi Sound deviceID(UUID)，进程内缓存
 
 

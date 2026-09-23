@@ -7,10 +7,11 @@ except (ImportError, ModuleNotFoundError):
     import sys; sys.exit(0)
 
 import asyncio
+import os
 
-# 这些从 Xiaomi Cloud Token 工具拿
-USERNAME = "13125554911"
-PASSWORD = "Bo7812700874"
+# 这些从环境变量拿（原明文账号口令因公开仓库泄漏已移除）
+USERNAME = os.environ.get("MI_USER", "")
+PASSWORD = os.environ.get("MI_PASSWORD", "")
 SERVER = "cn"
 
 PURIFIER_DID = "875028325"

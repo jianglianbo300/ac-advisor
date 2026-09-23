@@ -44,8 +44,8 @@ QR_FILE = r"C:\Users\Administrator\Desktop\mi_qr_login.png"
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qr_session.json")
 SOUND_DID = "501560617"          # Xiaomi Sound (miotDID)
 SESSION_TTL = 600                # 扫码会话缓存有效期（秒）
-_USER = "13125554911"
-_PASS = "Bo7812700874"
+_USER = os.environ.get("MI_USER", "")
+_PASS = os.environ.get("MI_PASSWORD", "")
 
 # aiohttp cookie 白名单（避免畸形 cookie 名触发 CookieError）
 COOKIE_WHITELIST = {"passToken", "userId", "cUserId", "deviceId", "sdkVersion",
