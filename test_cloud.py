@@ -14,7 +14,7 @@ PASSWORD = "Bo7812700874"
 SERVER = "cn"
 
 PURIFIER_DID = "875028325"
-PURIFIER_TOKEN = "c12622c390a94c90e25083e54d36ace0"
+PURIFIER_TOKEN = "<REDACTED-miio-token>  # 原明文 token 因公开仓库泄漏已移除，改从环境变量 MIIO_TOKEN 读取"
 
 async def main():
     mc = MiCloud(USERNAME, PASSWORD, SERVER)
