@@ -3,7 +3,7 @@ import sys; sys.path.insert(0, 'C:/Users/Administrator/AppData/Local/Programs/Py
 from miio import Device
 import json
 
-d = Device('192.168.71.120', 'c12622c390a94c90e25083e54d36ace0', timeout=5)
+d = Device('192.168.71.120', '<REDACTED-miio-token>', timeout=5)
 
 # 枚举所有可能的 siid/piid 组合
 results = []
