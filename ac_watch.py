@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.55"  # 单一版本戳：docstring/print/selftest 全引用此处（云端v8.54+K3 v8.55 融合）
+VERSION = "v8.59"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.58 + DeepSeek 交叉审计 T5/T1 修复）
 
 # ── TTS 语音 ──
 _tts_engine = None
@@ -1721,6 +1721,19 @@ def main():
                     _schedule_override = _dp_cache.get("override", False)
                     _schedule_target = _dp_cache.get("target")
                     _schedule_reason = _dp_cache.get("reason")
+                    # v8.59 fix (DeepSeek 交叉审计 T5, P0): 缓存回灌是**消费点**，必须在此夹取。
+                    # 08-21 事故：DP 生产者把 55 写进 _dp_schedule_cache（当时该分支缺夹取），
+                    # 此后每拍从缓存原样读回 → `执行 cooling target=55` 真实下发并开机，
+                    # target=55 持久化 ~2h12m（22:38→00:50）。v8.29/v8.39 的夹取只加在
+                    # 生产者（L1764/L1858），挡不住陈旧缓存与未来新增的生产路径。
+                    # 教训：防御要放在消费点，不是生产者。
+                    if _schedule_target is not None:
+                        try:
+                            _schedule_target = int(min(26, max(24, _schedule_target)))
+                        except (TypeError, ValueError):
+                            _schedule_target = None
+                            _schedule_override = False
+                            _schedule_reason = None
                     # audit8 fix: 已达蓄冷目标则缓存失效，避免凌晨抖振（关机→缓存未清→又开→又关循环）
                     if (
                         _schedule_override

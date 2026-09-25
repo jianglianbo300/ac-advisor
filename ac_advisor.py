@@ -1460,7 +1460,11 @@ def apply_and_commit(
             state["_target_drift"] = {"want": target_temp, "got": _real_t}
         else:
             state.pop("_target_drift", None)
-    state.pop("_ctrl_fail_streak", None)  # v8.51: 控制成功即清零连续失败计数
+    # v8.59 fix (DeepSeek 交叉审计 T1, P1): 原为无条件执行，会把上面 contradict 分支
+    # 刚累加的 _ctrl_fail_streak 立刻清零 → 反复矛盾回读永不告警（20 轮 0 告警）。
+    # v8.55 的注释已点明此坑，但只加了累加、漏改本行。改为仅"控制成功"才清零。
+    if not contradict:
+        state.pop("_ctrl_fail_streak", None)  # v8.51: 控制成功即清零连续失败计数
     save_state(state)
     if tts_reason and not contradict:
         try:
