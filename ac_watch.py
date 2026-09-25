@@ -1867,8 +1867,15 @@ def main():
         _schedule_target = _dehumidify_target
         _schedule_reason = _dehumidify_reason
         # v8.39 fix: 预除湿目标必须夹在 [24,26]，不盲信外部函数返回值
+        # v8.59 fix (DeepSeek 交叉审计 D2, P1): 夹取**不能**替代语义修正。
+        # D2 的根因是生产方返回 55(=%RH) 而这里是温度消费点——v8.39 的
+        # min/max 只把 55 变成了 26，却让"预除湿到55%RH"被静默改写为
+        # "制冷26°C"。已在 ac_advisor.predict_dehumidify_need 修正契约
+        # （返回 DEHUMIDIFY_COOL_TARGET），此处保留夹取作为越界兜底。
         if _schedule_target is not None:
-            _schedule_target = int(min(26, max(24, _schedule_target)))
+            _schedule_target = int(
+                min(26, max(24, _schedule_target))
+            )
 
     COMP_LABEL = {
         "compressor": "压缩机运行",

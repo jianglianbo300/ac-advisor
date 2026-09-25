@@ -37,6 +37,11 @@ COOL_DUTY = 0.70
 # 恢复 v10.0 原值 40（对齐「压轮 24°C 40~60min」早报文案）。
 COOL_BURST_MIN = 40
 
+# v8.59 fix (DeepSeek 交叉审计 D2, P1): 谷电预除湿的**制冷温度**目标。
+# 与 predict_dehumidify_need 的第二返回值、ac_watch.py 的 _schedule_target
+# 同名同量纲（°C），避免"55(%RH) 被当 26°C 下发"的历史语义错配。
+DEHUMIDIFY_COOL_TARGET = 26
+
 # v8.51 audit 2026-09-06: 空调控制连续失败告警（status_read_failed 曾静默重试 2.5h 无提醒）
 CTRL_FAIL_ALERT_THRESHOLD = 8  # 连续失败≥8次(≈16min@2min tick)触发告警
 
@@ -237,10 +242,18 @@ def predict_dehumidify_need(wx, current_hum, current_temp):
     avg_future_rh = sum(valid_rh) / len(valid_rh)
     if max_future_rh > 70 or avg_future_rh > 65:
         if current_hum and current_hum > 55:
+            # v8.59 fix (DeepSeek 交叉审计 D2, P1): 第二返回值此前硬编码 55，
+            # 语义是"%RH 目标"，但唯一消费点 ac_watch.py:1866 把它当**温度**
+            # 用（v8.39 的 int(min(26,max(24,55)))=26 只夹住了数值，没改语义）。
+            # 结果是"预除湿到 55%RH"被下发成"制冷 26°C"，日志却仍写"预除湿至55%"。
+            # 2026-08-21 22:38 实证：预除湿分支把 55 填进 _schedule_target，
+            # 覆盖了 DP 原本的 target=24，下发 target=55°C 并持续 24h07m。
+            # 契约修正：第二返回值统一为**除湿制冷温度**，与消费点同名同量纲。
             return (
                 True,
-                55,
-                f"谷电预湿：明日最高RH{max_future_rh:.0f}%，当前{current_hum:.0f}%，预除湿至55%",
+                DEHUMIDIFY_COOL_TARGET,
+                f"谷电预湿：明日最高RH{max_future_rh:.0f}%，当前{current_hum:.0f}%，"
+                f"预除湿制冷至{DEHUMIDIFY_COOL_TARGET}°C",
             )
     return False, None, None
 
