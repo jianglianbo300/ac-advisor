@@ -409,8 +409,10 @@ def cached_outdoor(state, now_dt):
             ts = datetime.fromisoformat(c["ts"])
             if (now_dt - ts).total_seconds() < VENT_WX_TTL_MIN * 60:
                 return c["wx"]
+            # v8.57 fix (kimi-k3 审计 P2 2026-09-25): 过期缓存主动剔除，防字段长期残留被异常路径复活引用。
+            state.pop("_vent_wx_cache", None)
         except Exception:
-            pass
+            state.pop("_vent_wx_cache", None)
     try:
         wx_data = A.fetch_weather()
         if "error" not in wx_data:
@@ -728,6 +730,17 @@ def decide(
     # v8.30 防抖振：启动线不得低于 关机线(target最低25)+slack(1)+迟滞(1)=27。
     # 学习负偏移把启动线压进 [25,26] 死区 → 25开/26关 20分钟一轮短循环（08-25 实录）。
     temp_cooling = max(A.TEMP_COOLING + adj, DAY_START_LINE_FLOOR)
+
+    # v8.57 fix (kimi-k3 审计 P2 2026-09-25): temp/hum 统一 None 防御。
+    # main() 的 last_temp/last_hum 回退在首启/长期断档时仍可能为 None，
+    # 下方 30+ 处裸比较会抛 TypeError 致整 tick 崩溃。
+    if temp is None or hum is None:
+        if running:
+            # 运行态：SENSOR_FALLBACK_ON_ALLOWED=False 语义 = 不允许拿陈旧/缺失数据继续决策。
+            # fail-safe 选 off 而非 None：None 会让空调在传感器失联下无限续跑（旁路所有保护门），off 是唯一可恢复可观测的安全态。
+            return ("off", None, "fail-safe: 传感器失联(temp/hum=None)，运行态强制关机")
+        # 非运行态：SENSOR_FALLBACK_OFF_ALLOWED=True 允许 fallback，无数据即无开机依据，不决策（保持 off）。
+        return (None, None, None)
 
     if running is None:
         return (None, None, None)
@@ -1205,6 +1218,33 @@ def main():
         state, now_ts, load_power=load_power
     )  # v8.43: 功率门控防手动锚点震荡
 
+    # v8.57 fix (kimi-k3 审计 P2 2026-09-25): 陈旧运行态自愈。
+    # 实测 ac_state.json 出现 run_start=09-21 / compressor_on_since=09-25 的 4 天不自洽字段（cron 断档遗留）。
+    # run_start 距今 >180min 且无近期 compressor_on_since 佐证 → 判定陈旧运行态，重置防误判。
+    _rs = state.get("run_start")
+    if _rs and state.get("mode") in ("cooling", "dehumid", "on"):
+        try:
+            _rs_dt = datetime.fromisoformat(_rs) if isinstance(_rs, str) else _rs
+            _rs_age_min = (now_dt - _rs_dt).total_seconds() / 60
+            if _rs_age_min > 180:
+                _cos = state.get("compressor_on_since")
+                _cos_fresh = False
+                if _cos:
+                    try:
+                        _cos_dt = datetime.fromisoformat(_cos) if isinstance(_cos, str) else _cos
+                        _cos_fresh = (now_dt - _cos_dt).total_seconds() < 180 * 60
+                    except Exception:
+                        _cos_fresh = False
+                if not _cos_fresh:
+                    log(
+                        f"[SELF-HEAL] 陈旧运行态：run_start={_rs}（{_rs_age_min:.0f}min前）"
+                        f" 无近期 compressor_on_since={_cos}，重置 mode=off/run_start=None"
+                    )
+                    state["run_start"] = None
+                    state["mode"] = "off"
+        except Exception as _e:
+            log(f"[SELF-HEAL] run_start 校验异常（忽略）：{_e}")
+
     # ── v8.55: 软开关暂停（ac_control=false）的干净语义 ──────────────
     # 审计实证（2026-09-20，streak=678 / ac_alerts 671条 / decision_log 数百条
     # evaluated 垃圾）：用户暂停只关 ac_control 软开关、cron 保留（采集不断链，
@@ -1675,6 +1715,18 @@ def main():
         _h = now_dt.hour
         # 检查缓存：同一小时内不重算
         _dp_cache = state.get("_dp_schedule_cache", {})
+        # v8.57 fix (kimi-k3 审计 P2 2026-09-25): 缓存跨天强制失效剔除，
+        # 防 cron 断档后陈旧调度被复活引用（实测出现 5 天前缓存）。
+        if _dp_cache.get("ts"):
+            try:
+                if (
+                    now_dt - datetime.fromisoformat(_dp_cache["ts"])
+                ).total_seconds() >= 86400:
+                    state.pop("_dp_schedule_cache", None)
+                    _dp_cache = {}
+            except Exception:
+                state.pop("_dp_schedule_cache", None)
+                _dp_cache = {}
         if _dp_cache.get("hour") == _h and _dp_cache.get("ts"):
             try:
                 _cache_age = (
