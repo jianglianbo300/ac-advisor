@@ -1378,6 +1378,13 @@ def apply_state_from_verify(state, new_mode, real, now_ts):
             if not was_on:
                 state["run_start"] = now_ts
                 state["last_on_at"] = now_ts
+                # v8.59 fix (DeepSeek 交叉审计 T6, P2): 新 run 起点必须同步刷新
+                # _run_start_kwh 起点快照。原先只有手动开机锚点（L1327）刷新，
+                # 本路径只设 run_start → 留下**旧 run 的 kWh 起点**，
+                # 使 reconcile_state 的关机学习门控
+                # `estimated_kwh - _run_start_kwh >= 0.005` 用错误起点比对、
+                # 增量被高估 → 幻象配对可能被学习（v8.50e 想堵的东西在此漏了）。
+                state["_run_start_kwh"] = state.get("estimated_kwh")
             state["mode"] = new_mode
             return None
         state["mode"] = "cooling"
