@@ -75,3 +75,14 @@ _ac_on_now.py
 qr_login.png
 qr_login_url.png
 qr2ascii.py
+
+# ── 外审工作区产物（2026-09-26）─────────────────────────────
+# 审计运行产物体积大（单次 .raw 可达 6 MB）且含完整推理链，
+# 其中可能包含源码上下文；只保留 mk_slices.py / verify_findings.py /
+# severity_recheck.md 等**可复现工具**，产物一律不入库。
+_audit_slices/results/
+_audit_slices/*.raw
+_audit_slices/_t_*.json
+_audit_slices/_t_*.jsonl
+_audit_slices/_t_*.log
+_audit_slices/__pycache__/
