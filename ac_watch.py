@@ -145,8 +145,6 @@ NIGHT_STOP_AH = 14.0
 NIGHT_START_AH_HYST = 0.5
 NIGHT_TARGET = 26
 NIGHT_MIN_TARGET = 24
-DAY_COOL_STOP_T = 22
-DAY_COOL_STOP_AH = 15.0
 DAY_STOP_AH = 14.5
 DAY_EXIT_RH_MAX = 62
 DUAL_STOP_MIN_COMP = 10
@@ -893,20 +891,7 @@ def decide(
                         None,
                         f"夜间湿度已降到{hum:.0f}%，压缩机工作完成关机",
                     )
-            if temp <= A.TEMP_ABSOLUTE_FLOOR:
-                return (
-                    "off",
-                    None,
-                    f"夜间室温{temp:.0f}度低于绝对下限{A.TEMP_ABSOLUTE_FLOOR}度，逃生门关机",
-                )
-            if comp_min is not None and comp_min < NIGHT_MIN_COMP_ON:
-                return (None, None, None)
-
-        if not is_night and temp <= DAY_COOL_STOP_T:
-            if ah is not None and ah <= DAY_COOL_STOP_AH:
-                return ("off", None, f"温度已降到{temp:.0f}度不闷，过冷保护关机")
-
-        if temp < A.TEMP_ABSOLUTE_FLOOR:
+        if temp <= A.TEMP_ABSOLUTE_FLOOR:
             return (
                 "off",
                 None,

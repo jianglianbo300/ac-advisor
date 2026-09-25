@@ -44,24 +44,8 @@ CTRL_FAIL_ALERT_THRESHOLD = 8  # 连续失败≥8次(≈16min@2min tick)触发�
 class ACState(Enum):
     OFF = "off"
     COOLING = "cooling"
-    COOLING_MAINTAIN = "cooling_maintain"
     DEHUMID = "dehumid"
     FAN = "fan"
-    FAN_LOCKED = "fan_locked"
-
-
-TRANSITIONS = {
-    ACState.OFF: {ACState.COOLING, ACState.DEHUMID, ACState.FAN},
-    ACState.COOLING: {ACState.COOLING_MAINTAIN, ACState.OFF, ACState.FAN},
-    ACState.COOLING_MAINTAIN: {ACState.OFF, ACState.COOLING},
-    ACState.DEHUMID: {ACState.OFF, ACState.FAN},
-    ACState.FAN: {ACState.OFF, ACState.COOLING, ACState.DEHUMID},
-    ACState.FAN_LOCKED: {ACState.OFF, ACState.FAN},
-}
-
-
-def transition(current, target):
-    return target if target in TRANSITIONS.get(current, set()) else current
 
 
 def comfort_index(temp, hum):
