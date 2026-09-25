@@ -713,6 +713,7 @@ def decide(
     is_steady_state=False,
     predicted_cool_min=None,
     sched_override_exempt=False,
+    compressor_on_since=None,  # v8.56 fix (kimi-k3 审计 2026-09-25): 压缩机带载起始 ISO 时间戳，用于 _comp_loaded 时效校验；main() 从 state["compressor_on_since"] 传入
 ):
     """纯决策函数。返回 (new_mode, target_temp, reason) 或 (None, None, None)。
 
@@ -737,7 +738,22 @@ def decide(
         # 省电门（均带"温度已达标"前置）本就不触发。故：压缩机真正带载制冷时
         # 不得以"运行超时"强制关机（用户开着就是要制冷；到温压缩机自己降频/停，
         # 不存在真空转 90 分钟）；省电门恢复原语义（温度达标/湿度达标才关）。
-        _comp_loaded = compressor == "compressor"
+        # v8.56 fix (kimi-k3 审计 2026-09-25): 带载豁免叠加时效校验——
+        # state 中 compressor_state 可能陈旧滞留（实测 4 天跨度），仅凭字符串
+        # 判断会永久豁免 WATCH_MAX_RUN=90min 硬门导致压缩机无限运行。
+        # 要求 compressor_on_since 距今 <=120min 才算可信带载；超时/缺失/解析
+        # 失败一律视为状态不可信，恢复 90min 硬门。
+        _comp_loaded = False
+        if compressor == "compressor" and compressor_on_since:
+            try:
+                _c_on = datetime.fromisoformat(str(compressor_on_since))
+                if _c_on.tzinfo is not None:
+                    _c_on = _c_on.astimezone().replace(tzinfo=None)
+                _comp_loaded = (
+                    datetime.now() - _c_on
+                ).total_seconds() <= 120 * 60
+            except (ValueError, TypeError):
+                _comp_loaded = False
         # v8.32 最小有效运行闸门：开机 N 分钟压缩机从未启动（一直仅风扇/未知）
         # → 纯风扇空转，止损关机。放最前面，白天/夜间/除湿路径统一生效。
         # v8.50 fix (Astra外审 pass1#2): 绝对温度下限前移到 fan_only 分支之前——
@@ -891,14 +907,18 @@ def decide(
         # 45+ 分钟、电耗 1.76→2.23 度)。补晚间专属关机：温度已到 target(+slack)
         # 且湿度不偏高(AH/RH 达标)时正常关机，语义与白天 L861 含水量达标关机对齐，
         # 不再空转与过冷。湿度偏高时仍继续制冷兼除湿，防止晚间反复启停抖振。
+        # v8.56 fix (kimi-k3 审计 2026-09-25): 先统一计算 None 防御后的有效目标值，
+        # 条件与 reason 共用——原 reason 直接 int(round(current_target))，当
+        # current_target=None 且温度达标时抛 TypeError 致整个 tick 崩溃。
+        _eff_target = (
+            current_target if current_target is not None else EVENING_TARGET
+        )
         if (
             evening
             and not is_night
             and comp_min is not None
             and comp_min >= A.MIN_RUN
-            and temp
-            <= (current_target if current_target is not None else EVENING_TARGET)
-            + DAY_TEMP_REACHED_SLACK
+            and temp <= _eff_target + DAY_TEMP_REACHED_SLACK
             and hum is not None
             and hum <= DAY_EXIT_RH_MAX
             and (ah is None or ah <= DAY_STOP_AH)
@@ -906,7 +926,7 @@ def decide(
             return (
                 "off",
                 None,
-                f"晚间温度已达标（{temp:.0f}°C≤目标{int(round(current_target))}），湿度正常关机",
+                f"晚间温度已达标（{temp:.0f}°C≤目标{int(round(_eff_target))}），湿度正常关机",
             )
 
         if (
@@ -1763,6 +1783,7 @@ def main():
         is_steady_state=False,
         predicted_cool_min=_predicted_cool_min,
         sched_override_exempt=_override_exempt,
+        compressor_on_since=state.get("compressor_on_since"),  # v8.56 fix (kimi-k3 审计 2026-09-25): 传入压缩机带载起始时间供时效校验
     )
 
     # v8.47 P2修复②(09-04审计): 室外兜底温度不开新 cycle。传感器离线期间
