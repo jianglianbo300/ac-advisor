@@ -1599,6 +1599,12 @@ def read_ac_power(timeout=4.0):
         from miio.airconditioningcompanionMCN import AirConditioningCompanionMcn02
 
         ip = ap["ip"]
+        # v8.59 注（伴侣调参备案，勿再试）: read_ac_power(timeout=4.0) 的参数**无法生效** ——
+        # 设备不可达时耗时来自 python-miio 内部 send_handshake() →
+        # MiIOProtocol.discover(addr, timeout=5)，该 timeout=5 是库内硬默认、
+        # 不走 self._timeout、也不接受外部覆盖（send_handshake 无 timeout 形参）。
+        # 实测：设 d._timeout=2/4/8 均仍阻塞 5.0s。故此处保持默认，不做改写，
+        # 仅把 read_ac_power 的 timeout 形参标注为"仅供 _read_indoor 等其它路径语义一致"。
         try:
             st = AirConditioningCompanionMcn02(ip, ap["token"]).status()
         except Exception as e:
