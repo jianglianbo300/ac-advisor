@@ -299,6 +299,12 @@ def evaluate_and_learn(state, now_ts):
         if entry.get("executed") is False:
             entry["evaluated"] = True
             continue
+        # v8.60 fix: 旧格式日志（缺 kwh_at_decision）不参与回评——无电量佐证
+        # 无法判断成功/失败，强行回评会污染偏移。标记 evaluated 跳过。
+        if "kwh_at_decision" not in entry:
+            entry["evaluated"] = True
+            entry["eval_note"] = "skipped_old_format_no_kwh"
+            continue
         if ts > cutoff:
             continue
         if ts < stale:
@@ -915,13 +921,99 @@ def read_indoor(timeout=3.0):
     temp, hum = _read_indoor_once(ip, token, timeout=timeout)
     if temp is not None:
         return temp, hum
-    return _read_indoor_once(ip, token, 5)
+    temp, hum = _read_indoor_once(ip, token, 5)
+    if temp is not None:
+        return temp, hum
+    # v8.60 (2026-09-27 audit): 配置 IP 读不到 → 触发 IP 漂移自愈。
+    # 本轮故障的直接教训：传感器 IP 被路由器重新分配（.120 → .24），配置写死
+    # 旧值 → 每 2 分钟读一次、每次都失败 → 谎报「传感器离线」并回退天气兜底，
+    # 而设备其实好好的。伴侣已有 heal_partner_ip，传感器此前**没有**，本轮补上。
+    new_ip = heal_sensor_ip(token)
+    if new_ip and new_ip != ip:
+        return _read_indoor_once(new_ip, token, 5)
+    return None, None
+
+
+def heal_sensor_ip(token):
+    """传感器 IP 漂移自愈：广播扫描 + 用真 token 走真实读取路径验证 → 回写配置。
+
+    与 heal_partner_ip 同构，但：
+    - 独立节流文件（`.sensor_heal.json`），不与伴侣互相抢 30min 窗口
+    - 探测直接调用 `_read_indoor_once`（真实读取路径），不用另一套探针，
+      杜绝「探针通过但实际读数失败」的两套语义偏差
+    - 找不到时 ac_warn 明说"需人工排查"，不静默
+    """
+    global _SENSOR_HEAL_STATE
+    try:
+        with open(_SENSOR_HEAL_STATE) as f:
+            last = json.load(f).get("ts")
+        if (
+            last
+            and (datetime.now() - datetime.fromisoformat(last)).total_seconds()
+            < HEAL_MIN_INTERVAL_SEC
+        ):
+            return None
+    except Exception:
+        pass
+    try:
+        with open(_SENSOR_HEAL_STATE, "w") as f:
+            json.dump({"ts": datetime.now().isoformat(timespec="seconds")}, f)
+    except Exception:
+        pass
+
+    candidates = miio_discover()
+    cur = None
+    try:
+        with open(CONFIG_FILE) as f:
+            cur = json.load(f).get("ip")
+    except Exception:
+        pass
+    for ip in candidates:
+        if ip == cur:
+            continue
+        t, _h = _read_indoor_once(ip, token, 4)
+        if t is None:
+            continue
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            cfg["ip"] = ip
+            cfg["_ip_history"] = (
+                "%s 传感器 IP 自动自愈：%s -> %s（DHCP 漂移；根治可做 DHCP 静态绑定）"
+                % (datetime.now().strftime("%Y-%m-%d %H:%M"), cur, ip)
+            )
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            ac_warn(
+                "传感器 IP 自愈成功：%s -> %s（已回写 miio_config.json，读数 T=%s）"
+                % (cur, ip, t)
+            )
+        except Exception as e:
+            ac_warn("传感器 IP 自愈：命中 %s 但回写配置失败 %s" % (ip, type(e).__name__))
+        return ip
+
+    ac_warn(
+        "传感器 IP 自愈：扫描 %d 台设备，未找到匹配传感器（真离线/断电，需人工排查）"
+        % len(candidates)
+    )
+    return None
 
 
 def _read_indoor_once(ip, token, timeout):
+    # v8.60 (2026-09-27 audit): 原本 `from miio import Device` 的 ImportError 与
+    # 真实网络故障一起被裸 `except: pass` 吞掉，两者都返回 (None,None)，上层无法
+    # 区分「设备掉线」与「依赖缺失」——本轮就因此把 ImportError 误判为设备离线，
+    # 排查了半天才发现是 wrapper 用错解释器（hermes venv 无 miio）。
+    # 现在：依赖缺失属于**环境故障**（重试无用），必须显式抛出并单独告警；
+    # 网络/设备故障才静默返回 None。
     try:
         from miio import Device
-
+    except ImportError as e:
+        raise RuntimeError(
+            f"miio 依赖缺失（{e}）——当前解释器无法读取米家设备。"
+            f"ac_watch.py 必须用项目 venv D:\\work\\ac-advisor\\.venv\\Scripts\\pythonw.exe 运行"
+        )
+    try:
         d = Device(ip, token, timeout=timeout)
         r = d.send("get_properties", [{"siid": 3, "piid": 7}, {"siid": 3, "piid": 1}])
         if isinstance(r, list) and len(r) >= 2:
@@ -1506,6 +1598,8 @@ def apply_and_commit(
 #         （miio token 绑设备、不绑 IP，所以换 IP 后仍能验明正身）。
 _WARN_LOG = os.path.join(SCRIPT_DIR, "ac_error.log")
 _HEAL_STATE = os.path.join(SCRIPT_DIR, ".partner_heal.json")
+# v8.60: 传感器独立节流文件——与伴侣互不抢 30min 扫描窗口
+_SENSOR_HEAL_STATE = os.path.join(SCRIPT_DIR, ".sensor_heal.json")
 HEAL_MIN_INTERVAL_SEC = 1800  # 自愈扫描限流：30 分钟一次（巡检是每 2 分钟一轮）
 
 

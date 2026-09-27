@@ -16,35 +16,134 @@ v8.43:
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.59"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.58 + DeepSeek 交叉审计 T5/T1 修复）
+VERSION = "v8.61"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.61 + TTS 静音时段 22:00-08:00 收口到 tts_speak 单点；原实现复用 NIGHT=(23,7) 只静音 23-07，两头各漏 1h）
 
-# ── TTS 语音 ──
+# ── TTS 语音（v8.60 2026-09-27：换自然音色）──
+# 旧实现的病根：`pyttsx3.init()` **不指定音色** → 走系统默认。本机 SAPI5 只有两个
+# 音色（Huihui 中文 / Zira 英文），默认落到 Zira，于是「英文音色在念中文字符」——
+# 这就是用户反馈的"不自然"。pyttsx3 是 SAPI5 老引擎，再怎么调参也到不了自然。
+#
+# 现在改为双通道：
+#   主通道 edge-tts（Azure 神经语音，本机可用 8 个 zh-CN *Natural* 音色）
+#   兜底 pyttsx3 + **显式指定中文音色**（断网 / edge-tts 不可用时）
+# 全部在 daemon 线程执行，异常一律吞掉——TTS 绝不影响空调控制主链路。
+#
+# 换音色：改 TTS_EDGE_VOICE 即可。可选（zh-CN 神经音色，均为 Natural）
+#   XiaoxiaoNeural  女  温和（默认，播报最自然）
+#   XiaoyiNeural    女  活泼
+#   YunxiNeural     男  年轻
+#   YunyangNeural   男  播音腔
+#   YunjianNeural   男  解说
+#   YunxiaNeural    男  少年
+#   liaoning-XiaobeiNeural / shaanxi-XiaoniNeural  方言
+TTS_EDGE_VOICE = "zh-CN-XiaoxiaoNeural"
+TTS_EDGE_RATE = "-8%"          # 略放慢，家居播报更从容
+# v8.61 语音静音时段（用户 2026-09-27 明确要求：22:00-08:00 不播报）。
+#   注意**不能**复用 NIGHT=(23,7)：那是控制逻辑的夜间窗口（MIN_OFF / 启动
+#   次数上限 / 谷电对齐，15+ 处在用），改它会动控制行为。语音是独立关注点，
+#   独立窗口，且比 NIGHT 两头各宽 1 小时——原实现只静音 23:00-07:00。
+TTS_QUIET_HOURS = (22, 8)
+_TTS_PLAYERS = (
+    r"C:\Program Files\MPV Player\mpv.exe",   # GUI 子系统，无控制台窗口
+    r"C:\Program Files\MPV Player\mpv.com",
+    "ffplay",
+)
+
 _tts_engine = None
 _tts_lock = threading.Lock()
 
 
+def _tts_play(mp3_path):
+    """无窗口播放 mp3。找不到播放器静默失败。"""
+    no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for player in _TTS_PLAYERS:
+        exe = player if os.path.isabs(player) else shutil.which(player)
+        if not exe or not os.path.exists(exe):
+            continue
+        cmd = ([exe, "--no-video", "--really-quiet", "--keep-open=no",
+                "--no-osc", "--idle=no", mp3_path] if "mpv" in exe.lower()
+               else [exe, "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path])
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=no_win)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _tts_edge(text):
+    """edge-tts 神经语音。返回 True=已播报。"""
+    tmp = os.path.join(tempfile.gettempdir(), "ac_tts_edge.mp3")
+    try:
+        import asyncio
+
+        import edge_tts
+
+        async def _run():
+            c = edge_tts.Communicate(text, TTS_EDGE_VOICE, rate=TTS_EDGE_RATE)
+            await c.save(tmp)
+
+        asyncio.run(_run())
+        ok = os.path.getsize(tmp) > 512
+        return _tts_play(tmp) if ok else False
+    except Exception:
+        return False
+
+
+def _tts_sapi(text):
+    """pyttsx3 兜底，**显式选中文音色**（不再吃系统默认）。"""
+    global _tts_engine
+    try:
+        with _tts_lock:
+            if _tts_engine is None:
+                _tts_engine = pyttsx3.init()
+                try:  # 显式挑一个 zh-CN 音色，避免落到 Zira(英)
+                    for v in _tts_engine.getProperty("voices"):
+                        if "zh" in " ".join(getattr(v, "languages", []) or []).lower() \
+                                or "chinese" in (getattr(v, "name", "") or "").lower():
+                            _tts_engine.setProperty("voice", v.id)
+                            break
+                except Exception:
+                    pass
+            _tts_engine.say(text)
+            _tts_engine.runAndWait()
+        return True
+    except Exception:
+        return False
+
+
+def _tts_quiet(now=None):
+    """当前是否处于语音静音时段（22:00-08:00 含端点）。纯函数，可测。"""
+    h = (now or datetime.now()).hour
+    return h >= TTS_QUIET_HOURS[0] or h < TTS_QUIET_HOURS[1]
+
+
 def tts_speak(text):
-    """语音播报（daemon 线程，不阻塞主循环）"""
+    """语音播报（daemon 线程，不阻塞主循环）。edge-tts 优先，失败降级 SAPI。
+
+    v8.61：静音时段（22:00-08:00）直接跳过。**收口在此单点**——将来新增任何
+    播报调用点都自动受约束，不依赖每个调用点各自记得判时间。
+    """
     if not text:
+        return
+    if _tts_quiet():
         return
 
     def _speak():
-        global _tts_engine
-        try:
-            with _tts_lock:
-                if _tts_engine is None:
-                    _tts_engine = pyttsx3.init()
-                _tts_engine.say(text)
-                _tts_engine.runAndWait()
-        except Exception:
-            pass
+        if _tts_edge(text):
+            return
+        _tts_sapi(text)
 
     threading.Thread(target=_speak, daemon=True).start()
 
@@ -226,6 +325,7 @@ SENSOR_PLAUSIBLE_T_MAX = 45
 SENSOR_PLAUSIBLE_RH_MIN = 20
 SENSOR_PLAUSIBLE_RH_MAX = 98
 SENSOR_TIMEOUT_ESCALATE = 20
+SENSOR_DEGRADE_CONTROL = 30
 FAKE_RUN_MAX_CYCLES = 3
 MANUAL_ANCHOR_TTL = 720
 
@@ -1396,9 +1496,39 @@ def main():
         return
 
     if wx_fallback_used:
-        log(
-            "传感器不可达但有天气预报兜底（兜底温度不开新cycle，运行中周期照常监护，保留断连计时）"
-        )
+        _foff_min_early = A.minutes_since(state.get("_sensor_off_since")) if state.get("_sensor_off_since") else None
+        # v8.60 fix (2026-09-27 audit 自查): 降级必须**让位**给保守关机。
+        # 初版在此无条件 return，抢在下方 SENSOR_TIMEOUT_ESCALATE 保守关机之前——
+        # 传感器离线 30min+ 且空调正在运行时，会直接 return 掉、永远走不到关机
+        # 逻辑，等于「空调盲跑」且无任何保护（本轮实测 mode=cooling/1037W 正是
+        # 该状态）。现改为：空调在运行 → 落到下方保守关机分支（20min 阈值先触发）；
+        # 空调未运行 → 才「只采集不控制」跳过新决策。
+        _ac_running = state.get("mode") in ("cooling", "dehumid", "dehumid_alert")
+        if (
+            _foff_min_early is not None
+            and _foff_min_early >= SENSOR_DEGRADE_CONTROL
+            and not _ac_running
+        ):
+            if not state.get("_sensor_degraded_alerted"):
+                state["_sensor_degraded_alerted"] = True
+                print(
+                    f"ac_watch: 传感器离线{_foff_min_early:.0f}分钟，降级为只采集不控制"
+                )
+                A._alert_ctrl_failure(
+                    state,
+                    {
+                        "action": "degrade",
+                        "reason": f"室内传感器离线{_foff_min_early:.0f}分钟，降级为只采集不控制",
+                    },
+                    1,
+                )
+            log(f"传感器离线{_foff_min_early:.0f}分钟，降级模式：跳过控制决策")
+            A.save_state(state)
+            return
+        elif _foff_min_early is not None and _foff_min_early >= SENSOR_DEGRADE_CONTROL and _ac_running:
+            log(
+                f"传感器离线{_foff_min_early:.0f}分钟且空调运行中 → 交由保守关机处理（不降级跳过）"
+            )
         if state.get("_sensor_off_since") is None:
             state["_sensor_off_since"] = now_ts
         # v8.50 fix (Astra外审 pass1#1): 天气兜底成功时旧代码永不执行断连超时
@@ -1445,6 +1575,8 @@ def main():
             state["_temp_src"] = "indoor"
             state["_hum_src"] = "indoor"
         state.pop("_sensor_off_since", None)
+        # 传感器恢复 → 清降级告警标志，否则下次离线永不再告警（一次性语义失效）
+        state.pop("_sensor_degraded_alerted", None)
 
     manual_off = state.get("manual_off_at")
     if manual_off and state.get("mode") in (None, "off"):
@@ -1678,6 +1810,17 @@ def main():
 
     _thermal_data = A.load_thermal_data()
     _model = _thermal_data.get("thermal_model", {})
+    _thermal_stale = False
+    _last_fit = _thermal_data.get("_last_fit_ts")
+    if _last_fit:
+        try:
+            _fit_dt = datetime.fromisoformat(_last_fit)
+            if (now_dt - _fit_dt).total_seconds() > 14 * 86400:
+                _thermal_stale = True
+        except Exception:
+            _thermal_stale = True
+    else:
+        _thermal_stale = True
     _predicted_cool_min = None
     # v8.36 fix (hy4审计#4): 天气 API 失败时 _outdoor_t 为 None，而
     # predict_cooling_time 内部直接算 `a * (outdoor_temp - t)` → TypeError，
@@ -1687,7 +1830,7 @@ def main():
     # （如 hot_day = outdoor_temp is not None and ...），此处独漏。
     # 仅在 running 且 temp > current_target 时才会进循环，故此前只在"运行中且
     # 室温高于目标"这一常见态下偶发崩溃。
-    if running and _outdoor_t is not None and current_target is not None:
+    if running and _outdoor_t is not None and current_target is not None and not _thermal_stale:
         _predicted_cool_min = A.predict_cooling_time(
             temp, current_target, _outdoor_t, _model
         )
@@ -2025,12 +2168,13 @@ def main():
                         )
                 except Exception:
                     pass
-        # TTS 语音播报（白天，夜间静音）
-        if not night_hours():
-            if new_mode == "cooling":
-                tts_speak(f"已自动开空调制冷{target}度，{reason}")
-            elif new_mode == "off":
-                tts_speak(f"已自动关空调，{reason}")
+        # TTS 语音播报。静音时段（22:00-08:00）在 tts_speak() 单点收口，
+        # 此处不再重复判时间——原注释写的「夜间静音」实际只覆盖 23:00-07:00
+        # （复用了控制逻辑的 NIGHT=(23,7)），两头各漏 1 小时。
+        if new_mode == "cooling":
+            tts_speak(f"已自动开空调制冷{target}度，{reason}")
+        elif new_mode == "off":
+            tts_speak(f"已自动关空调，{reason}")
         print(f"ac_watch: 已自动{ctrl['action']} · {meta}")
     elif ctrl["status"] == "no_action":
         # v8.50 fix (Astra外审 pass1#6/#8): no_action/失败 = 未实际执行，

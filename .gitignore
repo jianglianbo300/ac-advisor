@@ -15,8 +15,15 @@ forecast.json
 # 设备凭据（含净化器 IP + token，禁止入库）
 miio_config.json
 
-# 版本备份 *.bak-*
+# 版本备份 *.bak-* / *.bak_* / *.bak.* / *.bak
+# 2026-09-27 补：原规则只有 *.bak-*（连字符），而实际命名大量用下划线
+# （.bak_before_xxx_时间戳），导致 6 个备份文件长期未被忽略、裸奔在
+# git status 里 —— 一次 `git add -A` 就会入库。
 *.bak-*
+*.bak_*
+*.bak.*
+*.bak
+
 
 # 滤网状态（运行时生成）
 filter_state.json
