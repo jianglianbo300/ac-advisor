@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.61"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.61 + TTS 静音时段 22:00-08:00 收口到 tts_speak 单点；原实现复用 NIGHT=(23,7) 只静音 23-07，两头各漏 1h）
+VERSION = "v8.62"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.62 + TTS 主通道改小米音箱：音箱→edge-tts→SAPI 逐级降级，复用既有 xiaomi_tts.py）
 
 # ── TTS 语音（v8.60 2026-09-27：换自然音色）──
 # 旧实现的病根：`pyttsx3.init()` **不指定音色** → 走系统默认。本机 SAPI5 只有两个
@@ -129,9 +129,35 @@ def _tts_quiet(now=None):
     return h >= TTS_QUIET_HOURS[0] or h < TTS_QUIET_HOURS[1]
 
 
-def tts_speak(text):
-    """语音播报（daemon 线程，不阻塞主循环）。edge-tts 优先，失败降级 SAPI。
+def _tts_speaker(text, timeout=25):
+    """小米 Sound 音箱播报（云端 MiNA）。返回 True=已交给音箱。
 
+    v8.62：新增主通道。复用既有的 `xiaomi_tts.py`（2026-08-13 建、一直未被
+    ac_watch 调用），不重写 miotspec/action 逻辑。
+      音箱 DID=501560617 · siid=7 aiid=3 · 凭据 ~/.mi.token + ~/xiaomi_auth.json
+    为什么不自己写：实播 + 重登 + 解析 device_list 都在那个脚本里，重复实现只会
+    产生第二份会腐烂的副本（与「版本号进文件名」同病）。
+    用 sys.executable：ac_watch 由 ac_watch_wrapper.py 钉在项目 venv 下跑，
+    该 venv 才有 aiohttp/micloud；不写死绝对路径是为了换 venv 时不失效。
+    任何失败都吞掉返回 False —— 音箱不可用绝不能影响空调控制主链路。
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xiaomi_tts.py")
+    if not os.path.exists(script):
+        return False
+    try:
+        r = subprocess.run([sys.executable, script, text],
+                           capture_output=True, timeout=timeout)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def tts_speak(text):
+    """语音播报（daemon 线程，不阻塞主循环）。
+
+    v8.62 通道链：**小米音箱 → 电脑 edge-tts → SAPI**，逐级降级，任一级失败不影响下一级。
+      音箱放首位是因用户反馈「笔记本外放声音小」；电脑保留为兜底（零依赖、
+      token 失效时仍能出声，也是首次部署唯一可用通道）。
     v8.61：静音时段（22:00-08:00）直接跳过。**收口在此单点**——将来新增任何
     播报调用点都自动受约束，不依赖每个调用点各自记得判时间。
     """
@@ -141,6 +167,8 @@ def tts_speak(text):
         return
 
     def _speak():
+        if _tts_speaker(text):
+            return
         if _tts_edge(text):
             return
         _tts_sapi(text)
