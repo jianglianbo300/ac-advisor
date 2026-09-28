@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-空调自动监控 v8.44 — 每 2 分钟自动环（Hermes cron: */2 * * *）
+空调自动监控 —— **版本戳见下方 VERSION 常量，本 docstring 不再硬编码版本号**
+（2026-09-28：原文写死 "v8.44" 而 VERSION 已是 v8.62，且旁边注释自称
+  "单一版本戳：docstring/print/selftest 全引用此处" —— 自声明的不变量自己没做到。
+  现在 docstring 不写版本，版本只有 VERSION 一处，从此不可能漂移。）
+
+每 2 分钟自动环（Hermes cron: */2 * * *）
 
 v8.43:
  - P0 修复：reconcile_state 手动锚点震荡循环——伴侣 is_on 是 IR 信念非物理现实，
@@ -26,7 +31,7 @@ from datetime import datetime, timedelta
 
 import pyttsx3
 
-VERSION = "v8.62"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.62 + TTS 主通道改小米音箱：音箱→edge-tts→SAPI 逐级降级，复用既有 xiaomi_tts.py）
+VERSION = "v8.63"  # 单一版本戳：docstring/print/selftest 全引用此处（v8.63: 周期记录补 schema/kwh_semantics/abort_code/overlap_prev_min —— 只加记录字段，控制逻辑零改动；docstring 不再硬编码版本号）
 
 # ── TTS 语音（v8.60 2026-09-27：换自然音色）──
 # 旧实现的病根：`pyttsx3.init()` **不指定音色** → 走系统默认。本机 SAPI5 只有两个
@@ -602,6 +607,66 @@ def stale_stop_ts(old_ts, run_start_ts):
         return False
 
 
+# ── v8.63: 周期记录的口径标注 + 机器可读原因码 + 周期重叠检测 ──
+# 背景（2026-09-28 审计, 277 个周期复现）:
+#   ① `kwh_used` 一列在 cycle_log.jsonl 里混了**两套语义**: 2026-08-21~08-29 的
+#      78 条是 v8.36 修复**之前**的累计总电量（实测单调递增 27.4 → 66.3 度），
+#      08-29 起的 129 条才是本周期用量差值（max 2.93 度）。这 78 条占 28% 却贡献了
+#      97.5% 的求和 —— 任何人直接对 kwh_used 求和都会得到荒谬结论（实测 3683.8 度，
+#      真实约 90.9 度，与压缩机时长×铭牌交叉验证同量级）。
+#      v8.36 把算法改对了，但**没给数据打口径标记**，所以问题以"看起来像计量 bug"
+#      的形式复发。→ 这里补 `kwh_semantics` + `schema`，让新旧记录可机器区分。
+#   ② `abort_reason` 里嵌了 AH/RH/分钟等可变数字，同一个原因被拆成多条
+#      （Top10 里「夜间室内湿度已达标」被 AH 值拆成 5 条）→ 按字符串分组/统计失效。
+#      → 新增 `abort_code` 稳定枚举，数字只留在 abort_reason 给人看。
+#   ③ 出现过周期重叠（end_ts 晚于下一周期 start_ts）→ 新增 `overlap_prev_min`。
+# 注意: 本次**只给记录加字段，不改任何控制逻辑**（决策/阈值/执行路径零改动）。
+CYCLE_SCHEMA = 2
+KWH_SEMANTICS = "cycle_delta"   # kwh_used = 本周期用量差值（v8.36 起的口径）
+
+# 顺序敏感: 具体的规则必须排在泛化规则之前（如「…已达标」要排在「达标」前）
+_ABORT_CODE_RULES = (
+    ("压缩机已连续运行", "compressor_guard"),
+    ("逃生门", "overcool_escape"),
+    ("绝对下限", "overcool_escape"),
+    ("含水量已达标", "moisture_ok"),
+    ("夜间室内湿度已达标", "humidity_ok"),
+    ("含水量", "moisture_ok"),
+    ("湿度已达标", "humidity_reached"),
+    ("湿度已降到", "humidity_reached"),
+    ("不再吹风空耗", "fan_only_stop"),
+    ("防过冷", "overcool_guard"),
+    ("假运行", "fake_run_abort"),
+    ("最小有效运行", "fake_run_abort"),
+    ("已达标", "target_reached"),
+    ("达标", "target_reached"),
+)
+
+
+def _overlap_prev_min(state, start_ts):
+    """本周期 start 与**上一周期 end** 的间隔（分钟）。负数 = 周期重叠。"""
+    prev_end = state.get("_last_cycle_end_ts")
+    if not prev_end or not start_ts:
+        return None
+    try:
+        return round(
+            (datetime.fromisoformat(start_ts) - datetime.fromisoformat(prev_end)).total_seconds() / 60,
+            1,
+        )
+    except Exception:
+        return None
+
+
+def _abort_code(reason):
+    """自然语言原因 → 稳定枚举码。数字只进 abort_reason，不进 code。"""
+    if not reason:
+        return "normal"
+    for key, code in _ABORT_CODE_RULES:
+        if key in str(reason):
+            return code
+    return "other"
+
+
 def open_cycle(state, now_ts, ah, rh, temp=None, outdoor_temp=None):
     state["cycle_start"] = {
         "ts": now_ts,
@@ -667,6 +732,13 @@ def close_cycle(
             dur_min and comp_min is not None and comp_min / dur_min > 1.01
         ),
         "abort_reason": abort_reason,
+        # v8.63: 机器可读原因码（分组/统计只用这个，不用带数字的文本）
+        "abort_code": _abort_code(abort_reason),
+        # v8.63: 口径标注。schema<2 或缺 kwh_semantics 的历史记录不可直接求和
+        "schema": CYCLE_SCHEMA,
+        "kwh_semantics": KWH_SEMANTICS,
+        # v8.63: 与上一周期的重叠检测（负数 = 本周期在上一个结束前就开始了）
+        "overlap_prev_min": _overlap_prev_min(state, cs.get("ts")),
         "rh_spike": (rh is not None and cs.get("rh") is not None and rh > cs["rh"] + 3),
     }
     path = path or os.path.join(
@@ -675,6 +747,8 @@ def close_cycle(
     _rotate_if_big(path)  # v8.42: N1 双文件轮转
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # v8.63: 记住本周期结束时刻，供下一周期做重叠检测
+    state["_last_cycle_end_ts"] = now_ts
     # v8.30: 记录热力学事件（此前从未调用，8/21 后模型停止更新）
     if mode_before in ("cooling", "dehumid", "dehumid_alert") and dur_min >= 5:
         try:
